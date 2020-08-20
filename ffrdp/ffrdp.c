@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <pthread.h>
 #include "ffrdp.h"
 
 #ifdef WIN32
@@ -12,6 +13,8 @@ typedef   signed short  int16_t;
 typedef unsigned short uint16_t;
 typedef unsigned int   uint32_t;
 typedef   signed int    int32_t;
+// disable warnings
+#pragma warning(disable:4996)
 #else
 #include <stdint.h>
 #include <unistd.h>
@@ -134,6 +137,17 @@ static void list_del(FFRDP_FRAME_NODE *node, int f)
     if (f) free(node);
 }
 
+static int list_free(FFRDP_FRAME_NODE *node, int n)
+{
+    int k = 0;
+    while (node && ++k != n) {
+        FFRDP_FRAME_NODE *next = node->next;
+        list_del(node, 1);
+        node = next;
+    }
+    return k;
+}
+
 static int32_t signed_extend(uint32_t a, int size)
 {
     return (a & (1 << (size - 1))) ? (a | ~((1 << size) - 1)) : a;
@@ -147,10 +161,18 @@ static int seq_distance(uint32_t seq1, uint32_t seq2)
 void* ffrdp_init(char *ip, int port, int server)
 {
 #ifdef WIN32
+    WSADATA   wsaData;
     unsigned long opt;
 #endif
     FFRDPCONTEXT *ffrdp = calloc(1, sizeof(FFRDPCONTEXT));
     if (!ffrdp) return NULL;
+
+#ifdef WIN32
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        printf("WSAStartup failed !\n");
+        return NULL;
+    }
+#endif
 
     ffrdp->send_list_head.next = &ffrdp->send_list_tail;
     ffrdp->send_list_tail.prev = &ffrdp->send_list_head;
@@ -160,7 +182,7 @@ void* ffrdp_init(char *ip, int port, int server)
 
     ffrdp->server_addr.sin_family      = AF_INET;
     ffrdp->server_addr.sin_port        = htons(port);
-    ffrdp->server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    ffrdp->server_addr.sin_addr.s_addr = inet_addr(ip);
     ffrdp->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (ffrdp->udp_fd < 0) {
         printf("failed to open socket !\n");
@@ -194,7 +216,10 @@ int ffrdp_send(void *ctxt, char *buf, int len)
     int           n;
     if (!ffrdp || (ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0) return -1;
     n = len < (int)sizeof(ffrdp->send_buff) - ffrdp->send_size ? len : (int)sizeof(ffrdp->send_buff) - ffrdp->send_size;
-    if (n > 0) ffrdp->send_tail = ringbuf_write(ffrdp->send_buff, sizeof(ffrdp->send_buff), ffrdp->send_tail, buf, n);
+    if (n > 0) {
+        ffrdp->send_tail = ringbuf_write(ffrdp->send_buff, sizeof(ffrdp->send_buff), ffrdp->send_tail, buf, n);
+        ffrdp->send_size+= n;
+    }
     return n;
 }
 
@@ -204,7 +229,10 @@ int ffrdp_recv(void *ctxt, char *buf, int len)
     int           n;
     if (!ctxt) return -1;
     n = len < ffrdp->recv_size ? len : ffrdp->recv_size;
-    if (n > 0) ffrdp->recv_head = ringbuf_read(ffrdp->recv_buff, sizeof(ffrdp->recv_buff), ffrdp->recv_head, buf, n);
+    if (n > 0) {
+        ffrdp->recv_head = ringbuf_read(ffrdp->recv_buff, sizeof(ffrdp->recv_buff), ffrdp->recv_head, buf, n);
+        ffrdp->recv_size-= n;
+    }
     return n;
 }
 
@@ -222,7 +250,7 @@ void ffrdp_update(void *ctxt)
     FFRDP_FRAME_NODE   *node    = NULL, *p = NULL, *t = NULL;
     struct sockaddr_in *dstaddr = NULL;
     struct sockaddr_in  srcaddr;
-    int      seq, size, ret, fdat, fack, una, mack, win, dist, i;
+    int      seq, size, ret, fack, fdat, una, mack, win, dist, i;
     uint8_t  data[8];
     uint32_t maxackseq, tick;
 
@@ -234,7 +262,8 @@ void ffrdp_update(void *ctxt)
         seq  = ffrdp->send_seq++ & 0xFFFFFF;
         size = 4 + (ffrdp->send_size < FFRDP_MTU_SIZE ? ffrdp->send_size : FFRDP_MTU_SIZE);
         node = frame_node_new(size);
-        ffrdp->send_head = ringbuf_read(ffrdp->send_buff, sizeof(ffrdp->send_buff), ffrdp->send_head, node->data + 4, size);
+        ffrdp->send_head = ringbuf_read(ffrdp->send_buff, sizeof(ffrdp->send_buff), ffrdp->send_head, node->data + 4, size - 4);
+        ffrdp->send_size-= size - 4;
         *(uint32_t*)node->data = (FFRDP_FRAME_TYPE_DATA << 0) | ((seq & 0xFFFFFF) << 8);
         list_add(&ffrdp->send_list_head, node);
     }
@@ -265,9 +294,10 @@ void ffrdp_update(void *ctxt)
         p = p->prev;
     }
 
-    node = NULL; fack = 0;
+    node = NULL; fack = 0; fdat = 0;
     while (1) {
         if (!node) node = frame_node_new(4 + FFRDP_MTU_SIZE);
+        size = sizeof(srcaddr);
         if ((ret = recvfrom(ffrdp->udp_fd, node->data, node->size, 0, (struct sockaddr*)&srcaddr, &size)) <= 0) break;
         if ((ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0) {
             if (ffrdp->flags & FLAG_CONNECTED) {
@@ -325,7 +355,7 @@ void ffrdp_update(void *ctxt)
             seq = *(uint32_t*)p->data >> 8;
             dist= seq_distance(una, seq);
             if (dist >= 0) {
-                t = p->prev; list_del(p, 1); p = t;
+                t = p->next; list_del(p, 1); p = t;
             } else if ((1 << (-dist)) & mack) {
                 p->flags |= FLAG_GET_RXACK;
             } else if (seq_distance(maxackseq, seq) >= 0) {
@@ -352,21 +382,25 @@ void ffrdp_update(void *ctxt)
         mack = 0;
         p = ffrdp->recv_list_tail.prev;
         while (p != &ffrdp->recv_list_head) {
-            seq = *(uint32_t*)p->data >> 8;
+            seq  = *(uint32_t*)p->data >> 8;
+            dist = seq_distance(seq, ffrdp->recv_seq);
             if (seq == ffrdp->recv_seq) {
                 if (p->size - 4 < (int)(sizeof(ffrdp->recv_buff) - ffrdp->recv_size)) {
                     ffrdp->recv_tail = ringbuf_write(ffrdp->recv_buff, sizeof(ffrdp->recv_buff), ffrdp->recv_tail, p->data + 4, p->size - 4);
+                    ffrdp->recv_size+= p->size - 4;
                 } else {
                     printf("why size it not enough ?\n");
                     break;
                 }
                 ffrdp->recv_seq++; ffrdp->recv_seq &= 0xFFFFFF;
-                t = p->prev; list_del(p, 1); p = t;
+                t = p->next; list_del(p, 1); p = t;
+            } else if (dist < 0) {
+                t = p->next; list_del(p, 1); p = t;
             } else break;
             p = p->prev;
         }
         while (p != &ffrdp->recv_list_head) {
-            seq = *(uint32_t*)p->data >> 8;
+            seq  = *(uint32_t*)p->data >> 8;
             dist = seq_distance(seq, ffrdp->recv_seq);
             if (dist > 0 && dist < 16) mack |= (1 << dist);
             p = p->prev;
@@ -382,10 +416,85 @@ void ffrdp_free(void *ctxt)
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ctxt) return;
     if (ffrdp->udp_fd > 0) closesocket(ffrdp->udp_fd);
+    list_free(ffrdp->send_list_head.next, -1);
+    list_free(ffrdp->recv_list_head.next, -1);
     free(ffrdp);
+#ifdef WIN32
+    WSACleanup();
+#endif
+}
+
+#if 1
+static g_exit = 0;
+
+static void* server_thread(void *param)
+{
+    void *ffrdp = ffrdp_init("0.0.0.0", 8002, 1);
+    uint32_t tickheartbeat = 0;
+    uint8_t  buffer[256];
+    int      ret;
+
+    while (!g_exit) {
+        if (get_tick_count() >= tickheartbeat + 1000) {
+            tickheartbeat = get_tick_count();
+            ffrdp_send(ffrdp, "client_hb", 10);
+        }
+
+        ret = ffrdp_recv(ffrdp, buffer, sizeof(buffer));
+        if (ret > 0) {
+            printf("%s\n", buffer);
+        }
+
+        ffrdp_update(ffrdp);
+        usleep(10 * 1000);
+    }
+    ffrdp_free(ffrdp);
+    return NULL;
+}
+
+static void* client_thread(void *param)
+{
+    void *ffrdp = ffrdp_init("192.168.0.148", 8002, 0);
+    uint32_t tickheartbeat = 0;
+    uint8_t  buffer[256];
+    int      ret;
+
+    while (!g_exit) {
+        if (get_tick_count() >= tickheartbeat + 1000) {
+            tickheartbeat = get_tick_count();
+            ffrdp_send(ffrdp, "server_hb", 10);
+        }
+
+        ret = ffrdp_recv(ffrdp, buffer, sizeof(buffer));
+        if (ret > 0) {
+            printf("%s\n", buffer);
+        }
+
+        ffrdp_update(ffrdp);
+        usleep(10 * 1000);
+    }
+    ffrdp_free(ffrdp);
+    return NULL;
 }
 
 int main(void)
 {
+    pthread_t hserver;
+    pthread_t hclient;
+
+    pthread_create(&hserver, NULL, server_thread, NULL);
+    pthread_create(&hclient, NULL, client_thread, NULL);
+
+    while (!g_exit) {
+        char cmd[256];
+        scanf("%256s", cmd);
+        if (stricmp(cmd, "quit") == 0 || stricmp(cmd, "exit") == 0) {
+            g_exit = 1;
+        }
+    }
+
+    pthread_join(hserver, NULL);
+    pthread_join(hclient, NULL);
     return 0;
 }
+#endif
