@@ -2,7 +2,7 @@ ffrdp 是一个基于 udp 的快速可靠协议
 
 rto 计算：
 初始：
-rtts = rttm
+rtts = rttm;
 rttd = rttm / 2;
 
 迭代：
@@ -11,8 +11,9 @@ rttd = (1 - beta ) * rttd + beta  *(rttm - rtts); // beta = 1 / 4
 
 正常：
 rto  = rtts + r * rttd;
+
 超时：
-rto  = 1.5 * rto
+rto  = 1.5 * rto;
 
 帧定义：
 data frame: 0x00 seq0 seq1 seq2 data ...
