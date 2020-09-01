@@ -297,7 +297,7 @@ void ffrdp_update(void *ctxt)
     send_una = ffrdp->send_list_head ? *(uint32_t*)ffrdp->send_list_head->data >> 8 : 0;
     recv_una = ffrdp->recv_seq;
 
-    for (p=ffrdp->send_list_head; p; p=p->next) {
+    for (i=0,p=ffrdp->send_list_head; i<16&&p; i++,p=p->next) {
         if (!(p->flags & FLAG_FIRST_SEND)) { // first send
             if (p->size - 4 <= (int)ffrdp->recv_win) {
                 ret = sendto(ffrdp->udp_fd, p->data, p->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
