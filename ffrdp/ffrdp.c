@@ -229,7 +229,7 @@ void* ffrdp_init(char *ip, int port, int server)
 #else
     fcntl(ffrdp->server_fd, F_SETFL, fcntl(ffrdp->server_fd, F_GETFL, 0) | O_NONBLOCK);  // setup non-block io mode
 #endif
-    opt = 16*FFRDP_MTU_SIZE; setsockopt(ffrdp->udp_fd, SOL_SOCKET, SO_RCVBUF, (char*)&opt, sizeof(int)); // setup udp recv buffer size
+    opt = 16 * (4 + FFRDP_MTU_SIZE); setsockopt(ffrdp->udp_fd, SOL_SOCKET, SO_RCVBUF, (char*)&opt, sizeof(int)); // setup udp recv buffer size
     return ffrdp;
 
 failed:
