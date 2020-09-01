@@ -288,6 +288,7 @@ void ffrdp_update(void *ctxt)
     FFRDP_FRAME_NODE   *node    = NULL, *p = NULL, *t = NULL;
     struct sockaddr_in *dstaddr = NULL;
     struct sockaddr_in  srcaddr;
+    int32_t  addrlen = sizeof(srcaddr);
     int32_t  seq, una, mack, size, ret, send_una, send_mack = 0, recv_una, recv_mack = 0, recv_win, dist, maxack, i;
     uint8_t  data[8];
 
@@ -327,8 +328,7 @@ void ffrdp_update(void *ctxt)
 
     for (node=NULL;;) { // receive data
         if (!node && !(node = frame_node_new(4 + FFRDP_MTU_SIZE))) break;;
-        size = sizeof(srcaddr);
-        if ((ret = recvfrom(ffrdp->udp_fd, node->data, node->size, 0, (struct sockaddr*)&srcaddr, &size)) <= 0) break;
+        if ((ret = recvfrom(ffrdp->udp_fd, node->data, node->size, 0, (struct sockaddr*)&srcaddr, &addrlen)) <= 0) break;
         if ((ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0) {
             if (ffrdp->flags & FLAG_CONNECTED) {
                 if (memcmp(&srcaddr, &ffrdp->client_addr, sizeof(srcaddr)) != 0) continue;
