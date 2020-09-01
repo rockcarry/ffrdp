@@ -36,8 +36,8 @@ static uint32_t get_tick_count()
 #define MAX(a, b)         ((a) > (b) ? (a) : (b))
 #define RECV_BUFF_SIZE    (16 * 1024)
 #define FFRDP_MTU_SIZE     1024
-#define FFRDP_MIN_RTO      2
-#define FFRDP_MAX_RTO      1000
+#define FFRDP_MIN_RTO      20
+#define FFRDP_MAX_RTO      2000
 #define FFRDP_WIN_CYCLE    100
 #define FFRDP_MAX_WAITSND  256
 
