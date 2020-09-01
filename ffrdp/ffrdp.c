@@ -323,6 +323,7 @@ void ffrdp_update(void *ctxt)
             p->tick_timeout = p->tick_send + ffrdp->rto;
             p->flags       &=~FLAG_FAST_RESEND;
             p->flags       |= FLAG_DATA_RESEND;
+            if (ffrdp->rto == FFRDP_MAX_RTO) break; // if rto reach FFRDP_MAX_RTO, we only try to resend one packet
         }
     }
 
