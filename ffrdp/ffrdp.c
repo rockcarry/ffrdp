@@ -361,7 +361,7 @@ void ffrdp_update(void *ctxt)
                 send_mack|= mack;
             } if (dist > 0) {
                 send_una  = una;
-                send_mack = mack | (send_mack >> dist);
+                send_mack = (send_mack >> dist) | mack;
                 recv_win  = *(uint32_t*)(node->data + 4) >> 16;
             }
             break;
@@ -411,16 +411,16 @@ void ffrdp_update(void *ctxt)
         ffrdp->recv_win = recv_win; ffrdp->tick_query_rwin = get_tick_count(); // update rx recv window size
         for (p=ffrdp->send_list_head; p;) {
             seq = *(uint32_t*)p->data >> 8;
-            dist= seq_distance(send_una, seq);
+            dist= seq_distance(seq, send_una);
             for (i=15; i>=0 && !(send_mack&(1<<i)); i--);
             if (i < 0) maxack = (send_una - 1) & 0xFFFFFF;
             else maxack = (send_una + i + 1) & 0xFFFFFF;
 
-            if (dist < -16) {
+            if (dist > 16) {
                 break;
-            } else if (dist > 0 || dist < 0 && (send_mack & (1 << (-dist-1)))) {
+            } else if (dist < 0 || dist > 0 && (send_mack & (1 << (dist-1)))) {
                 p->flags |= FLAG_NEED_REMOVE;
-            } else if (seq_distance(maxack, seq) >= 0) {
+            } else if (seq_distance(maxack, seq) > 0) {
                 p->flags |= FLAG_FAST_RESEND;
             }
 
