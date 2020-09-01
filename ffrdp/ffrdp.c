@@ -133,12 +133,9 @@ static FFRDP_FRAME_NODE* frame_node_new(int size) // create a new frame node
 {
     FFRDP_FRAME_NODE *node = malloc(sizeof(FFRDP_FRAME_NODE) + size);
     if (!node) return NULL;
-    node->next         = node->prev = NULL;
-    node->size         = size;
-    node->data         = (uint8_t*)node + sizeof(FFRDP_FRAME_NODE);
-    node->flags        = 0;
-    node->tick_send    = 0;
-    node->tick_timeout = 0;
+    memset(node, 0, sizeof(FFRDP_FRAME_NODE));
+    node->size = size;
+    node->data = (uint8_t*)node + sizeof(FFRDP_FRAME_NODE);
     return node;
 }
 
