@@ -238,6 +238,21 @@ failed:
     return NULL;
 }
 
+void ffrdp_free(void *ctxt)
+{
+    FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
+    if (!ctxt) return;
+    if (ffrdp->udp_fd > 0) closesocket(ffrdp->udp_fd);
+    list_free(&ffrdp->send_list_head, &ffrdp->send_list_tail, -1);
+    list_free(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, -1);
+    pthread_mutex_destroy(&ffrdp->mutex_rx);
+    pthread_mutex_destroy(&ffrdp->mutex_tx);
+    free(ffrdp);
+#ifdef WIN32
+    WSACleanup();
+#endif
+}
+
 int ffrdp_send(void *ctxt, char *buf, int len)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
@@ -457,21 +472,6 @@ void ffrdp_update(void *ctxt)
             p = p->next;
         }
     }
-}
-
-void ffrdp_free(void *ctxt)
-{
-    FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
-    if (!ctxt) return;
-    if (ffrdp->udp_fd > 0) closesocket(ffrdp->udp_fd);
-    list_free(&ffrdp->send_list_head, &ffrdp->send_list_tail, -1);
-    list_free(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, -1);
-    pthread_mutex_destroy(&ffrdp->mutex_rx);
-    pthread_mutex_destroy(&ffrdp->mutex_tx);
-    free(ffrdp);
-#ifdef WIN32
-    WSACleanup();
-#endif
 }
 
 #if 1
