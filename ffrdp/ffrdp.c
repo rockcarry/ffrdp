@@ -193,7 +193,7 @@ void* ffrdp_init(char *ip, int port, int server)
     }
 #endif
 
-    ffrdp->recv_win = RECV_BUFF_SIZE;
+    ffrdp->recv_win = FFRDP_MTU_SIZE;
     ffrdp->rto      = FFRDP_MIN_RTO;
 
     ffrdp->server_addr.sin_family      = AF_INET;
@@ -296,12 +296,7 @@ void ffrdp_update(void *ctxt)
     send_una = ffrdp->send_list_head ? *(uint32_t*)ffrdp->send_list_head->data >> 8 : 0;
     recv_una = ffrdp->recv_seq;
 
-    if (ffrdp->send_list_head && ffrdp->recv_win < ffrdp->send_list_head->size) {
-        if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_query_rwin > FFRDP_WIN_CYCLE) { // query remote receive window size
-            data[0] = FFRDP_FRAME_TYPE_WIN0; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
-        }
-    }
-    for (i=0,p=ffrdp->send_list_head; i<16&&p; i++,p=p->next) {
+    for (p=ffrdp->send_list_head; p; p=p->next) {
         if (!(p->flags & FLAG_FIRST_SEND)) { // first send
             if (p->size - 4 <= (int)ffrdp->recv_win) {
                 ret = sendto(ffrdp->udp_fd, p->data, p->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
@@ -311,11 +306,14 @@ void ffrdp_update(void *ctxt)
                 p->tick_send     = get_tick_count();
                 p->tick_timeout  = p->tick_send + ffrdp->rto;
                 p->flags        |= FLAG_FIRST_SEND;
-            } else break;
+            } else if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_query_rwin > FFRDP_WIN_CYCLE) { // query remote receive window size
+                data[0] = FFRDP_FRAME_TYPE_WIN0; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
+                break;
+            }
         } else if ((p->flags & FLAG_FIRST_SEND) && ((int32_t)get_tick_count() - (int32_t)p->tick_timeout > 0 || (p->flags & FLAG_FAST_RESEND))) { // resend
             ret = sendto(ffrdp->udp_fd, p->data, p->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
             if (ret != p->size) break;
-//          printf("re-send packet seq: %d %d\n", *(uint32_t*)p->data >> 8, ffrdp->rto);
+            printf("re-send packet seq: %d %d\n", *(uint32_t*)p->data >> 8, ffrdp->rto);
             if (!(p->flags & FLAG_FAST_RESEND)) {
                 ffrdp->rto += ffrdp->rto / 2;
                 ffrdp->rto  = MIN(FFRDP_MAX_RTO, ffrdp->rto);
