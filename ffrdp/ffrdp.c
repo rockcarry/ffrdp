@@ -34,7 +34,6 @@ static uint32_t get_tick_count()
 
 #define MIN(a, b)         ((a) < (b) ? (a) : (b))
 #define MAX(a, b)         ((a) > (b) ? (a) : (b))
-#define SEND_BUFF_SIZE    (16 * 1024)
 #define RECV_BUFF_SIZE    (16 * 1024)
 #define FFRDP_MTU_SIZE     1024
 #define FFRDP_MIN_RTO      2
@@ -65,10 +64,6 @@ typedef struct tagFFRDP_FRAME_NODE {
 } FFRDP_FRAME_NODE;
 
 typedef struct {
-    uint8_t  send_buff[SEND_BUFF_SIZE];
-    int32_t  send_size;
-    int32_t  send_head;
-    int32_t  send_tail;
     uint8_t  recv_buff[RECV_BUFF_SIZE];
     int32_t  recv_size;
     int32_t  recv_head;
@@ -92,9 +87,6 @@ typedef struct {
     uint32_t rttm, rtts, rttd, rto;
     uint32_t tick_query_rwin;
     uint32_t wait_snd;
-
-    pthread_mutex_t mutex_rx;
-    pthread_mutex_t mutex_tx;
 } FFRDPCONTEXT;
 
 static uint32_t ringbuf_write(uint8_t *rbuf, uint32_t maxsize, uint32_t tail, uint8_t *src, uint32_t len)
@@ -221,9 +213,6 @@ void* ffrdp_init(char *ip, int port, int server)
         }
     }
 
-    pthread_mutex_init(&ffrdp->mutex_rx, NULL);
-    pthread_mutex_init(&ffrdp->mutex_tx, NULL);
-
 #ifdef WIN32
     opt = 1; ioctlsocket(ffrdp->udp_fd, FIONBIO, &opt); // setup non-block io mode
 #else
@@ -245,8 +234,6 @@ void ffrdp_free(void *ctxt)
     if (ffrdp->udp_fd > 0) closesocket(ffrdp->udp_fd);
     list_free(&ffrdp->send_list_head, &ffrdp->send_list_tail, -1);
     list_free(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, -1);
-    pthread_mutex_destroy(&ffrdp->mutex_rx);
-    pthread_mutex_destroy(&ffrdp->mutex_tx);
     free(ffrdp);
 #ifdef WIN32
     WSACleanup();
@@ -255,32 +242,36 @@ void ffrdp_free(void *ctxt)
 
 int ffrdp_send(void *ctxt, char *buf, int len)
 {
-    FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
-    int           ret;
-    if (!ffrdp || (ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0 || ffrdp->wait_snd > FFRDP_MAX_WAITSND) return -1;
-    pthread_mutex_lock(&ffrdp->mutex_tx);
-    if (len <= (int)sizeof(ffrdp->send_buff) - ffrdp->send_size) {
-        ffrdp->send_tail = ringbuf_write(ffrdp->send_buff, sizeof(ffrdp->send_buff), ffrdp->send_tail, buf, len);
-        ffrdp->send_size+= len;
-        ret = len;
-    } else ret = 0;
-    pthread_mutex_unlock(&ffrdp->mutex_tx);
-    return ret;
+    FFRDPCONTEXT     *ffrdp = (FFRDPCONTEXT*)ctxt;
+    FFRDP_FRAME_NODE *node  = NULL;
+    int               n = len, size;
+    if (  !ffrdp || (ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0
+       || (len + FFRDP_MTU_SIZE - 1) / FFRDP_MTU_SIZE + ffrdp->wait_snd > FFRDP_MAX_WAITSND) {
+        return -1;
+    }
+    while (n > 0) {
+        size = MIN(FFRDP_MTU_SIZE, n);
+        if (!(node = frame_node_new(size + 4))) break;
+        *(uint32_t*)node->data = (FFRDP_FRAME_TYPE_DATA << 0) | ((ffrdp->send_seq & 0xFFFFFF) << 8);
+        memcpy(node->data + 4, buf, size);
+        list_enqueue(&ffrdp->send_list_head, &ffrdp->send_list_tail, node);
+        ffrdp->send_seq++; ffrdp->send_seq &= 0xFFFFFF; ffrdp->wait_snd++;
+        buf += size; n -= size;
+    }
+    return len - n;
 }
 
 int ffrdp_recv(void *ctxt, char *buf, int len)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
-    int           n;
+    int           ret;
     if (!ctxt) return -1;
-    pthread_mutex_lock(&ffrdp->mutex_rx);
-    n = MIN(len, ffrdp->recv_size);
-    if (n > 0) {
-        ffrdp->recv_head = ringbuf_read(ffrdp->recv_buff, sizeof(ffrdp->recv_buff), ffrdp->recv_head, buf, n);
-        ffrdp->recv_size-= n;
+    ret = MIN(len, ffrdp->recv_size);
+    if (ret > 0) {
+        ffrdp->recv_head = ringbuf_read(ffrdp->recv_buff, sizeof(ffrdp->recv_buff), ffrdp->recv_head, buf, ret);
+        ffrdp->recv_size-= ret;
     }
-    pthread_mutex_unlock(&ffrdp->mutex_rx);
-    return n;
+    return ret;
 }
 
 int ffrdp_byebye(void *ctxt)
@@ -301,28 +292,13 @@ void ffrdp_update(void *ctxt)
     uint8_t  data[8];
 
     if (!ctxt) return;
-    dstaddr = ffrdp->flags & FLAG_SERVER ? &ffrdp->client_addr : &ffrdp->server_addr;
-
-    while (ffrdp->send_size > 0) { // move data from send ring buffer to send queue
-        size = 4 + MIN(ffrdp->send_size, FFRDP_MTU_SIZE);
-        if (!(node = frame_node_new(size))) break;
-        pthread_mutex_lock(&ffrdp->mutex_tx);
-        ffrdp->send_head = ringbuf_read(ffrdp->send_buff, sizeof(ffrdp->send_buff), ffrdp->send_head, node->data + 4, size - 4);
-        ffrdp->send_size-= size - 4;
-        pthread_mutex_unlock(&ffrdp->mutex_tx);
-        *(uint32_t*)node->data = (FFRDP_FRAME_TYPE_DATA << 0) | ((ffrdp->send_seq & 0xFFFFFF) << 8);
-        list_enqueue(&ffrdp->send_list_head, &ffrdp->send_list_tail, node);
-        ffrdp->send_seq++; ffrdp->send_seq &= 0xFFFFFF;
-        ffrdp->wait_snd++;
-    }
-
+    dstaddr  = ffrdp->flags & FLAG_SERVER ? &ffrdp->client_addr : &ffrdp->server_addr;
     send_una = ffrdp->send_list_head ? *(uint32_t*)ffrdp->send_list_head->data >> 8 : 0;
     recv_una = ffrdp->recv_seq;
 
     if (ffrdp->send_list_head && ffrdp->recv_win < ffrdp->send_list_head->size) {
         if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_query_rwin > FFRDP_WIN_CYCLE) { // query remote receive window size
-            data[0] = FFRDP_FRAME_TYPE_WIN0;
-            sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
+            data[0] = FFRDP_FRAME_TYPE_WIN0; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
         }
     }
     for (recv_full=0,i=0,p=ffrdp->send_list_head; i<16&&p; i++,p=p->next) {
@@ -422,10 +398,8 @@ void ffrdp_update(void *ctxt)
             seq  = *(uint32_t*)ffrdp->recv_list_head->data >> 8;
             dist = seq_distance(seq, ffrdp->recv_seq);
             if (dist == 0 && ffrdp->recv_list_head->size - 4 <= (int)(sizeof(ffrdp->recv_buff) - ffrdp->recv_size)) {
-                pthread_mutex_lock(&ffrdp->mutex_rx);
                 ffrdp->recv_tail = ringbuf_write(ffrdp->recv_buff, sizeof(ffrdp->recv_buff), ffrdp->recv_tail, ffrdp->recv_list_head->data + 4, ffrdp->recv_list_head->size - 4);
                 ffrdp->recv_size+= ffrdp->recv_list_head->size - 4;
-                pthread_mutex_unlock(&ffrdp->mutex_rx);
                 ffrdp->recv_seq++; ffrdp->recv_seq &= 0xFFFFFF;
                 list_remove(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, ffrdp->recv_list_head, 1);
             } else break;
@@ -518,7 +492,7 @@ static void* client_thread(void *param)
 
 int main(void)
 {
-    pthread_t hserver;
+//  pthread_t hserver;
     pthread_t hclient;
 
 //  pthread_create(&hserver, NULL, server_thread, NULL);
