@@ -288,7 +288,7 @@ void ffrdp_update(void *ctxt)
     FFRDP_FRAME_NODE   *node    = NULL, *p = NULL, *t = NULL;
     struct sockaddr_in *dstaddr = NULL;
     struct sockaddr_in  srcaddr;
-    int32_t  seq, una, mack, size, ret, send_una, send_mack = 0, recv_una, recv_mack = 0, recv_win, dist, recv_full, maxack, i;
+    int32_t  seq, una, mack, size, ret, send_una, send_mack = 0, recv_una, recv_mack = 0, recv_win, dist, maxack, i;
     uint8_t  data[8];
 
     if (!ctxt) return;
@@ -301,8 +301,8 @@ void ffrdp_update(void *ctxt)
             data[0] = FFRDP_FRAME_TYPE_WIN0; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
         }
     }
-    for (recv_full=0,i=0,p=ffrdp->send_list_head; i<16&&p; i++,p=p->next) {
-        if (!recv_full && !(p->flags & FLAG_FIRST_SEND)) { // first send
+    for (i=0,p=ffrdp->send_list_head; i<16&&p; i++,p=p->next) {
+        if (!(p->flags & FLAG_FIRST_SEND)) { // first send
             if (p->size - 4 <= (int)ffrdp->recv_win) {
                 ret = sendto(ffrdp->udp_fd, p->data, p->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
                 if (ret != p->size) break;
@@ -311,7 +311,7 @@ void ffrdp_update(void *ctxt)
                 p->tick_send     = get_tick_count();
                 p->tick_timeout  = p->tick_send + ffrdp->rto;
                 p->flags        |= FLAG_FIRST_SEND;
-            } else recv_full = 1;
+            } else break;
         } else if ((p->flags & FLAG_FIRST_SEND) && ((int32_t)get_tick_count() - (int32_t)p->tick_timeout > 0 || (p->flags & FLAG_FAST_RESEND))) { // resend
             ret = sendto(ffrdp->udp_fd, p->data, p->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
             if (ret != p->size) break;
