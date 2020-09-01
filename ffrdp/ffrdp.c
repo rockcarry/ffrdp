@@ -61,7 +61,7 @@ typedef struct tagFFRDP_FRAME_NODE {
     #define FLAG_NEED_REMOVE (1 << 3) // if this flag set, frame need remove from send queue
     uint32_t flags;        // frame flags
     uint32_t tick_send;    // frame send tick
-    uint32_t tick_timeout; // frame ack timeout tick
+    uint32_t tick_timeout; // frame ack timeout
 } FFRDP_FRAME_NODE;
 
 typedef struct {
@@ -88,7 +88,7 @@ typedef struct {
     FFRDP_FRAME_NODE *recv_list_tail;
     uint32_t send_seq;
     uint32_t recv_seq;
-    uint32_t recv_win;
+    uint32_t recv_win; // remote receive window
     uint32_t rttm, rtts, rttd, rto;
     uint32_t tick_query_rwin;
     uint32_t wait_snd;
@@ -285,8 +285,7 @@ void ffrdp_update(void *ctxt)
     FFRDP_FRAME_NODE   *node    = NULL, *p = NULL, *t = NULL;
     struct sockaddr_in *dstaddr = NULL;
     struct sockaddr_in  srcaddr;
-    int      seq, una, mack, size, ret, send_una, send_mack = 0, recv_una, recv_mack = 0, recv_win, dist, recv_full, i;
-    uint32_t maxack, tick;
+    int32_t  seq, una, mack, size, ret, send_una, send_mack = 0, recv_una, recv_mack = 0, recv_win, dist, recv_full, maxack, i;
     uint8_t  data[8];
 
     if (!ctxt) return;
@@ -308,9 +307,15 @@ void ffrdp_update(void *ctxt)
     send_una = ffrdp->send_list_head ? *(uint32_t*)ffrdp->send_list_head->data >> 8 : 0;
     recv_una = ffrdp->recv_seq;
 
+    if (ffrdp->send_list_head && ffrdp->recv_win < ffrdp->send_list_head->size) {
+        if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_query_rwin > FFRDP_WIN_CYCLE) { // query remote receive window size
+            data[0] = FFRDP_FRAME_TYPE_WIN0;
+            sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
+        }
+    }
     for (recv_full=0,i=0,p=ffrdp->send_list_head; i<16&&p; i++,p=p->next) {
         if (!recv_full && !(p->flags & FLAG_FIRST_SEND)) { // first send
-            if ((int)ffrdp->recv_win >= p->size - 4) {
+            if (p->size - 4 <= (int)ffrdp->recv_win) {
                 ret = sendto(ffrdp->udp_fd, p->data, p->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
                 if (ret != p->size) break;
 //              printf("first send packet seq: %d\n", *(uint32_t*)p->data >> 8);
@@ -318,16 +323,11 @@ void ffrdp_update(void *ctxt)
                 p->tick_send     = get_tick_count();
                 p->tick_timeout  = p->tick_send + ffrdp->rto;
                 p->flags        |= FLAG_FIRST_SEND;
-            } else if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_query_rwin > FFRDP_WIN_CYCLE) { // query rx recv win
-                data[0] = FFRDP_FRAME_TYPE_WIN0;
-                sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
-                ffrdp->tick_query_rwin = get_tick_count();
-                recv_full = 1;
-            }
+            } else recv_full = 1;
         } else if ((p->flags & FLAG_FIRST_SEND) && ((int32_t)get_tick_count() - (int32_t)p->tick_timeout > 0 || (p->flags & FLAG_FAST_RESEND))) { // resend
             ret = sendto(ffrdp->udp_fd, p->data, p->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
             if (ret != p->size) break;
-            printf("re-send packet seq: %d %d\n", *(uint32_t*)p->data >> 8, ffrdp->rto);
+//          printf("re-send packet seq: %d %d\n", *(uint32_t*)p->data >> 8, ffrdp->rto);
             if (!(p->flags & FLAG_FAST_RESEND)) {
                 ffrdp->rto += ffrdp->rto / 2;
                 ffrdp->rto  = MIN(FFRDP_MAX_RTO, ffrdp->rto);
@@ -371,7 +371,6 @@ void ffrdp_update(void *ctxt)
             una  = *(uint32_t*)(node->data + 0) >> 8;
             mack = *(uint32_t*)(node->data + 4) & 0xFFFF;
             dist = seq_distance(una, send_una);
-//          if (dist >= 0) { tick = get_tick_count(); }
             if (dist == 0) {
                 send_mack|= mack;
             } if (dist > 0) {
@@ -388,7 +387,7 @@ void ffrdp_update(void *ctxt)
             sendto(ffrdp->udp_fd, data, 3, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
             break;
         case FFRDP_FRAME_TYPE_WIN1:
-            ffrdp->recv_win = (data[1] << 0) | (data[2] << 8);
+            ffrdp->recv_win = (data[1] << 0) | (data[2] << 8); ffrdp->tick_query_rwin = get_tick_count();
             break;
         case FFRDP_FRAME_TYPE_BYE:
             if (ffrdp->flags & FLAG_SERVER) {
@@ -406,33 +405,26 @@ void ffrdp_update(void *ctxt)
         data[0] = FFRDP_FRAME_TYPE_BYE; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
     }
 
-    if (seq_distance(recv_una, ffrdp->recv_seq) > 0) { // got data frame
+    if (seq_distance(recv_una, ffrdp->recv_seq) > 0 || recv_mack) { // got data frame
+        while (ffrdp->recv_list_head) {
+            seq  = *(uint32_t*)ffrdp->recv_list_head->data >> 8;
+            dist = seq_distance(seq, ffrdp->recv_seq);
+            if (dist == 0 && ffrdp->recv_list_head->size - 4 <= (int)(sizeof(ffrdp->recv_buff) - ffrdp->recv_size)) {
+                pthread_mutex_lock(&ffrdp->mutex_rx);
+                ffrdp->recv_tail = ringbuf_write(ffrdp->recv_buff, sizeof(ffrdp->recv_buff), ffrdp->recv_tail, ffrdp->recv_list_head->data + 4, ffrdp->recv_list_head->size - 4);
+                ffrdp->recv_size+= ffrdp->recv_list_head->size - 4;
+                pthread_mutex_unlock(&ffrdp->mutex_rx);
+                ffrdp->recv_seq++; ffrdp->recv_seq &= 0xFFFFFF;
+                list_remove(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, ffrdp->recv_list_head, 1);
+            } else break;
+        }
         *(uint32_t*)(data + 0) = (FFRDP_FRAME_TYPE_ACK << 0) | (recv_una << 8);
         *(uint32_t*)(data + 4) = (recv_mack << 0) | ((sizeof(ffrdp->recv_buff) - ffrdp->recv_size) << 16);
         sendto(ffrdp->udp_fd, data, sizeof(data), 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)); // send ack frame
-
-        for (p=ffrdp->recv_list_head; p;) {
-            seq  = *(uint32_t*)p->data >> 8;
-            dist = seq_distance(seq, ffrdp->recv_seq);
-            if (dist == 0) {
-                if (p->size - 4 <= (int)(sizeof(ffrdp->recv_buff) - ffrdp->recv_size)) {
-                    pthread_mutex_lock(&ffrdp->mutex_rx);
-                    ffrdp->recv_tail = ringbuf_write(ffrdp->recv_buff, sizeof(ffrdp->recv_buff), ffrdp->recv_tail, p->data + 4, p->size - 4);
-                    ffrdp->recv_size+= p->size - 4;
-                    pthread_mutex_unlock(&ffrdp->mutex_rx);
-                    ffrdp->recv_seq++; ffrdp->recv_seq &= 0xFFFFFF;
-                    t = p; p = p->next; list_remove(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, t, 1); continue;
-                } else {
-                    printf("recv buffer is not enough !\n");
-                    break;
-                }
-            } break;
-            p = p->next;
-        }
     }
 
     if (ffrdp->send_list_head && seq_distance(send_una, *(uint32_t*)ffrdp->send_list_head->data >> 8) > 0) { // got ack frame
-        ffrdp->recv_win = recv_win; // update rx recv window size
+        ffrdp->recv_win = recv_win; ffrdp->tick_query_rwin = get_tick_count(); // update rx recv window size
         for (p=ffrdp->send_list_head; p;) {
             seq = *(uint32_t*)p->data >> 8;
             dist= seq_distance(send_una, seq);
@@ -532,7 +524,7 @@ int main(void)
     pthread_t hserver;
     pthread_t hclient;
 
-    pthread_create(&hserver, NULL, server_thread, NULL);
+//  pthread_create(&hserver, NULL, server_thread, NULL);
     pthread_create(&hclient, NULL, client_thread, NULL);
 
     while (!g_exit) {
@@ -543,7 +535,7 @@ int main(void)
         }
     }
 
-    pthread_join(hserver, NULL);
+//  pthread_join(hserver, NULL);
     pthread_join(hclient, NULL);
     return 0;
 }
