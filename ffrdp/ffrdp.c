@@ -53,15 +53,15 @@ enum {
 typedef struct tagFFRDP_FRAME_NODE {
     struct tagFFRDP_FRAME_NODE *next;
     struct tagFFRDP_FRAME_NODE *prev;
-    uint16_t size;
-    uint8_t *data;
+    uint16_t size; // frame size
+    uint8_t *data; // frame data
     #define FLAG_FIRST_SEND  (1 << 0) // after frame first send, this flag will be set
     #define FLAG_DATA_RESEND (1 << 1) // after frame resend, this flag will be set
     #define FLAG_FAST_RESEND (1 << 2) // data frame need fast resend when next update
     #define FLAG_NEED_REMOVE (1 << 3) // if this flag set, frame need remove from send queue
-    uint32_t flags;
-    uint32_t tick_send;
-    uint32_t tick_timeout;
+    uint32_t flags;        // frame flags
+    uint32_t tick_send;    // frame send tick
+    uint32_t tick_timeout; // frame ack timeout tick
 } FFRDP_FRAME_NODE;
 
 typedef struct {
@@ -73,12 +73,12 @@ typedef struct {
     int32_t  recv_size;
     int32_t  recv_head;
     int32_t  recv_tail;
-    SOCKET   udp_fd;
     #define FLAG_SERVER    (1 << 0)
     #define FLAG_CONNECTED (1 << 1)
     #define FLAG_BYEBYE0   (1 << 2)
     #define FLAG_BYEBYE1   (1 << 3)
     uint32_t flags;
+    SOCKET   udp_fd;
     struct   sockaddr_in server_addr;
     struct   sockaddr_in client_addr;
 
@@ -119,17 +119,17 @@ static uint32_t ringbuf_read(uint8_t *rbuf, uint32_t maxsize, uint32_t head, uin
     return len2 ? len2 : head + len1;
 }
 
-static int32_t signed_extend(uint32_t a, int size)
+static int32_t signed_extend(uint32_t a, int size) // signed extend 24bit to 32bit
 {
     return (a & (1 << (size - 1))) ? (a | ~((1 << size) - 1)) : a;
 }
 
-static int seq_distance(uint32_t seq1, uint32_t seq2)
+static int seq_distance(uint32_t seq1, uint32_t seq2) // calculate seq distance
 {
     return signed_extend(seq1, 24) - signed_extend(seq2, 24);
 }
 
-static FFRDP_FRAME_NODE* frame_node_new(int size)
+static FFRDP_FRAME_NODE* frame_node_new(int size) // create a new frame node
 {
     FFRDP_FRAME_NODE *node = malloc(sizeof(FFRDP_FRAME_NODE) + size);
     if (!node) return NULL;
@@ -232,6 +232,7 @@ void* ffrdp_init(char *ip, int port, int server)
 #else
     fcntl(ffrdp->server_fd, F_SETFL, fcntl(ffrdp->server_fd, F_GETFL, 0) | O_NONBLOCK);  // setup non-block io mode
 #endif
+    opt = 16*FFRDP_MTU_SIZE; setsockopt(ffrdp->udp_fd, SOL_SOCKET, SO_RCVBUF, (char*)&opt, sizeof(int)); // setup udp recv buffer size
     return ffrdp;
 
 failed:
@@ -244,7 +245,7 @@ int ffrdp_send(void *ctxt, char *buf, int len)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     int           ret;
-    if (!ffrdp || (ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0 || ffrdp->wait_snd >= FFRDP_MAX_WAITSND) return -1;
+    if (!ffrdp || (ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0 || ffrdp->wait_snd > FFRDP_MAX_WAITSND) return -1;
     pthread_mutex_lock(&ffrdp->mutex_tx);
     if (len <= (int)sizeof(ffrdp->send_buff) - ffrdp->send_size) {
         ffrdp->send_tail = ringbuf_write(ffrdp->send_buff, sizeof(ffrdp->send_buff), ffrdp->send_tail, buf, len);
@@ -490,41 +491,13 @@ static g_exit = 0;
 static void* server_thread(void *param)
 {
     void *ffrdp = ffrdp_init("0.0.0.0", 8002, 1);
-    uint8_t  sendbuf[8*1024];
-    uint8_t  recvbuf[8*1024];
-    uint8_t  buffer [8*1024];
-    int      recvhead = 0;
-    int      recvtail = 0;
-    int      recvsize = 0;
-    int      size, ret;
+    uint8_t buffer[8*1024];
+    int     ret;
 
     while (!g_exit) {
-#if 0
-        size = 1 + rand() & 0x1FFF;
-        *(uint32_t*)(sendbuf + 0) = size;
-        *(uint32_t*)(sendbuf + 4) = get_tick_count();
-        ret = ffrdp_send(ffrdp, sendbuf, size);
-        if (ret != size) {
-            printf("server send data failed: %d\n", size);
-        }
-#endif
-
         ret = ffrdp_recv(ffrdp, buffer, sizeof(buffer));
         if (ret > 0) printf("ret: %d\n", ret);
-#if 0
-        if (ret > 0) {
-            recvtail = ringbuf_write(recvbuf, sizeof(recvbuf), recvtail, buffer, ret);
-            recvsize+= ret;
-        }
-        if (recvsize >= 4) {
-            ringbuf_read(recvbuf, sizeof(recvbuf), recvhead, (uint8_t*)&size, 4);
-            if (recvsize >= size) {
-                recvhead = ringbuf_read(recvbuf, sizeof(recvbuf), recvhead, buffer, size);
-                recvsize-= size;
-                printf("server receive data, size: %d, %s, delay: %d\n", size, buffer + 8, get_tick_count() - *(uint32_t*)(buffer + 4));
-            }
-        }
-#endif
+
         ffrdp_update(ffrdp);
         usleep(10 * 1000);
     }
@@ -535,13 +508,8 @@ static void* server_thread(void *param)
 static void* client_thread(void *param)
 {
     void *ffrdp = ffrdp_init("192.168.0.148", 8002, 0);
-    uint8_t  sendbuf[8*1024];
-    uint8_t  recvbuf[8*1024];
-    uint8_t  buffer [8*1024];
-    int      recvhead = 0;
-    int      recvtail = 0;
-    int      recvsize = 0;
-    int      size, ret;
+    uint8_t sendbuf[8*1024];
+    int     size, ret;
 
     while (!g_exit) {
         size = 1 + rand() & 0x1FFF;
@@ -551,22 +519,6 @@ static void* client_thread(void *param)
         if (ret != size) {
             printf("client send data failed: %d\n", size);
         }
-
-#if 0
-        ret = ffrdp_recv(ffrdp, buffer, sizeof(buffer));
-        if (ret > 0) {
-            recvtail = ringbuf_write(recvbuf, sizeof(recvbuf), recvtail, buffer, ret);
-            recvsize+= ret;
-        }
-        if (recvsize > 4) {
-            ringbuf_read(recvbuf, sizeof(recvbuf), recvhead, (uint8_t*)&size, 4);
-            if (recvsize > size) {
-                recvhead = ringbuf_read(recvbuf, sizeof(recvbuf), recvhead, buffer, size);
-                recvsize-= size;
-                printf("client receive data, size: %d, delay: %d\n", size, get_tick_count() - *(uint32_t*)(buffer + 4));
-            }
-        }
-#endif
 
         ffrdp_update(ffrdp);
         usleep(10 * 1000);
@@ -580,7 +532,7 @@ int main(void)
     pthread_t hserver;
     pthread_t hclient;
 
-//  pthread_create(&hserver, NULL, server_thread, NULL);
+    pthread_create(&hserver, NULL, server_thread, NULL);
     pthread_create(&hclient, NULL, client_thread, NULL);
 
     while (!g_exit) {
@@ -591,7 +543,7 @@ int main(void)
         }
     }
 
-//  pthread_join(hserver, NULL);
+    pthread_join(hserver, NULL);
     pthread_join(hclient, NULL);
     return 0;
 }
