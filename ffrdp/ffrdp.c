@@ -342,16 +342,8 @@ void ffrdp_update(void *ctxt)
         case FFRDP_FRAME_TYPE_DATA:
             seq  = *(uint32_t*)node->data >> 8;
             dist = seq_distance(seq, recv_una);
-            if (dist == 0) {
-                for (i=0; i<16 && (recv_mack & (1<<i)); i++);
-                recv_una  += i + 1;
-                recv_mack>>= i;
-            } else if (dist > 0 && dist <= 16) {
-                recv_mack |= (1 << (dist - 1));
-            }
-            if (dist >= 0 && dist <= 16) {
-                node->size = ret; list_enqueue(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, node); node = NULL;
-            }
+            if (dist == 0) recv_una++;
+            if (dist >= 0) { node->size = ret; list_enqueue(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, node); node = NULL; }
             break;
         case FFRDP_FRAME_TYPE_ACK:
             una  = *(uint32_t*)(node->data + 0) >> 8;
@@ -366,7 +358,7 @@ void ffrdp_update(void *ctxt)
             }
             break;
         case FFRDP_FRAME_TYPE_WIN0:
-            size    = sizeof(ffrdp->recv_buff) - ffrdp->recv_size;
+            size    = (!ffrdp->recv_list_head || (*(uint32_t*)ffrdp->recv_list_head->data >> 8) != ffrdp->recv_seq) ? sizeof(ffrdp->recv_buff) - ffrdp->recv_size : 0;
             data[0] = FFRDP_FRAME_TYPE_WIN1;
             data[1] = (size >> 0) & 0xFF;
             data[2] = (size >> 8) & 0xFF;
@@ -391,7 +383,7 @@ void ffrdp_update(void *ctxt)
         data[0] = FFRDP_FRAME_TYPE_BYE; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
     }
 
-    if (seq_distance(recv_una, ffrdp->recv_seq) > 0 || recv_mack) { // got data frame
+    if (seq_distance(recv_una, ffrdp->recv_seq) > 0) { // got data frame
         while (ffrdp->recv_list_head) {
             seq  = *(uint32_t*)ffrdp->recv_list_head->data >> 8;
             dist = seq_distance(seq, ffrdp->recv_seq);
@@ -402,8 +394,16 @@ void ffrdp_update(void *ctxt)
                 list_remove(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, ffrdp->recv_list_head, 1);
             } else break;
         }
-        *(uint32_t*)(data + 0) = (FFRDP_FRAME_TYPE_ACK << 0) | (recv_una << 8);
-        *(uint32_t*)(data + 4) = (recv_mack << 0) | ((sizeof(ffrdp->recv_buff) - ffrdp->recv_size) << 16);
+        for (recv_mack=0,i=0,p=ffrdp->recv_list_head; i<=16&&p; i++,p->next) {
+            seq  = *(uint32_t*)ffrdp->recv_list_head->data >> 8;
+            dist = seq_distance(seq, ffrdp->recv_seq);
+            if (dist > 1 && dist <= 16) recv_mack |= 1 << (dist - 1);
+        }
+        *(uint32_t*)(data + 0) = (FFRDP_FRAME_TYPE_ACK << 0) | (ffrdp->recv_seq << 8);
+        *(uint32_t*)(data + 4) = (recv_mack << 0);;
+        if (!ffrdp->recv_list_head || (*(uint32_t*)ffrdp->recv_list_head->data >> 8) != ffrdp->recv_seq) {
+            *(uint32_t*)(data + 4) |= (sizeof(ffrdp->recv_buff) - ffrdp->recv_size) << 16;
+        }
         sendto(ffrdp->udp_fd, data, sizeof(data), 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)); // send ack frame
     }
 
@@ -448,7 +448,6 @@ void ffrdp_update(void *ctxt)
 
 #if 1
 static g_exit = 0;
-
 static void* server_thread(void *param)
 {
     void *ffrdp = ffrdp_init("0.0.0.0", 8002, 1);
