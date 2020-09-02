@@ -214,6 +214,7 @@ void* ffrdp_init(char *ip, int port, int server)
     if (!ffrdp) return NULL;
 
 #ifdef WIN32
+    timeBeginPeriod(1);
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         printf("WSAStartup failed !\n");
         return NULL;
@@ -264,6 +265,7 @@ void ffrdp_free(void *ctxt)
     free(ffrdp);
 #ifdef WIN32
     WSACleanup();
+    timeEndPeriod(1);
 #endif
 }
 
@@ -507,7 +509,7 @@ static void* server_thread(void *param)
     tick_start  = get_tick_count();
     total_bytes = 0;
     while (!g_exit) {
-       size = 1 + (rand() & 0x3FFF);
+       size = 1 + (rand() & 0x1FFF);
         *(uint32_t*)(sendbuf + 4) = get_tick_count();
         strcpy((char*)sendbuf + 8, "rockcarry server data");
         ret = ffrdp_send(ffrdp, (char*)sendbuf, size);
@@ -545,7 +547,7 @@ static void* client_thread(void *param)
     tick_start  = get_tick_count();
     total_bytes = 0;
     while (!g_exit) {
-        size = 1 + (rand() & 0x3FFF);
+        size = 1 + (rand() & 0x1FFF);
         *(uint32_t*)(sendbuf + 4) = get_tick_count();
         strcpy((char*)sendbuf + 8, "rockcarry client data");
 

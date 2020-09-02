@@ -61,7 +61,7 @@
 			/>
 			<Tool
 				Name="VCLinkerTool"
-				AdditionalDependencies="ws2_32.lib pthread.lib"
+				AdditionalDependencies="ws2_32.lib pthread.lib winmm.lib"
 				LinkIncremental="2"
 				AdditionalLibraryDirectories="../pthread-win32/lib"
 				GenerateDebugInformation="true"
@@ -137,7 +137,7 @@
 			/>
 			<Tool
 				Name="VCLinkerTool"
-				AdditionalDependencies="ws2_32.lib pthread.lib"
+				AdditionalDependencies="ws2_32.lib pthread.lib winmm.lib"
 				LinkIncremental="1"
 				AdditionalLibraryDirectories="../pthread-win32/lib"
 				GenerateDebugInformation="true"
