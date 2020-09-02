@@ -32,14 +32,14 @@ static uint32_t get_tick_count()
 }
 #endif
 
-#define MIN(a, b)         ((a) < (b) ? (a) : (b))
-#define MAX(a, b)         ((a) > (b) ? (a) : (b))
-#define RECV_BUFF_SIZE    (16 * 1024)
-#define FFRDP_MTU_SIZE     1024
-#define FFRDP_MIN_RTO      20
-#define FFRDP_MAX_RTO      2000
-#define FFRDP_WIN_CYCLE    100
-#define FFRDP_MAX_WAITSND  256
+#define MIN(a, b)          ((a) < (b) ? (a) : (b))
+#define MAX(a, b)          ((a) > (b) ? (a) : (b))
+#define FFRDP_RECVBUF_SIZE (32 * 1024)
+#define FFRDP_MTU_SIZE      1024
+#define FFRDP_MIN_RTO       20
+#define FFRDP_MAX_RTO       2000
+#define FFRDP_WIN_CYCLE     100
+#define FFRDP_MAX_WAITSND   256
 
 enum {
     FFRDP_FRAME_TYPE_DATA,
@@ -64,7 +64,7 @@ typedef struct tagFFRDP_FRAME_NODE {
 } FFRDP_FRAME_NODE;
 
 typedef struct {
-    uint8_t  recv_buff[RECV_BUFF_SIZE];
+    uint8_t  recv_buff[FFRDP_RECVBUF_SIZE];
     int32_t  recv_size;
     int32_t  recv_head;
     int32_t  recv_tail;
@@ -218,7 +218,7 @@ void* ffrdp_init(char *ip, int port, int server)
 #else
     fcntl(ffrdp->server_fd, F_SETFL, fcntl(ffrdp->server_fd, F_GETFL, 0) | O_NONBLOCK);  // setup non-block io mode
 #endif
-    opt = 16 * (4 + FFRDP_MTU_SIZE); setsockopt(ffrdp->udp_fd, SOL_SOCKET, SO_RCVBUF, (char*)&opt, sizeof(int)); // setup udp recv buffer size
+    opt = 256 * FFRDP_MTU_SIZE; setsockopt(ffrdp->udp_fd, SOL_SOCKET, SO_RCVBUF, (char*)&opt, sizeof(int)); // setup udp recv buffer size
     return ffrdp;
 
 failed:
@@ -452,15 +452,26 @@ static g_exit = 0;
 static void* server_thread(void *param)
 {
     void *ffrdp = ffrdp_init("0.0.0.0", 8002, 1);
-    uint8_t buffer[8*1024];
-    int     ret;
+    uint8_t  buffer[8*1024];
+    uint32_t tick_start, total_bytes;
+    int      ret;
 
+    tick_start  = get_tick_count();
+    total_bytes = 0;
     while (!g_exit) {
         ret = ffrdp_recv(ffrdp, buffer, sizeof(buffer));
-        if (ret > 0) printf("ret: %d\n", ret);
+        if (ret > 0) {
+//          printf("ret: %d\n", ret);
+            total_bytes += ret;
+            if (get_tick_count() - tick_start > 10 * 1000) {
+                printf("%.2f KB/s\n", (float)total_bytes / 10240);
+                tick_start = get_tick_count();
+                total_bytes= 0;
+            }
+        }
 
         ffrdp_update(ffrdp);
-        usleep(10 * 1000);
+        usleep(1 * 1000);
     }
     ffrdp_free(ffrdp);
     return NULL;
@@ -469,20 +480,21 @@ static void* server_thread(void *param)
 static void* client_thread(void *param)
 {
     void *ffrdp = ffrdp_init("192.168.0.148", 8002, 0);
-    uint8_t sendbuf[8*1024];
-    int     size, ret;
+    uint8_t  sendbuf[8*1024];
+    int      size, ret;
 
     while (!g_exit) {
         size = 1 + rand() & 0x1FFF;
         *(uint32_t*)(sendbuf + 4) = get_tick_count();
-        strcpy(sendbuf + 8, "rock");
+        strcpy(sendbuf + 8, "rockcarry");
+
         ret = ffrdp_send(ffrdp, sendbuf, size);
         if (ret != size) {
             printf("client send data failed: %d\n", size);
         }
 
         ffrdp_update(ffrdp);
-        usleep(10 * 1000);
+        usleep(1 * 1000);
     }
     ffrdp_free(ffrdp);
     return NULL;
