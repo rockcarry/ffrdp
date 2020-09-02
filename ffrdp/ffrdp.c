@@ -94,6 +94,10 @@ typedef struct {
     uint32_t rttm, rtts, rttd, rto;
     uint32_t tick_query_rwin;
     uint32_t wait_snd;
+    uint32_t counter_send_1sttime;
+    uint32_t counter_resend_fast;
+    uint32_t counter_resend_rto;
+    uint32_t counter_query_rwin;
 } FFRDPCONTEXT;
 
 static uint32_t ringbuf_write(uint8_t *rbuf, uint32_t maxsize, uint32_t tail, uint8_t *src, uint32_t len)
@@ -193,6 +197,7 @@ static void ffrdp_reset(FFRDPCONTEXT *ffrdp)
     ffrdp->recv_win  = FFRDP_MTU_SIZE;
     ffrdp->rto       = FFRDP_MIN_RTO;
     ffrdp->flags    &=~(FLAG_CONNECTED|FLAG_BYEBYE0|FLAG_BYEBYE1);
+    ffrdp->counter_send_1sttime = ffrdp->counter_resend_fast = ffrdp->counter_resend_rto = ffrdp->counter_query_rwin = 0;
     list_free(&ffrdp->send_list_head, &ffrdp->send_list_tail, -1);
     list_free(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, -1);
     memset(&ffrdp->client_addr, 0, sizeof(ffrdp->client_addr));
@@ -329,8 +334,10 @@ void ffrdp_update(void *ctxt)
                 p->tick_send     = get_tick_count();
                 p->tick_timeout  = p->tick_send + ffrdp->rto;
                 p->flags        |= FLAG_FIRST_SEND;
+                ffrdp->counter_send_1sttime++;
             } else if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_query_rwin > FFRDP_WIN_CYCLE) { // query remote receive window size
                 data[0] = FFRDP_FRAME_TYPE_WIN0; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
+                ffrdp->counter_query_rwin++;
                 break;
             }
         } else if ((p->flags & FLAG_FIRST_SEND) && ((int32_t)get_tick_count() - (int32_t)p->tick_timeout > 0 || (p->flags & FLAG_FAST_RESEND))) { // resend
@@ -340,6 +347,9 @@ void ffrdp_update(void *ctxt)
             if (!(p->flags & FLAG_FAST_RESEND)) {
                 ffrdp->rto += ffrdp->rto / 2;
                 ffrdp->rto  = MIN(FFRDP_MAX_RTO, ffrdp->rto);
+                ffrdp->counter_resend_rto++;
+            } else {
+                ffrdp->counter_resend_fast++;
             }
             p->tick_send    = get_tick_count();
             p->tick_timeout = p->tick_send + ffrdp->rto;
@@ -466,6 +476,24 @@ void ffrdp_update(void *ctxt)
     }
 }
 
+void ffrdp_dump(void *ctxt)
+{
+    FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
+    if (!ctxt) return;
+    printf("recv_size           : %d\n", ffrdp->recv_size           );
+    printf("flags               : %x\n", ffrdp->flags               );
+    printf("send_seq            : %u\n", ffrdp->send_seq            );
+    printf("recv_seq            : %u\n", ffrdp->recv_seq            );
+    printf("recv_win            : %u\n", ffrdp->recv_win            );
+    printf("wait_snd            : %u\n", ffrdp->wait_snd            );
+    printf("tick_query_rwin     : %u\n", ffrdp->tick_query_rwin     );
+    printf("counter_send_1sttime: %u\n", ffrdp->counter_send_1sttime);
+    printf("counter_resend_fast : %u\n", ffrdp->counter_resend_fast );
+    printf("counter_resend_rto  : %u\n", ffrdp->counter_resend_rto  );
+    printf("counter_query_rwin  : %u\n", ffrdp->counter_query_rwin  );
+    printf("rttm: %u, rtts: %u, rttd: %u, rto: %u\n\n", ffrdp->rttm, ffrdp->rtts, ffrdp->rttd, ffrdp->rto);
+}
+
 #if 1
 static int g_exit = 0;
 static void* server_thread(void *param)
@@ -492,7 +520,8 @@ static void* server_thread(void *param)
 //          printf("ret: %d\n", ret);
             total_bytes += ret;
             if ((int32_t)get_tick_count() - (int32_t)tick_start > 10 * 1000) {
-                printf("server receive: %.2f KB/s\n", (float)total_bytes / 10240);
+//              printf("server receive: %.2f KB/s\n", (float)total_bytes / 10240);
+//              ffrdp_dump(ffrdp);
                 tick_start = get_tick_count();
                 total_bytes= 0;
             }
@@ -531,6 +560,7 @@ static void* client_thread(void *param)
             total_bytes += ret;
             if ((int32_t)get_tick_count() - (int32_t)tick_start > 10 * 1000) {
                 printf("client receive: %.2f KB/s\n", (float)total_bytes / 10240);
+                ffrdp_dump(ffrdp);
                 tick_start = get_tick_count();
                 total_bytes= 0;
             }
