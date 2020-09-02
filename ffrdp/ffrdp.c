@@ -455,19 +455,28 @@ static int g_exit = 0;
 static void* server_thread(void *param)
 {
     void *ffrdp = ffrdp_init("0.0.0.0", 8002, 1);
-    uint8_t  buffer[32*1024];
+    uint8_t  sendbuf[16*1024];
+    uint8_t  recvbuf[16*1024];
     uint32_t tick_start, total_bytes;
-    int      ret;
+    int      size, ret;
 
     tick_start  = get_tick_count();
     total_bytes = 0;
     while (!g_exit) {
-        ret = ffrdp_recv(ffrdp, (char*)buffer, sizeof(buffer));
+       size = 1 + (rand() & 0x3FFF);
+        *(uint32_t*)(sendbuf + 4) = get_tick_count();
+        strcpy((char*)sendbuf + 8, "rockcarry server data");
+        ret = ffrdp_send(ffrdp, (char*)sendbuf, size);
+        if (ret != size) {
+            printf("server send data failed: %d\n", size);
+        }
+
+        ret = ffrdp_recv(ffrdp, (char*)recvbuf, sizeof(recvbuf));
         if (ret > 0) {
 //          printf("ret: %d\n", ret);
             total_bytes += ret;
             if (get_tick_count() - tick_start > 10 * 1000) {
-                printf("%.2f KB/s\n", (float)total_bytes / 10240);
+                printf("server receive: %.2f KB/s\n", (float)total_bytes / 10240);
                 tick_start = get_tick_count();
                 total_bytes= 0;
             }
@@ -483,17 +492,32 @@ static void* server_thread(void *param)
 static void* client_thread(void *param)
 {
     void *ffrdp = ffrdp_init("192.168.0.148", 8002, 0);
-    uint8_t  sendbuf[32*1024];
+    uint8_t  sendbuf[16*1024];
+    uint8_t  recvbuf[16*1024];
+    uint32_t tick_start, total_bytes;
     int      size, ret;
 
+    tick_start  = get_tick_count();
+    total_bytes = 0;
     while (!g_exit) {
         size = 1 + (rand() & 0x3FFF);
         *(uint32_t*)(sendbuf + 4) = get_tick_count();
-        strcpy((char*)sendbuf + 8, "rockcarry");
+        strcpy((char*)sendbuf + 8, "rockcarry client data");
 
         ret = ffrdp_send(ffrdp, (char*)sendbuf, size);
         if (ret != size) {
             printf("client send data failed: %d\n", size);
+        }
+
+        ret = ffrdp_recv(ffrdp, (char*)recvbuf, sizeof(recvbuf));
+        if (ret > 0) {
+//          printf("ret: %d\n", ret);
+            total_bytes += ret;
+            if (get_tick_count() - tick_start > 10 * 1000) {
+                printf("client receive: %.2f KB/s\n", (float)total_bytes / 10240);
+                tick_start = get_tick_count();
+                total_bytes= 0;
+            }
         }
 
         ffrdp_update(ffrdp);
@@ -505,10 +529,10 @@ static void* client_thread(void *param)
 
 int main(void)
 {
-//  pthread_t hserver;
+    pthread_t hserver;
     pthread_t hclient;
 
-//  pthread_create(&hserver, NULL, server_thread, NULL);
+    pthread_create(&hserver, NULL, server_thread, NULL);
     pthread_create(&hclient, NULL, client_thread, NULL);
 
     while (!g_exit) {
@@ -519,7 +543,7 @@ int main(void)
         }
     }
 
-//  pthread_join(hserver, NULL);
+    pthread_join(hserver, NULL);
     pthread_join(hclient, NULL);
     return 0;
 }
