@@ -118,14 +118,12 @@ static uint32_t ringbuf_read(uint8_t *rbuf, uint32_t maxsize, uint32_t head, uin
     return len2 ? len2 : head + len1;
 }
 
-static int32_t signed_extend(uint32_t a, int size) // signed extend 24bit to 32bit
-{
-    return (a & (1 << (size - 1))) ? (a | ~((1 << size) - 1)) : a;
-}
-
 static int seq_distance(uint32_t seq1, uint32_t seq2) // calculate seq distance
 {
-    return signed_extend(seq1, 24) - signed_extend(seq2, 24);
+    int c = seq1 - seq2;
+    if      (c >=  0x7FFFFF) return c - 0x1000000;
+    else if (c <= -0x7FFFFF) return c + 0x1000000;
+    else return c;
 }
 
 static FFRDP_FRAME_NODE* frame_node_new(int size) // create a new frame node
