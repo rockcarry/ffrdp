@@ -43,6 +43,7 @@ static uint32_t get_tick_count()
 #define FFRDP_WIN_CYCLE      100
 #define FFRDP_MAX_WAITSND    256
 #define FFRDP_SNDPKT_FLOWCTL 32
+#define FFRDP_UDPRBUF_SIZE  (128 * FFRDP_MTU_SIZE)
 
 #define GET_FRAME_SEQ(f)        (*(uint32_t*)(f)->data >> 8)
 #define SET_FRAME_SEQ(f, seq)   do { *(uint32_t*)(f)->data  = ((seq) & 0xFFFFFF) << 8; } while (0)
@@ -183,6 +184,23 @@ static int list_free(FFRDP_FRAME_NODE **head, FFRDP_FRAME_NODE **tail, int n)
     return k;
 }
 
+static void ffrdp_reset(FFRDPCONTEXT *ffrdp)
+{
+    struct sockaddr_in srcaddr;
+    uint8_t  buf[FFRDP_MTU_SIZE + 4];
+    uint32_t addrlen = sizeof(srcaddr);
+    int      ret;
+    ffrdp->recv_size = ffrdp->recv_head = ffrdp->recv_tail = ffrdp->send_seq = ffrdp->recv_seq = 0;
+    ffrdp->rttm      = ffrdp->rtts = ffrdp->rttd = ffrdp->tick_query_rwin = ffrdp->wait_snd = 0;
+    ffrdp->recv_win  = FFRDP_MTU_SIZE;
+    ffrdp->rto       = FFRDP_MIN_RTO;
+    ffrdp->flags    &=~(FLAG_CONNECTED|FLAG_BYEBYE0|FLAG_BYEBYE1);
+    list_free(&ffrdp->send_list_head, &ffrdp->send_list_tail, -1);
+    list_free(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, -1);
+    memset(&ffrdp->client_addr, 0, sizeof(ffrdp->client_addr));
+    do { ret = recvfrom(ffrdp->udp_fd, buf, sizeof(buf), 0, (struct sockaddr*)&srcaddr, &addrlen); } while (ret > 0);
+}
+
 void* ffrdp_init(char *ip, int port, int server)
 {
 #ifdef WIN32
@@ -224,7 +242,7 @@ void* ffrdp_init(char *ip, int port, int server)
 #else
     fcntl(ffrdp->udp_fd, F_SETFL, fcntl(ffrdp->udp_fd, F_GETFL, 0) | O_NONBLOCK);  // setup non-block io mode
 #endif
-    opt = 128 * FFRDP_MTU_SIZE; setsockopt(ffrdp->udp_fd, SOL_SOCKET, SO_RCVBUF, (char*)&opt, sizeof(int)); // setup udp recv buffer size
+    opt = FFRDP_UDPRBUF_SIZE; setsockopt(ffrdp->udp_fd, SOL_SOCKET, SO_RCVBUF, (char*)&opt, sizeof(int)); // setup udp recv buffer size
     return ffrdp;
 
 failed:
@@ -375,10 +393,11 @@ void ffrdp_update(void *ctxt)
             break;
         case FFRDP_FRAME_TYPE_BYE:
             if (ffrdp->flags & FLAG_SERVER) {
-                ffrdp->flags &= ~FLAG_CONNECTED;
                 data[0] = FFRDP_FRAME_TYPE_BYE; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
+                ffrdp_reset(ffrdp);
             } else {
                 ffrdp->flags |= FLAG_BYEBYE1;
+                ffrdp_reset(ffrdp);
             }
             break;
         }
