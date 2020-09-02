@@ -474,7 +474,7 @@ static void* server_thread(void *param)
         if (ret > 0) {
 //          printf("ret: %d\n", ret);
             total_bytes += ret;
-            if (get_tick_count() - tick_start > 10 * 1000) {
+            if ((int32_t)get_tick_count() - (int32_t)tick_start > 10 * 1000) {
                 printf("server receive: %.2f KB/s\n", (float)total_bytes / 10240);
                 tick_start = get_tick_count();
                 total_bytes= 0;
@@ -512,7 +512,7 @@ static void* client_thread(void *param)
         if (ret > 0) {
 //          printf("ret: %d\n", ret);
             total_bytes += ret;
-            if (get_tick_count() - tick_start > 10 * 1000) {
+            if ((int32_t)get_tick_count() - (int32_t)tick_start > 10 * 1000) {
                 printf("client receive: %.2f KB/s\n", (float)total_bytes / 10240);
                 tick_start = get_tick_count();
                 total_bytes= 0;
