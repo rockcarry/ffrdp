@@ -515,7 +515,7 @@ static void* server_thread(void *param)
     tick_start  = get_tick_count();
     total_bytes = 0;
     while (!g_exit) {
-       size = 1 + (rand() & 0x1FFF);
+        size = 1 + (rand() & 0x3FFF);
         *(uint32_t*)(sendbuf + 4) = get_tick_count();
         strcpy((char*)sendbuf + 8, "rockcarry server data");
         ret = ffrdp_send(ffrdp, (char*)sendbuf, size);
@@ -561,7 +561,7 @@ static void* client_thread(void *param)
     tick_start  = get_tick_count();
     total_bytes = 0;
     while (!g_exit) {
-        size = 1 + (rand() & 0x1FFF);
+        size = 1 + (rand() & 0x3FFF);
         *(uint32_t*)(sendbuf + 4) = get_tick_count();
         strcpy((char*)sendbuf + 8, "rockcarry client data");
 
