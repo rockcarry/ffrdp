@@ -96,6 +96,7 @@ typedef struct {
     uint32_t tick_query_rwin;
     uint32_t wait_snd;
     uint32_t counter_send_1sttime;
+    uint32_t counter_send_failed;
     uint32_t counter_resend_fast;
     uint32_t counter_resend_rto;
     uint32_t counter_query_rwin;
@@ -277,6 +278,7 @@ int ffrdp_send(void *ctxt, char *buf, int len)
     int               n = len, size;
     if (  !ffrdp || ((ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0)
        || ((len + FFRDP_MTU_SIZE - 1) / FFRDP_MTU_SIZE + ffrdp->wait_snd > FFRDP_MAX_WAITSND)) {
+        ffrdp->counter_send_failed++;
         return -1;
     }
     while (n > 0) {
@@ -346,7 +348,7 @@ void ffrdp_update(void *ctxt)
         } else if ((p->flags & FLAG_FIRST_SEND) && ((int32_t)get_tick_count() - (int32_t)p->tick_timeout > 0 || (p->flags & FLAG_FAST_RESEND))) { // resend
             ret = sendto(ffrdp->udp_fd, p->data, p->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
             if (ret != p->size) break;
-            printf("re-send packet seq: %d %d\n", GET_FRAME_SEQ(p), ffrdp->rto);
+//          printf("re-send packet seq: %d %d\n", GET_FRAME_SEQ(p), ffrdp->rto);
             if (!(p->flags & FLAG_FAST_RESEND)) {
                 ffrdp->rto += ffrdp->rto / 2;
                 ffrdp->rto  = MIN(FFRDP_MAX_RTO, ffrdp->rto);
@@ -491,6 +493,7 @@ void ffrdp_dump(void *ctxt)
     printf("wait_snd            : %u\n", ffrdp->wait_snd            );
     printf("tick_query_rwin     : %u\n", ffrdp->tick_query_rwin     );
     printf("counter_send_1sttime: %u\n", ffrdp->counter_send_1sttime);
+    printf("counter_send_failed : %u\n", ffrdp->counter_send_failed );
     printf("counter_resend_fast : %u\n", ffrdp->counter_resend_fast );
     printf("counter_resend_rto  : %u\n", ffrdp->counter_resend_rto  );
     printf("counter_query_rwin  : %u\n", ffrdp->counter_query_rwin  );
