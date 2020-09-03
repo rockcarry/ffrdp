@@ -65,7 +65,6 @@ typedef struct tagFFRDP_FRAME_NODE {
     #define FLAG_FIRST_SEND  (1 << 0) // after frame first send, this flag will be set
     #define FLAG_DATA_RESEND (1 << 1) // after frame resend, this flag will be set
     #define FLAG_FAST_RESEND (1 << 2) // data frame need fast resend when next update
-    #define FLAG_NEED_REMOVE (1 << 3) // if this flag set, frame need remove from send queue
     uint32_t flags;        // frame flags
     uint32_t tick_send;    // frame send tick
     uint32_t tick_timeout; // frame ack timeout
@@ -453,28 +452,24 @@ void ffrdp_update(void *ctxt)
 
             if (dist > 16) {
                 break;
-            } else if (dist < 0 || (dist > 0 && (send_mack & (1 << (dist-1))))) {
-                p->flags |= FLAG_NEED_REMOVE;
-            } else if (seq_distance(maxack, GET_FRAME_SEQ(p)) > 0) {
-                p->flags |= FLAG_FAST_RESEND;
-            }
-
-            if ((p->flags & FLAG_FIRST_SEND) && (p->flags & FLAG_DATA_RESEND) == 0) {
-                ffrdp->rttm = (int32_t)get_tick_count() - (int32_t)p->tick_send;
-                if (ffrdp->rtts == 0) {
-                    ffrdp->rtts = ffrdp->rttm;
-                    ffrdp->rttd = ffrdp->rttm / 2;
-                } else {
-                    ffrdp->rtts = (7 * ffrdp->rtts + 1 * ffrdp->rttm) / 8;
-                    ffrdp->rttd = (3 * ffrdp->rttd + 1 * abs((int)ffrdp->rttm - (int)ffrdp->rtts)) / 4;
+            } else if (dist < 0 || (dist > 0 && (send_mack & (1 << (dist-1))))) { // this frame got ack
+                if ((p->flags & FLAG_DATA_RESEND) == 0) { // this frame never resend, so use it to calculate rto
+                    ffrdp->rttm = (int32_t)get_tick_count() - (int32_t)p->tick_send;
+                    if (ffrdp->rtts == 0) {
+                        ffrdp->rtts = ffrdp->rttm;
+                        ffrdp->rttd = ffrdp->rttm / 2;
+                    } else {
+                        ffrdp->rtts = (7 * ffrdp->rtts + 1 * ffrdp->rttm) / 8;
+                        ffrdp->rttd = (3 * ffrdp->rttd + 1 * abs((int)ffrdp->rttm - (int)ffrdp->rtts)) / 4;
+                    }
+                    ffrdp->rto = ffrdp->rtts + 4 * ffrdp->rttd;
+                    ffrdp->rto = MAX(FFRDP_MIN_RTO, ffrdp->rto);
+                    ffrdp->rto = MIN(FFRDP_MAX_RTO, ffrdp->rto);
                 }
-                ffrdp->rto = ffrdp->rtts + 4 * ffrdp->rttd;
-                ffrdp->rto = MAX(FFRDP_MIN_RTO, ffrdp->rto);
-                ffrdp->rto = MIN(FFRDP_MAX_RTO, ffrdp->rto);
-            }
-            if (p->flags & FLAG_NEED_REMOVE) {
                 t = p; p = p->next; list_remove(&ffrdp->send_list_head, &ffrdp->send_list_tail, t, 1);
                 ffrdp->wait_snd--; continue;
+            } else if (seq_distance(maxack, GET_FRAME_SEQ(p)) > 0) {
+                p->flags |= FLAG_FAST_RESEND;
             }
             p = p->next;
         }
