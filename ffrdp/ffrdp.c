@@ -333,7 +333,6 @@ void ffrdp_update(void *ctxt)
             if (p->size - 4 <= (int)ffrdp->recv_win) {
                 ret = sendto(ffrdp->udp_fd, p->data, p->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
                 if (ret != p->size) break;
-//              printf("first send packet seq: %d\n", GET_FRAME_SEQ(p));
                 ffrdp->recv_win -= p->size - 4;
                 p->tick_send     = get_tick_count();
                 p->tick_timeout  = p->tick_send + ffrdp->rto;
@@ -347,7 +346,6 @@ void ffrdp_update(void *ctxt)
         } else if ((p->flags & FLAG_FIRST_SEND) && ((int32_t)get_tick_count() - (int32_t)p->tick_timeout > 0 || (p->flags & FLAG_FAST_RESEND))) { // resend
             ret = sendto(ffrdp->udp_fd, p->data, p->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
             if (ret != p->size) break;
-//          printf("re-send packet seq: %d %d\n", GET_FRAME_SEQ(p), ffrdp->rto);
             if (!(p->flags & FLAG_FAST_RESEND)) {
                 ffrdp->rto += ffrdp->rto / 2;
                 ffrdp->rto  = MIN(FFRDP_MAX_RTO, ffrdp->rto);
