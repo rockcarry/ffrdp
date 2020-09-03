@@ -497,6 +497,7 @@ void ffrdp_dump(void *ctxt)
 
 #if 1
 static int g_exit = 0;
+static pthread_mutex_t g_mutex;
 static void* server_thread(void *param)
 {
     char     ipaddr[32], *str;
@@ -519,7 +520,7 @@ static void* server_thread(void *param)
         strcpy((char*)sendbuf + 8, "rockcarry server data");
         ret = ffrdp_send(ffrdp, (char*)sendbuf, size);
         if (ret != size) {
-            printf("server send data failed: %d\n", size);
+//          printf("server send data failed: %d\n", size);
         }
 
         ret = ffrdp_recv(ffrdp, (char*)recvbuf, sizeof(recvbuf));
@@ -527,8 +528,10 @@ static void* server_thread(void *param)
 //          printf("ret: %d\n", ret);
             total_bytes += ret;
             if ((int32_t)get_tick_count() - (int32_t)tick_start > 10 * 1000) {
-//              printf("server receive: %.2f KB/s\n", (float)total_bytes / 10240);
-//              ffrdp_dump(ffrdp);
+                pthread_mutex_lock(&g_mutex);
+                printf("server receive: %.2f KB/s\n", (float)total_bytes / 10240);
+                ffrdp_dump(ffrdp);
+                pthread_mutex_unlock(&g_mutex);
                 tick_start = get_tick_count();
                 total_bytes= 0;
             }
@@ -564,7 +567,7 @@ static void* client_thread(void *param)
 
         ret = ffrdp_send(ffrdp, (char*)sendbuf, size);
         if (ret != size) {
-            printf("client send data failed: %d\n", size);
+//          printf("client send data failed: %d\n", size);
         }
 
         ret = ffrdp_recv(ffrdp, (char*)recvbuf, sizeof(recvbuf));
@@ -572,8 +575,10 @@ static void* client_thread(void *param)
 //          printf("ret: %d\n", ret);
             total_bytes += ret;
             if ((int32_t)get_tick_count() - (int32_t)tick_start > 10 * 1000) {
+                pthread_mutex_lock(&g_mutex);
                 printf("client receive: %.2f KB/s\n", (float)total_bytes / 10240);
                 ffrdp_dump(ffrdp);
+                pthread_mutex_unlock(&g_mutex);
                 tick_start = get_tick_count();
                 total_bytes= 0;
             }
@@ -618,6 +623,7 @@ int main(int argc, char *argv[])
         }
     }
 
+    pthread_mutex_init(&g_mutex, NULL);
     if (server_en) pthread_create(&hserver, NULL, server_thread, server_bind_ip);
     if (client_en) pthread_create(&hclient, NULL, client_thread, client_cnnt_ip);
 
@@ -631,6 +637,7 @@ int main(int argc, char *argv[])
 
     if (hserver) pthread_join(hserver, NULL);
     if (hclient) pthread_join(hclient, NULL);
+    pthread_mutex_destroy(&g_mutex);
     return 0;
 }
 #endif
