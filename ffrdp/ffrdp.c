@@ -463,7 +463,7 @@ void ffrdp_update(void *ctxt)
                     ffrdp->rttd = ffrdp->rttm / 2;
                 } else {
                     ffrdp->rtts = (7 * ffrdp->rtts + 1 * ffrdp->rttm) / 8;
-                    ffrdp->rttd = (3 * ffrdp->rttd + 1 * abs(ffrdp->rttm - ffrdp->rtts)) / 4;
+                    ffrdp->rttd = (3 * ffrdp->rttd + 1 * abs((int)ffrdp->rttm - (int)ffrdp->rtts)) / 4;
                 }
                 ffrdp->rto = ffrdp->rtts + 4 * ffrdp->rttd;
                 ffrdp->rto = MAX(FFRDP_MIN_RTO, ffrdp->rto);
