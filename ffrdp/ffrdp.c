@@ -320,7 +320,7 @@ void ffrdp_update(void *ctxt)
     struct sockaddr_in *dstaddr = NULL;
     struct sockaddr_in  srcaddr;
     uint32_t addrlen = sizeof(srcaddr);
-    int32_t  una, mack, size, ret, send_una, send_mack = 0, recv_una, recv_mack = 0, recv_win, dist, maxack, i;
+    int32_t  una, mack, size, ret, got_data = 0,send_una, send_mack = 0, recv_una, recv_mack = 0, recv_win, dist, maxack, i;
     uint8_t  data[8];
 
     if (!ctxt) return;
@@ -378,6 +378,7 @@ void ffrdp_update(void *ctxt)
             dist = seq_distance(GET_FRAME_SEQ(node), recv_una);
             if (dist == 0) recv_una++;
             if (dist >= 0) { node->size = ret; list_enqueue(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, node); node = NULL; }
+            got_data = 1;
             break;
         case FFRDP_FRAME_TYPE_ACK:
             una  = *(uint32_t*)(node->data + 0) >> 8;
@@ -418,7 +419,7 @@ void ffrdp_update(void *ctxt)
         data[0] = FFRDP_FRAME_TYPE_BYE; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
     }
 
-    if (seq_distance(recv_una, ffrdp->recv_seq) > 0) { // got data frame
+    if (got_data) { // got data frame
         while (ffrdp->recv_list_head) {
             dist = seq_distance(GET_FRAME_SEQ(ffrdp->recv_list_head), ffrdp->recv_seq);
             if (dist == 0 && ffrdp->recv_list_head->size - 4 <= (int)(sizeof(ffrdp->recv_buff) - ffrdp->recv_size)) {
