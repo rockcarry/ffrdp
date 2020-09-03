@@ -26,6 +26,7 @@ typedef   signed int    int32_t;
 #define SOCKET int
 #define closesocket close
 #define stricmp strcasecmp
+#define strtok_s strtok_r
 static uint32_t get_tick_count()
 {
     struct timespec ts;
@@ -500,12 +501,18 @@ void ffrdp_dump(void *ctxt)
 static int g_exit = 0;
 static void* server_thread(void *param)
 {
-    void *ffrdp = ffrdp_init("0.0.0.0", 8002, 1);
+    char     ipaddr[32], *str;
+    int      port   = 8000;
+    void    *ffrdp  = NULL;
     uint8_t  sendbuf[16*1024];
     uint8_t  recvbuf[16*1024];
     uint32_t tick_start, total_bytes;
     int      size, ret;
 
+    strncpy(ipaddr, param, sizeof(ipaddr));
+    strtok_s(ipaddr, ":", &str);
+    if (str && *str) port = atoi(str);
+    ffrdp = ffrdp_init(ipaddr, port, 1);
     tick_start  = get_tick_count();
     total_bytes = 0;
     while (!g_exit) {
@@ -538,12 +545,18 @@ static void* server_thread(void *param)
 
 static void* client_thread(void *param)
 {
-    void *ffrdp = ffrdp_init("192.168.0.148", 8002, 0);
+    char     ipaddr[32], *str;
+    int      port   = 8000;
+    void    *ffrdp  = NULL;
     uint8_t  sendbuf[16*1024];
     uint8_t  recvbuf[16*1024];
     uint32_t tick_start, total_bytes;
     int      size, ret;
 
+    strncpy(ipaddr, param, sizeof(ipaddr));
+    strtok_s(ipaddr, ":", &str);
+    if (str && *str) port = atoi(str);
+    ffrdp = ffrdp_init(ipaddr, port, 0);
     tick_start  = get_tick_count();
     total_bytes = 0;
     while (!g_exit) {
@@ -575,13 +588,40 @@ static void* client_thread(void *param)
     return NULL;
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
-    pthread_t hserver;
-    pthread_t hclient;
+    int server_en = 0, client_en = 0, i;
+    char server_bind_ip[32] = "0.0.0.0";
+    char client_cnnt_ip[32] = "127.0.0.1";
+    pthread_t hserver = 0;
+    pthread_t hclient = 0;
 
-    pthread_create(&hserver, NULL, server_thread, NULL);
-    pthread_create(&hclient, NULL, client_thread, NULL);
+    if (argc <= 1) {
+        printf("ffrdp test program - v1.0.0\n");
+        printf("usage: ffrdp_test --server=ip:port --client=ip:port\n\n");
+        return 0;
+    }
+
+    for (i=1; i<argc; i++) {
+        if (strstr(argv[i], "--server=") == argv[i]) {
+            server_en = 1;
+            if (strcmp(argv[i] + 9, "") != 0) {
+                strncpy(server_bind_ip, argv[i] + 9, sizeof(server_bind_ip));
+            }
+        } else if (strstr(argv[i], "--client=") == argv[i]) {
+            client_en = 1;
+            if (strcmp(argv[i] + 9, "") != 0) {
+                strncpy(client_cnnt_ip, argv[i] + 9, sizeof(client_cnnt_ip));
+            }
+        } else if (strcmp(argv[i], "--server") == 0) {
+            server_en = 1;
+        } else if (strcmp(argv[i], "--client") == 0) {
+            client_en = 1;
+        }
+    }
+
+    if (server_en) pthread_create(&hserver, NULL, server_thread, server_bind_ip);
+    if (client_en) pthread_create(&hclient, NULL, client_thread, client_cnnt_ip);
 
     while (!g_exit) {
         char cmd[256];
@@ -591,8 +631,8 @@ int main(void)
         }
     }
 
-    pthread_join(hserver, NULL);
-    pthread_join(hclient, NULL);
+    if (hserver) pthread_join(hserver, NULL);
+    if (hclient) pthread_join(hclient, NULL);
     return 0;
 }
 #endif
