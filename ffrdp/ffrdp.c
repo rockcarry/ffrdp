@@ -320,7 +320,7 @@ void ffrdp_update(void *ctxt)
     struct sockaddr_in *dstaddr = NULL;
     struct sockaddr_in  srcaddr;
     uint32_t addrlen = sizeof(srcaddr);
-    int32_t  una, mack, size, ret, got_data = 0,send_una, send_mack = 0, recv_una, recv_mack = 0, recv_win, dist, maxack, i;
+    int32_t  una, mack, size, ret, got_data = 0, send_una, send_mack = 0, recv_una, recv_mack = 0, recv_win, dist, maxack, i;
     uint8_t  data[8];
 
     if (!ctxt) return;
