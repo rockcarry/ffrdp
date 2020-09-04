@@ -195,7 +195,7 @@ static void ffrdp_reset(FFRDPCONTEXT *ffrdp)
     int      ret;
     ffrdp->recv_size = ffrdp->recv_head = ffrdp->recv_tail = ffrdp->send_seq = ffrdp->recv_seq = 0;
     ffrdp->rttm      = ffrdp->rtts = ffrdp->rttd = ffrdp->tick_query_rwin = ffrdp->wait_snd = 0;
-    ffrdp->recv_win  = FFRDP_MTU_SIZE;
+    ffrdp->recv_win  = FFRDP_RECVBUF_SIZE / 2;
     ffrdp->rto       = FFRDP_MIN_RTO;
     ffrdp->flags    &=~(FLAG_CONNECTED|FLAG_BYEBYE0|FLAG_BYEBYE1);
     ffrdp->counter_send_1sttime = ffrdp->counter_resend_fast = ffrdp->counter_resend_rto = ffrdp->counter_query_rwin = 0;
@@ -222,7 +222,7 @@ void* ffrdp_init(char *ip, int port, int server)
     }
 #endif
 
-    ffrdp->recv_win = FFRDP_MTU_SIZE;
+    ffrdp->recv_win = FFRDP_RECVBUF_SIZE / 2;
     ffrdp->rto      = FFRDP_MIN_RTO;
 
     ffrdp->server_addr.sin_family      = AF_INET;
