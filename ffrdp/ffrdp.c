@@ -222,6 +222,7 @@ void* ffrdp_init(char *ip, int port, int server)
 #endif
 
     ffrdp->recv_win = FFRDP_RECVBUF_SIZE / 2;
+    ffrdp->rtts     = (uint32_t) -1;
     ffrdp->rto      = FFRDP_MIN_RTO;
 
     ffrdp->server_addr.sin_family      = AF_INET;
@@ -448,7 +449,7 @@ void ffrdp_update(void *ctxt)
                 break;
             } else if (dist < 0 || (dist > 0 && (send_mack & (1 << (dist-1))))) { // this frame got ack
                 ffrdp->rttm = (int32_t)get_tick_count() - (int32_t)p->tick_send;
-                if (ffrdp->rtts == 0) {
+                if (ffrdp->rtts == (uint32_t)-1) {
                     ffrdp->rtts = ffrdp->rttm;
                     ffrdp->rttd = ffrdp->rttm / 2;
                 } else {
