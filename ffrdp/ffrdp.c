@@ -495,26 +495,31 @@ void ffrdp_dump(void *ctxt)
 }
 
 #if 1
-static int g_exit = 0;
+static int  g_exit = 0;
+static char server_bind_ip[32]   = "0.0.0.0";
+static char client_cnnt_ip[32]   = "127.0.0.1";
+static int  server_bind_port     = 8000;
+static int  client_cnnt_port     = 8000;
+static int  server_max_send_size = 16 * 1024;
+static int  client_max_send_size = 16 * 1024;
 static pthread_mutex_t g_mutex;
 static void* server_thread(void *param)
 {
-    char     ipaddr[32], *str;
-    int      port   = 8000;
-    void    *ffrdp  = NULL;
-    uint8_t  sendbuf[16*1024];
-    uint8_t  recvbuf[16*1024];
+    void    *ffrdp  = ffrdp_init(server_bind_ip, server_bind_port, 1);
+    uint8_t *sendbuf= malloc(server_max_send_size);
+    uint8_t *recvbuf= malloc(client_max_send_size);
     uint32_t tick_start, total_bytes;
     int      size, ret;
 
-    strncpy(ipaddr, param, sizeof(ipaddr));
-    strtok_s(ipaddr, ":", &str);
-    if (str && *str) port = atoi(str);
-    ffrdp = ffrdp_init(ipaddr, port, 1);
+    if (!sendbuf || !recvbuf) {
+        printf("server failed to allocate send or recv buffer !\n");
+        goto done;
+    }
+
     tick_start  = get_tick_count();
     total_bytes = 0;
     while (!g_exit) {
-        size = 1 + (rand() & 0x3FFF);
+        size = 1 + rand() % server_max_send_size;
         *(uint32_t*)(sendbuf + 4) = get_tick_count();
         strcpy((char*)sendbuf + 8, "rockcarry server data");
         ret = ffrdp_send(ffrdp, (char*)sendbuf, size);
@@ -522,7 +527,7 @@ static void* server_thread(void *param)
 //          printf("server send data failed: %d\n", size);
         }
 
-        ret = ffrdp_recv(ffrdp, (char*)recvbuf, sizeof(recvbuf));
+        ret = ffrdp_recv(ffrdp, (char*)recvbuf, client_max_send_size);
         if (ret > 0) {
 //          printf("ret: %d\n", ret);
             total_bytes += ret;
@@ -539,28 +544,31 @@ static void* server_thread(void *param)
         ffrdp_update(ffrdp);
         usleep(1 * 1000);
     }
+
+done:
+    free(sendbuf);
+    free(recvbuf);
     ffrdp_free(ffrdp);
     return NULL;
 }
 
 static void* client_thread(void *param)
 {
-    char     ipaddr[32], *str;
-    int      port   = 8000;
-    void    *ffrdp  = NULL;
-    uint8_t  sendbuf[16*1024];
-    uint8_t  recvbuf[16*1024];
+    void    *ffrdp  = ffrdp_init(client_cnnt_ip, client_cnnt_port, 0);
+    uint8_t *sendbuf= malloc(client_max_send_size);
+    uint8_t *recvbuf= malloc(server_max_send_size);
     uint32_t tick_start, total_bytes;
     int      size, ret;
 
-    strncpy(ipaddr, param, sizeof(ipaddr));
-    strtok_s(ipaddr, ":", &str);
-    if (str && *str) port = atoi(str);
-    ffrdp = ffrdp_init(ipaddr, port, 0);
+    if (!sendbuf || !recvbuf) {
+        printf("client failed to allocate send or recv buffer !\n");
+        goto done;
+    }
+
     tick_start  = get_tick_count();
     total_bytes = 0;
     while (!g_exit) {
-        size = 1 + (rand() & 0x3FFF);
+        size = 1 + rand() % client_max_send_size;
         *(uint32_t*)(sendbuf + 4) = get_tick_count();
         strcpy((char*)sendbuf + 8, "rockcarry client data");
 
@@ -569,7 +577,7 @@ static void* client_thread(void *param)
 //          printf("client send data failed: %d\n", size);
         }
 
-        ret = ffrdp_recv(ffrdp, (char*)recvbuf, sizeof(recvbuf));
+        ret = ffrdp_recv(ffrdp, (char*)recvbuf, server_max_send_size);
         if (ret > 0) {
 //          printf("ret: %d\n", ret);
             total_bytes += ret;
@@ -586,6 +594,10 @@ static void* client_thread(void *param)
         ffrdp_update(ffrdp);
         usleep(1 * 1000);
     }
+
+done:
+    free(sendbuf);
+    free(recvbuf);
     ffrdp_free(ffrdp);
     return NULL;
 }
@@ -593,10 +605,8 @@ static void* client_thread(void *param)
 int main(int argc, char *argv[])
 {
     int server_en = 0, client_en = 0, i;
-    char server_bind_ip[32] = "0.0.0.0";
-    char client_cnnt_ip[32] = "127.0.0.1";
-    pthread_t hserver = 0;
-    pthread_t hclient = 0;
+    pthread_t hserver = 0, hclient = 0;
+    char *str;
 
     if (argc <= 1) {
         printf("ffrdp test program - v1.0.0\n");
@@ -619,12 +629,29 @@ int main(int argc, char *argv[])
             server_en = 1;
         } else if (strcmp(argv[i], "--client") == 0) {
             client_en = 1;
+        } else if (strstr(argv[i], "--server_max_send_size=") == argv[i]) {
+            server_max_send_size = atoi(argv[i] + 23);
+        } else if (strstr(argv[i], "--client_max_send_size=") == argv[i]) {
+            client_max_send_size = atoi(argv[i] + 23);
         }
     }
 
+    strtok_s(server_bind_ip, ":", &str); if (str && *str) server_bind_port = atoi(str);
+    strtok_s(client_cnnt_ip, ":", &str); if (str && *str) client_cnnt_port = atoi(str);
+    if (server_en) {
+        printf("server bind ip      : %s\n", server_bind_ip      );
+        printf("server bind port    : %d\n", server_bind_port    );
+        printf("server_max_send_size: %d\n", server_max_send_size);
+    }
+    if (client_en) {
+        printf("client connect ip   : %s\n", client_cnnt_ip      );
+        printf("client connect port : %d\n", client_cnnt_port    );
+        printf("client_max_send_size: %d\n", client_max_send_size);
+    }
+
     pthread_mutex_init(&g_mutex, NULL);
-    if (server_en) pthread_create(&hserver, NULL, server_thread, server_bind_ip);
-    if (client_en) pthread_create(&hclient, NULL, client_thread, client_cnnt_ip);
+    if (server_en) pthread_create(&hserver, NULL, server_thread, NULL);
+    if (client_en) pthread_create(&hclient, NULL, client_thread, NULL);
 
     while (!g_exit) {
         char cmd[256];
