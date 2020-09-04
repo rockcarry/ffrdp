@@ -488,8 +488,9 @@ void ffrdp_dump(void *ctxt)
     printf("tick_query_rwin     : %u\n", ffrdp->tick_query_rwin     );
     printf("counter_send_1sttime: %u\n", ffrdp->counter_send_1sttime);
     printf("counter_send_failed : %u\n", ffrdp->counter_send_failed );
-    printf("counter_resend_fast : %u\n", ffrdp->counter_resend_fast );
     printf("counter_resend_rto  : %u\n", ffrdp->counter_resend_rto  );
+    printf("counter_resend_fast : %u\n", ffrdp->counter_resend_fast );
+    printf("counter_resend_ratio: %.2f%%\n", 100.0 * (ffrdp->counter_resend_rto + ffrdp->counter_resend_fast) / ffrdp->counter_send_1sttime);
     printf("counter_query_rwin  : %u\n", ffrdp->counter_query_rwin  );
     printf("rttm: %u, rtts: %u, rttd: %u, rto: %u\n\n", ffrdp->rttm, ffrdp->rtts, ffrdp->rttd, ffrdp->rto);
 }
