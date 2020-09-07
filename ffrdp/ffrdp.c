@@ -445,7 +445,7 @@ void ffrdp_update(void *ctxt)
             if (i < 0) maxack = (send_una - 1) & 0xFFFFFF;
             else maxack = (send_una + i + 1) & 0xFFFFFF;
 
-            if (dist > 16) {
+            if (dist > 16 || !(p->flags & FLAG_FIRST_SEND)) {
                 break;
             } else if (dist < 0 || (dist > 0 && (send_mack & (1 << (dist-1))))) { // this frame got ack
                 ffrdp->rttm = (int32_t)get_tick_count() - (int32_t)p->tick_send;
