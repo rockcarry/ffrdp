@@ -193,7 +193,7 @@ static int ffrdp_sleep(FFRDPCONTEXT *ffrdp, int flag)
 {
     if (flag) {
         struct timeval tv;
-        struct fd_set  rs;
+        fd_set  rs;
         FD_ZERO(&rs);
         FD_SET(ffrdp->udp_fd, &rs);
         tv.tv_sec  = 0;
