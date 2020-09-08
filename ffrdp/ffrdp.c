@@ -35,8 +35,6 @@ static uint32_t get_tick_count()
 }
 #endif
 
-#define MIN(a, b)           ((a) < (b) ? (a) : (b))
-#define MAX(a, b)           ((a) > (b) ? (a) : (b))
 #define FFRDP_RECVBUF_SIZE  (64 * 1024 - 4)
 #define FFRDP_MTU_SIZE       1024
 #define FFRDP_MIN_RTO        20
@@ -45,7 +43,12 @@ static uint32_t get_tick_count()
 #define FFRDP_MAX_WAITSND    256
 #define FFRDP_SNDPKT_FLOWCTL 32
 #define FFRDP_UDPRBUF_SIZE  (128 * FFRDP_MTU_SIZE)
+#define FFRDP_SELECT_SLEEP   0
+#define FFRDP_SELECT_TIMEOUT 10000
+#define FFRDP_USLEEP_TIMEOUT 1000
 
+#define MIN(a, b)               ((a) < (b) ? (a) : (b))
+#define MAX(a, b)               ((a) > (b) ? (a) : (b))
 #define GET_FRAME_SEQ(f)        (*(uint32_t*)(f)->data >> 8)
 #define SET_FRAME_SEQ(f, seq)   do { *(uint32_t*)(f)->data  = ((seq) & 0xFFFFFF) << 8; } while (0)
 
@@ -184,6 +187,20 @@ static int list_free(FFRDP_FRAME_NODE **head, FFRDP_FRAME_NODE **tail, int n)
     int k = 0;
     while (*head && ++k != n) list_remove(head, tail, *head, 1);
     return k;
+}
+
+static int ffrdp_sleep(FFRDPCONTEXT *ffrdp, int flag)
+{
+    if (flag) {
+        struct timeval tv;
+        struct fd_set  rs;
+        FD_ZERO(&rs);
+        FD_SET(ffrdp->udp_fd, &rs);
+        tv.tv_sec  = 0;
+        tv.tv_usec = FFRDP_SELECT_TIMEOUT;
+        if (select((int)ffrdp->udp_fd + 1, &rs, NULL, NULL, &tv) <= 0) return -1;
+    } else usleep(FFRDP_USLEEP_TIMEOUT);
+    return 0;
 }
 
 static void ffrdp_reset(FFRDPCONTEXT *ffrdp)
@@ -357,6 +374,7 @@ void ffrdp_update(void *ctxt)
         }
     }
 
+    if (ffrdp_sleep(ffrdp, FFRDP_SELECT_SLEEP) != 0) return;
     for (node=NULL;;) { // receive data
         if (!node && !(node = frame_node_new(4 + FFRDP_MTU_SIZE))) break;;
         if ((ret = recvfrom(ffrdp->udp_fd, node->data, node->size, 0, (struct sockaddr*)&srcaddr, &addrlen)) <= 0) break;
@@ -538,7 +556,6 @@ static void* server_thread(void *param)
         }
 
         ffrdp_update(ffrdp);
-        usleep(1 * 1000);
     }
 
 done:
@@ -588,7 +605,6 @@ static void* client_thread(void *param)
         }
 
         ffrdp_update(ffrdp);
-        usleep(1 * 1000);
     }
 
 done:
