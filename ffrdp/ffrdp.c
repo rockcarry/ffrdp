@@ -492,7 +492,7 @@ void ffrdp_update(void *ctxt)
             sendto(ffrdp->udp_fd, data, 3, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
             break;
         case FFRDP_FRAME_TYPE_WIN1:
-            ffrdp->recv_win = (data[1] << 0) | (data[2] << 8); ffrdp->tick_query_rwin = get_tick_count();
+            ffrdp->recv_win = (node->data[1] << 0) | (node->data[2] << 8); ffrdp->tick_query_rwin = get_tick_count();
             break;
         }
     }
