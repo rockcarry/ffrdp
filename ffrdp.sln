@@ -3,8 +3,6 @@ Microsoft Visual Studio Solution File, Format Version 9.00
 # Visual Studio 2005
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ffrdp", "ffrdp\ffrdp.vcproj", "{6A3B7828-634F-4C26-A6D8-753ACF1FE520}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "fffec", "fffec\fffec.vcproj", "{D0C2610A-482A-4CCE-B889-AF534619E049}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Win32 = Debug|Win32
@@ -15,10 +13,6 @@ Global
 		{6A3B7828-634F-4C26-A6D8-753ACF1FE520}.Debug|Win32.Build.0 = Debug|Win32
 		{6A3B7828-634F-4C26-A6D8-753ACF1FE520}.Release|Win32.ActiveCfg = Release|Win32
 		{6A3B7828-634F-4C26-A6D8-753ACF1FE520}.Release|Win32.Build.0 = Release|Win32
-		{D0C2610A-482A-4CCE-B889-AF534619E049}.Debug|Win32.ActiveCfg = Debug|Win32
-		{D0C2610A-482A-4CCE-B889-AF534619E049}.Debug|Win32.Build.0 = Debug|Win32
-		{D0C2610A-482A-4CCE-B889-AF534619E049}.Release|Win32.ActiveCfg = Release|Win32
-		{D0C2610A-482A-4CCE-B889-AF534619E049}.Release|Win32.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
