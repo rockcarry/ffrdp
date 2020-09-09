@@ -36,7 +36,7 @@ static uint32_t get_tick_count()
 #endif
 
 #define FFRDP_RECVBUF_SIZE  (64 * 1024 - 4)
-#define FFRDP_MTU_SIZE       1024
+#define FFRDP_MTU_SIZE       1024 // should align to 4 bytes
 #define FFRDP_MIN_RTO        20
 #define FFRDP_MAX_RTO        2000
 #define FFRDP_WIN_CYCLE      100
@@ -46,6 +46,8 @@ static uint32_t get_tick_count()
 #define FFRDP_SELECT_SLEEP   0
 #define FFRDP_SELECT_TIMEOUT 10000
 #define FFRDP_USLEEP_TIMEOUT 1000
+#define FFRDP_ENABLE_FEC     0
+#define FFRDP_FEC_REDUNDANCY 8
 
 #define MIN(a, b)               ((a) < (b) ? (a) : (b))
 #define MAX(a, b)               ((a) > (b) ? (a) : (b))
@@ -101,6 +103,20 @@ typedef struct {
     uint32_t counter_resend_fast;
     uint32_t counter_resend_rto;
     uint32_t counter_query_rwin;
+
+#if FFRDP_ENABLE_FEC
+    uint8_t  fec_txbuf[4 + FFRDP_MTU_SIZE + 2];
+    uint8_t  fec_rxbuf[4 + FFRDP_MTU_SIZE + 2];
+    uint32_t fec_txseq;
+    uint32_t fec_rxseq;
+    uint32_t fec_rxmask;
+    uint32_t counter_fec_tx_short;
+    uint32_t counter_fec_tx_full;
+    uint32_t counter_fec_rx_short;
+    uint32_t counter_fec_rx_full;
+    uint32_t counter_fec_ok;
+    uint32_t counter_fec_failed;
+#endif
 } FFRDPCONTEXT;
 
 static uint32_t ringbuf_write(uint8_t *rbuf, uint32_t maxsize, uint32_t tail, uint8_t *src, uint32_t len)
@@ -221,6 +237,78 @@ static void ffrdp_reset(FFRDPCONTEXT *ffrdp)
     do { ret = recvfrom(ffrdp->udp_fd, buf, sizeof(buf), 0, (struct sockaddr*)&srcaddr, &addrlen); } while (ret > 0);
 }
 
+static int ffrdp_send_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame, struct sockaddr_in *dstaddr)
+{
+#if !FFRDP_ENABLE_FEC
+    frame->data[frame->size - 2] = frame->data[frame->size - 1] = 0;
+    return sendto(ffrdp->udp_fd, frame->data, frame->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)) == frame->size ? 0 : -1;
+#else
+    if (frame->size != 4 + FFRDP_MTU_SIZE + 2) { // short frame
+        int ret = sendto(ffrdp->udp_fd, frame->data, frame->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
+        ffrdp->counter_fec_tx_short++;
+        return ret == frame->size ? 0 : -1;
+    } else {
+        uint32_t *psrc = (uint32_t*)frame->data;
+        uint32_t *pdst = (uint32_t*)ffrdp->fec_txbuf;
+        int       ret, i;
+        *(uint16_t*)(frame->data + 4 + FFRDP_MTU_SIZE) = (uint16_t)ffrdp->fec_txseq++;
+        ret = sendto(ffrdp->udp_fd, frame->data, frame->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
+        if (ret != frame->size) return -1;
+        for (i=0; i<(FFRDP_MTU_SIZE+4)/sizeof(uint32_t); i++) *pdst++ ^= *psrc++; // make xor fec frame
+        if (ffrdp->fec_txseq % FFRDP_FEC_REDUNDANCY == FFRDP_FEC_REDUNDANCY - 1) {
+            *(uint16_t*)(ffrdp->fec_txbuf + 4 + FFRDP_MTU_SIZE) = ffrdp->fec_txseq++;
+            ffrdp->fec_txbuf[0] = FFRDP_FRAME_TYPE_DATA;
+            sendto(ffrdp->udp_fd, ffrdp->fec_txbuf, sizeof(ffrdp->fec_txbuf), 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)); // send fec frame
+            memset(ffrdp->fec_txbuf, 0, sizeof(ffrdp->fec_txbuf)); // clear tx_fecbuf
+        }
+        ffrdp->counter_fec_tx_full++;
+        return 0;
+    }
+#endif
+}
+
+static int ffrdp_recv_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame)
+{
+#if !FFRDP_ENABLE_FEC
+    ffrdp = ffrdp; frame = frame; return 0;
+#else
+    uint16_t fecseq;
+    int      i, j;
+    if (frame->size != 4 + FFRDP_MTU_SIZE + 2) {
+        ffrdp->counter_fec_rx_short++;
+        return 0;
+    }
+    fecseq = *(uint16_t*)(frame->data + 4 + FFRDP_MTU_SIZE);
+    if (fecseq / FFRDP_FEC_REDUNDANCY != ffrdp->fec_rxseq / FFRDP_FEC_REDUNDANCY) {
+        memcpy(ffrdp->fec_rxbuf, frame->data, sizeof(ffrdp->fec_rxbuf));
+        ffrdp->fec_rxseq = fecseq; ffrdp->fec_rxmask = 0;
+        return fecseq % FFRDP_FEC_REDUNDANCY != FFRDP_FEC_REDUNDANCY - 1 ? 0 : -1;
+    }
+    ffrdp->fec_rxseq = fecseq;
+    if (!(ffrdp->fec_rxmask & (1 << (fecseq % FFRDP_FEC_REDUNDANCY)))) {
+        uint32_t *psrc = (uint32_t*)frame->data;
+        uint32_t *pdst = (uint32_t*)ffrdp->fec_rxbuf;
+        for (i=0; i<(FFRDP_MTU_SIZE+4)/sizeof(uint32_t); i++) *pdst++ ^= *psrc++;
+        ffrdp->fec_rxmask |= 1 << (fecseq % FFRDP_FEC_REDUNDANCY);
+    }
+    if (fecseq % FFRDP_FEC_REDUNDANCY == FFRDP_FEC_REDUNDANCY - 1) {
+        if (ffrdp->fec_rxmask == (1 << FFRDP_FEC_REDUNDANCY) - 1) return -1;
+        for (i=0,j=0; i<FFRDP_FEC_REDUNDANCY-1 && j<=1; i++) {
+            if (!(ffrdp->fec_rxmask & (1 << i))) j++;
+        }
+        if (j != 1) {
+            ffrdp->counter_fec_failed++;
+            return -1;
+        }
+        memcpy(frame->data, ffrdp->fec_rxbuf, frame->size);
+        frame->data[0] = FFRDP_FRAME_TYPE_DATA;
+        ffrdp->counter_fec_ok++;
+    }
+    ffrdp->counter_fec_rx_full++;
+    return 0;
+#endif
+}
+
 void* ffrdp_init(char *ip, int port, int server)
 {
 #ifdef WIN32
@@ -299,7 +387,7 @@ int ffrdp_send(void *ctxt, char *buf, int len)
     }
     while (n > 0) {
         size = MIN(FFRDP_MTU_SIZE, n);
-        if (!(node = frame_node_new(size + 4))) break;
+        if (!(node = frame_node_new(4 + size + 2))) break;
         SET_FRAME_SEQ(node, ffrdp->send_seq);
         memcpy(node->data + 4, buf, size);
         list_enqueue(&ffrdp->send_list_head, &ffrdp->send_list_tail, node);
@@ -347,10 +435,9 @@ void ffrdp_update(void *ctxt)
 
     for (i=0,p=ffrdp->send_list_head; i<FFRDP_SNDPKT_FLOWCTL&&p; i++,p=p->next) {
         if (!(p->flags & FLAG_FIRST_SEND)) { // first send
-            if (p->size - 4 <= (int)ffrdp->recv_win) {
-                ret = sendto(ffrdp->udp_fd, p->data, p->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
-                if (ret != p->size) break;
-                ffrdp->recv_win -= p->size - 4;
+            if (p->size - 4 - 2 <= (int)ffrdp->recv_win) {
+                if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) break;
+                ffrdp->recv_win -= p->size - 4 - 2;
                 p->tick_send     = get_tick_count();
                 p->tick_timeout  = p->tick_send + ffrdp->rto;
                 p->flags        |= FLAG_FIRST_SEND;
@@ -361,8 +448,7 @@ void ffrdp_update(void *ctxt)
                 break;
             }
         } else if ((p->flags & FLAG_FIRST_SEND) && ((int32_t)get_tick_count() - (int32_t)p->tick_timeout > 0 || (p->flags & FLAG_FAST_RESEND))) { // resend
-            ret = sendto(ffrdp->udp_fd, p->data, p->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
-            if (ret != p->size) break;
+            if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) break;
             if (!(p->flags & FLAG_FAST_RESEND)) {
                 ffrdp->counter_resend_rto++;
             } else {
@@ -376,7 +462,7 @@ void ffrdp_update(void *ctxt)
 
     if (ffrdp_sleep(ffrdp, FFRDP_SELECT_SLEEP) != 0) return;
     for (node=NULL;;) { // receive data
-        if (!node && !(node = frame_node_new(4 + FFRDP_MTU_SIZE))) break;;
+        if (!node && !(node = frame_node_new(4 + FFRDP_MTU_SIZE + 2))) break;;
         if ((ret = recvfrom(ffrdp->udp_fd, node->data, node->size, 0, (struct sockaddr*)&srcaddr, &addrlen)) <= 0) break;
         if ((ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0) {
             if (ffrdp->flags & FLAG_CONNECTED) {
@@ -389,10 +475,13 @@ void ffrdp_update(void *ctxt)
 
         switch (node->data[0]) {
         case FFRDP_FRAME_TYPE_DATA:
-            dist = seq_distance(GET_FRAME_SEQ(node), recv_una);
-            if (dist == 0) recv_una++;
-            if (dist >= 0) { node->size = ret; list_enqueue(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, node); node = NULL; }
-            got_data = 1;
+            node->size = ret; // frame size is the return size of recvfrom
+            if (ffrdp_recv_data_frame(ffrdp, node) == 0) {
+                dist = seq_distance(GET_FRAME_SEQ(node), recv_una);
+                if (dist == 0) recv_una++;
+                if (dist >= 0) { list_enqueue(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, node); node = NULL; }
+                got_data = 1;
+            }
             break;
         case FFRDP_FRAME_TYPE_ACK:
             una  = *(uint32_t*)(node->data + 0) >> 8;
@@ -436,9 +525,9 @@ void ffrdp_update(void *ctxt)
     if (got_data) { // got data frame
         while (ffrdp->recv_list_head) {
             dist = seq_distance(GET_FRAME_SEQ(ffrdp->recv_list_head), ffrdp->recv_seq);
-            if (dist == 0 && ffrdp->recv_list_head->size - 4 <= (int)(sizeof(ffrdp->recv_buff) - ffrdp->recv_size)) {
-                ffrdp->recv_tail = ringbuf_write(ffrdp->recv_buff, sizeof(ffrdp->recv_buff), ffrdp->recv_tail, ffrdp->recv_list_head->data + 4, ffrdp->recv_list_head->size - 4);
-                ffrdp->recv_size+= ffrdp->recv_list_head->size - 4;
+            if (dist == 0 && ffrdp->recv_list_head->size - 4 - 2 <= (int)(sizeof(ffrdp->recv_buff) - ffrdp->recv_size)) {
+                ffrdp->recv_tail = ringbuf_write(ffrdp->recv_buff, sizeof(ffrdp->recv_buff), ffrdp->recv_tail, ffrdp->recv_list_head->data + 4, ffrdp->recv_list_head->size - 4 - 2);
+                ffrdp->recv_size+= ffrdp->recv_list_head->size - 4 - 2;
                 ffrdp->recv_seq++; ffrdp->recv_seq &= 0xFFFFFF;
                 list_remove(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, ffrdp->recv_list_head, 1);
             } else break;
@@ -492,20 +581,32 @@ void ffrdp_dump(void *ctxt)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ctxt) return;
-    printf("recv_size           : %d\n", ffrdp->recv_size           );
-    printf("flags               : %x\n", ffrdp->flags               );
-    printf("send_seq            : %u\n", ffrdp->send_seq            );
-    printf("recv_seq            : %u\n", ffrdp->recv_seq            );
-    printf("recv_win            : %u\n", ffrdp->recv_win            );
-    printf("wait_snd            : %u\n", ffrdp->wait_snd            );
-    printf("tick_query_rwin     : %u\n", ffrdp->tick_query_rwin     );
-    printf("counter_send_1sttime: %u\n", ffrdp->counter_send_1sttime);
-    printf("counter_send_failed : %u\n", ffrdp->counter_send_failed );
-    printf("counter_resend_rto  : %u\n", ffrdp->counter_resend_rto  );
-    printf("counter_resend_fast : %u\n", ffrdp->counter_resend_fast );
+    printf("rttm: %u, rtts: %u, rttd: %u, rto: %u\n", ffrdp->rttm, ffrdp->rtts, ffrdp->rttd, ffrdp->rto);
+    printf("recv_size           : %d\n"  , ffrdp->recv_size           );
+    printf("flags               : %x\n"  , ffrdp->flags               );
+    printf("send_seq            : %u\n"  , ffrdp->send_seq            );
+    printf("recv_seq            : %u\n"  , ffrdp->recv_seq            );
+    printf("recv_win            : %u\n"  , ffrdp->recv_win            );
+    printf("wait_snd            : %u\n"  , ffrdp->wait_snd            );
+    printf("tick_query_rwin     : %u\n"  , ffrdp->tick_query_rwin     );
+    printf("counter_send_1sttime: %u\n"  , ffrdp->counter_send_1sttime);
+    printf("counter_send_failed : %u\n"  , ffrdp->counter_send_failed );
+    printf("counter_resend_rto  : %u\n"  , ffrdp->counter_resend_rto  );
+    printf("counter_resend_fast : %u\n"  , ffrdp->counter_resend_fast );
     printf("counter_resend_ratio: %.2f%%\n", 100.0 * (ffrdp->counter_resend_rto + ffrdp->counter_resend_fast) / ffrdp->counter_send_1sttime);
-    printf("counter_query_rwin  : %u\n", ffrdp->counter_query_rwin  );
-    printf("rttm: %u, rtts: %u, rttd: %u, rto: %u\n\n", ffrdp->rttm, ffrdp->rtts, ffrdp->rttd, ffrdp->rto);
+    printf("counter_query_rwin  : %u\n"  , ffrdp->counter_query_rwin  );
+#if FFRDP_ENABLE_FEC
+    printf("fec_txseq           : %d\n"  , ffrdp->fec_txseq           );
+    printf("fec_rxseq           : %d\n"  , ffrdp->fec_rxseq           );
+    printf("fec_rxmask          : %08x\n", ffrdp->fec_rxmask          );
+    printf("counter_fec_tx_short: %u\n"  , ffrdp->counter_fec_tx_short);
+    printf("counter_fec_tx_full : %u\n"  , ffrdp->counter_fec_tx_full );
+    printf("counter_fec_rx_short: %u\n"  , ffrdp->counter_fec_rx_short);
+    printf("counter_fec_rx_full : %u\n"  , ffrdp->counter_fec_rx_full );
+    printf("counter_fec_ok      : %u\n"  , ffrdp->counter_fec_ok      );
+    printf("counter_fec_failed  : %u\n"  , ffrdp->counter_fec_failed  );
+#endif
+    printf("\r\n");
 }
 
 #if 1
