@@ -59,7 +59,6 @@ enum {
     FFRDP_FRAME_TYPE_ACK ,
     FFRDP_FRAME_TYPE_WIN0,
     FFRDP_FRAME_TYPE_WIN1,
-    FFRDP_FRAME_TYPE_BYE ,
 };
 
 typedef struct tagFFRDP_FRAME_NODE {
@@ -81,8 +80,6 @@ typedef struct {
     int32_t  recv_tail;
     #define FLAG_SERVER    (1 << 0)
     #define FLAG_CONNECTED (1 << 1)
-    #define FLAG_BYEBYE0   (1 << 2)
-    #define FLAG_BYEBYE1   (1 << 3)
     uint32_t flags;
     SOCKET   udp_fd;
     struct   sockaddr_in server_addr;
@@ -229,7 +226,7 @@ static void ffrdp_reset(FFRDPCONTEXT *ffrdp)
     ffrdp->rttm      = ffrdp->rtts = ffrdp->rttd = ffrdp->tick_query_rwin = ffrdp->wait_snd = 0;
     ffrdp->recv_win  = FFRDP_RECVBUF_SIZE / 2;
     ffrdp->rto       = FFRDP_MIN_RTO;
-    ffrdp->flags    &=~(FLAG_CONNECTED|FLAG_BYEBYE0|FLAG_BYEBYE1);
+    ffrdp->flags    &=~FLAG_CONNECTED;
     ffrdp->counter_send_1sttime = ffrdp->counter_resend_fast = ffrdp->counter_resend_rto = ffrdp->counter_query_rwin = 0;
     list_free(&ffrdp->send_list_head, &ffrdp->send_list_tail, -1);
     list_free(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, -1);
@@ -410,14 +407,6 @@ int ffrdp_recv(void *ctxt, char *buf, int len)
     return ret;
 }
 
-int ffrdp_byebye(void *ctxt)
-{
-    FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
-    if (!ffrdp || (ffrdp->flags & FLAG_SERVER)) return -1;
-    ffrdp->flags |= FLAG_BYEBYE0;
-    return 0;
-}
-
 void ffrdp_update(void *ctxt)
 {
     FFRDPCONTEXT       *ffrdp   = (FFRDPCONTEXT*)ctxt;
@@ -505,22 +494,9 @@ void ffrdp_update(void *ctxt)
         case FFRDP_FRAME_TYPE_WIN1:
             ffrdp->recv_win = (data[1] << 0) | (data[2] << 8); ffrdp->tick_query_rwin = get_tick_count();
             break;
-        case FFRDP_FRAME_TYPE_BYE:
-            if (ffrdp->flags & FLAG_SERVER) {
-                data[0] = FFRDP_FRAME_TYPE_BYE; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
-                ffrdp_reset(ffrdp);
-            } else {
-                ffrdp->flags |= FLAG_BYEBYE1;
-                ffrdp_reset(ffrdp);
-            }
-            break;
         }
     }
     if (node) free(node);
-
-    if ((ffrdp->flags & FLAG_SERVER) == 0 && (ffrdp->flags & FLAG_BYEBYE0) && (ffrdp->flags & FLAG_BYEBYE1) == 0) {
-        data[0] = FFRDP_FRAME_TYPE_BYE; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
-    }
 
     if (got_data) { // got data frame
         while (ffrdp->recv_list_head) {
