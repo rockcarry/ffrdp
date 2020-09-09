@@ -217,24 +217,6 @@ static int ffrdp_sleep(FFRDPCONTEXT *ffrdp, int flag)
     return 0;
 }
 
-static void ffrdp_reset(FFRDPCONTEXT *ffrdp)
-{
-    struct sockaddr_in srcaddr;
-    uint8_t  buf[FFRDP_MTU_SIZE + 4];
-    uint32_t addrlen = sizeof(srcaddr);
-    int      ret;
-    ffrdp->recv_size = ffrdp->recv_head = ffrdp->recv_tail = ffrdp->send_seq = ffrdp->recv_seq = 0;
-    ffrdp->rttm      = ffrdp->rtts = ffrdp->rttd = ffrdp->tick_query_rwin = ffrdp->wait_snd = 0;
-    ffrdp->recv_win  = FFRDP_RECVBUF_SIZE / 2;
-    ffrdp->rto       = FFRDP_MIN_RTO;
-    ffrdp->flags    &=~FLAG_CONNECTED;
-    ffrdp->counter_send_1sttime = ffrdp->counter_resend_fast = ffrdp->counter_resend_rto = ffrdp->counter_query_rwin = 0;
-    list_free(&ffrdp->send_list_head, &ffrdp->send_list_tail, -1);
-    list_free(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, -1);
-    memset(&ffrdp->client_addr, 0, sizeof(ffrdp->client_addr));
-    do { ret = recvfrom(ffrdp->udp_fd, buf, sizeof(buf), 0, (struct sockaddr*)&srcaddr, &addrlen); } while (ret > 0);
-}
-
 static int ffrdp_send_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame, struct sockaddr_in *dstaddr)
 {
 #if !FFRDP_ENABLE_FEC
