@@ -250,7 +250,7 @@ static int ffrdp_send_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame, s
 static int ffrdp_recv_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame)
 {
 #if !FFRDP_ENABLE_FEC
-    ffrdp = ffrdp; frame = frame; return 0;
+    (void)ffrdp; (void)frame; return 0;
 #else
     int32_t fecseq, i;
     if (frame->size != 4 + FFRDP_MTU_SIZE + 2) {
@@ -578,6 +578,7 @@ static void* server_thread(void *param)
     uint32_t tick_start, total_bytes;
     int      size, ret;
 
+    (void)param;
     if (!sendbuf || !recvbuf) {
         printf("server failed to allocate send or recv buffer !\n");
         goto done;
@@ -626,6 +627,7 @@ static void* client_thread(void *param)
     uint32_t tick_start, total_bytes;
     int      size, ret;
 
+    (void)param;
     if (!sendbuf || !recvbuf) {
         printf("client failed to allocate send or recv buffer !\n");
         goto done;
