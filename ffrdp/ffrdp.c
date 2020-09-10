@@ -430,7 +430,7 @@ void ffrdp_update(void *ctxt)
             node->size = ret; // frame size is the return size of recvfrom
             if (ffrdp_recv_data_frame(ffrdp, node) == 0) {
                 dist = seq_distance(GET_FRAME_SEQ(node), recv_una);
-                if (dist == 0) recv_una++;
+                if (dist == 0) { recv_una++; }
                 if (dist >= 0) { list_enqueue(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, node); node = NULL; }
                 got_data = 1;
             }
