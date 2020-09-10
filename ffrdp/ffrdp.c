@@ -257,8 +257,8 @@ static int ffrdp_recv_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame)
         return fecseq % FFRDP_FEC_REDUNDANCY != FFRDP_FEC_REDUNDANCY - 1 ? 0 : -1;
     } else ffrdp->fec_rxseq = fecseq; // group not changed
     if (fecseq % FFRDP_FEC_REDUNDANCY == FFRDP_FEC_REDUNDANCY - 1) { // it's redundance frame
-        if (ffrdp->fec_rxcnt == FFRDP_FEC_REDUNDANCY) { return -1; }
-        if (ffrdp->fec_rxcnt != FFRDP_FEC_REDUNDANCY - 1) { ffrdp->counter_fec_failed++; return -1; }
+        if (ffrdp->fec_rxcnt == FFRDP_FEC_REDUNDANCY - 1) { return -1; }
+        if (ffrdp->fec_rxcnt != FFRDP_FEC_REDUNDANCY - 2) { ffrdp->counter_fec_failed++; return -1; }
         psrc = (uint32_t*)ffrdp->fec_rxbuf; pdst = (uint32_t*)frame->data;
         for (i=0; i<(4+FFRDP_MTU_SIZE)/sizeof(uint32_t); i++) *pdst++ ^= *psrc++;
         frame->data[0] = FFRDP_FRAME_TYPE_DATA;
