@@ -224,14 +224,12 @@ static int ffrdp_send_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame, s
         ffrdp->counter_fec_tx_short++;
         frame->data[frame->size - 2] = frame->data[frame->size - 1] = 0;
         return sendto(ffrdp->udp_fd, frame->data, frame->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)) == frame->size ? 0 : -1;
-    } else {
-        uint32_t *psrc = (uint32_t*)frame->data;
-        uint32_t *pdst = (uint32_t*)ffrdp->fec_txbuf;
-        int       ret, i;
-        *(uint16_t*)(frame->data + 4 + FFRDP_MTU_SIZE) = (uint16_t)ffrdp->fec_txseq++;
-        ret = sendto(ffrdp->udp_fd, frame->data, frame->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
-        if (ret != frame->size) return -1;
-        for (i=0; i<(FFRDP_MTU_SIZE+4)/(int)sizeof(uint32_t); i++) *pdst++ ^= *psrc++; // make xor fec frame
+    } else { // full frame
+        uint32_t *psrc = (uint32_t*)frame->data, *pdst = (uint32_t*)ffrdp->fec_txbuf, i;
+        *(uint16_t*)(frame->data + 4 + FFRDP_MTU_SIZE) = (uint16_t)ffrdp->fec_txseq;
+        if (sendto(ffrdp->udp_fd, frame->data, frame->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)) != frame->size) return -1;
+        else ffrdp->fec_txseq++;
+        for (i=0; i<(4+FFRDP_MTU_SIZE)/sizeof(uint32_t); i++) *pdst++ ^= *psrc++; // make xor fec frame
         if (ffrdp->fec_txseq % FFRDP_FEC_REDUNDANCY == FFRDP_FEC_REDUNDANCY - 1) {
             *(uint16_t*)(ffrdp->fec_txbuf + 4 + FFRDP_MTU_SIZE) = ffrdp->fec_txseq++;
             ffrdp->fec_txbuf[0] = FFRDP_FRAME_TYPE_DATA;
