@@ -486,7 +486,7 @@ void ffrdp_update(void *ctxt)
     if (ffrdp->send_list_head && seq_distance(send_una, GET_FRAME_SEQ(ffrdp->send_list_head)) > 0) { // got ack frame
         ffrdp->recv_win = recv_win; ffrdp->tick_query_rwin = get_tick_count(); // update rx recv window size
         for (p=ffrdp->send_list_head; p;) {
-            dist= seq_distance(GET_FRAME_SEQ(p), send_una);
+            dist = seq_distance(GET_FRAME_SEQ(p), send_una);
             for (i=15; i>=0 && !(send_mack&(1<<i)); i--);
             if (i < 0) maxack = (send_una - 1) & 0xFFFFFF;
             else maxack = (send_una + i + 1) & 0xFFFFFF;
