@@ -195,11 +195,9 @@ static void list_remove(FFRDP_FRAME_NODE **head, FFRDP_FRAME_NODE **tail, FFRDP_
     free(node);
 }
 
-static int list_free(FFRDP_FRAME_NODE **head, FFRDP_FRAME_NODE **tail, int n)
+static void list_free(FFRDP_FRAME_NODE **head, FFRDP_FRAME_NODE **tail)
 {
-    int k = 0;
-    while (*head && ++k != n) list_remove(head, tail, *head);
-    return k;
+    while (*head) list_remove(head, tail, *head);
 }
 
 static int ffrdp_sleep(FFRDPCONTEXT *ffrdp, int flag)
@@ -338,8 +336,8 @@ void ffrdp_free(void *ctxt)
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ctxt) return;
     if (ffrdp->udp_fd > 0) closesocket(ffrdp->udp_fd);
-    list_free(&ffrdp->send_list_head, &ffrdp->send_list_tail, -1);
-    list_free(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, -1);
+    list_free(&ffrdp->send_list_head, &ffrdp->send_list_tail);
+    list_free(&ffrdp->recv_list_head, &ffrdp->recv_list_tail);
     free(ffrdp);
 #ifdef WIN32
     WSACleanup();
