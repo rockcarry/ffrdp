@@ -473,10 +473,10 @@ void ffrdp_update(void *ctxt)
         }
         for (recv_mack=0,i=0,p=ffrdp->recv_list_head; i<=16&&p; i++,p=p->next) {
             dist = seq_distance(GET_FRAME_SEQ(p), ffrdp->recv_seq);
-            if (dist > 1 && dist <= 16) recv_mack |= 1 << (dist - 1);
+            if (dist <= 16) recv_mack |= 1 << (dist - 1); // dist is obviously > 0
         }
         *(uint32_t*)(data + 0) = (FFRDP_FRAME_TYPE_ACK << 0) | (ffrdp->recv_seq << 8);
-        *(uint32_t*)(data + 4) = (recv_mack << 0);;
+        *(uint32_t*)(data + 4) = (recv_mack << 0);
         if (!ffrdp->recv_list_head || GET_FRAME_SEQ(ffrdp->recv_list_head) != ffrdp->recv_seq) {
             *(uint32_t*)(data + 4) |= (sizeof(ffrdp->recv_buff) - ffrdp->recv_size) << 16;
         }
