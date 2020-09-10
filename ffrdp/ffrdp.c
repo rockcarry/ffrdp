@@ -181,7 +181,6 @@ static void list_enqueue(FFRDP_FRAME_NODE **head, FFRDP_FRAME_NODE **tail, FFRDP
             }
         }
         node->next = *head;
-        node->prev =  NULL;
         node->next->prev = node;
         *head = node;
     }
