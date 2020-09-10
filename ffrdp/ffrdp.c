@@ -355,7 +355,7 @@ int ffrdp_send(void *ctxt, char *buf, int len)
         SET_FRAME_SEQ(node, ffrdp->send_seq);
         memcpy(node->data + 4, buf, size);
         list_enqueue(&ffrdp->send_list_head, &ffrdp->send_list_tail, node);
-        ffrdp->send_seq++; ffrdp->send_seq &= 0xFFFFFF; ffrdp->wait_snd++;
+        ffrdp->send_seq++; ffrdp->wait_snd++;
         buf += size; n -= size;
     }
     return len - n;
