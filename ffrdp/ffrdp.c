@@ -186,19 +186,19 @@ static void list_enqueue(FFRDP_FRAME_NODE **head, FFRDP_FRAME_NODE **tail, FFRDP
     }
 }
 
-static void list_remove(FFRDP_FRAME_NODE **head, FFRDP_FRAME_NODE **tail, FFRDP_FRAME_NODE *node, int f)
+static void list_remove(FFRDP_FRAME_NODE **head, FFRDP_FRAME_NODE **tail, FFRDP_FRAME_NODE *node)
 {
     if (node->next) node->next->prev = node->prev;
     else *tail = node->prev;
     if (node->prev) node->prev->next = node->next;
     else *head = node->next;
-    if (f) free(node);
+    free(node);
 }
 
 static int list_free(FFRDP_FRAME_NODE **head, FFRDP_FRAME_NODE **tail, int n)
 {
     int k = 0;
-    while (*head && ++k != n) list_remove(head, tail, *head, 1);
+    while (*head && ++k != n) list_remove(head, tail, *head);
     return k;
 }
 
@@ -480,7 +480,7 @@ void ffrdp_update(void *ctxt)
                 ffrdp->recv_tail = ringbuf_write(ffrdp->recv_buff, sizeof(ffrdp->recv_buff), ffrdp->recv_tail, ffrdp->recv_list_head->data + 4, ffrdp->recv_list_head->size - 4 - 2);
                 ffrdp->recv_size+= ffrdp->recv_list_head->size - 4 - 2;
                 ffrdp->recv_seq++; ffrdp->recv_seq &= 0xFFFFFF;
-                list_remove(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, ffrdp->recv_list_head, 1);
+                list_remove(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, ffrdp->recv_list_head);
             } else break;
         }
         for (recv_mack=0,i=0,p=ffrdp->recv_list_head; i<=16&&p; i++,p=p->next) {
@@ -518,7 +518,7 @@ void ffrdp_update(void *ctxt)
                 ffrdp->rto = MAX(FFRDP_MIN_RTO, ffrdp->rto);
                 ffrdp->rto = MIN(FFRDP_MAX_RTO, ffrdp->rto);
 
-                t = p; p = p->next; list_remove(&ffrdp->send_list_head, &ffrdp->send_list_tail, t, 1);
+                t = p; p = p->next; list_remove(&ffrdp->send_list_head, &ffrdp->send_list_tail, t);
                 ffrdp->wait_snd--; continue;
             } else if (seq_distance(maxack, GET_FRAME_SEQ(p)) > 0) {
                 p->flags |= FLAG_FAST_RESEND;
