@@ -92,9 +92,9 @@ typedef struct {
     uint32_t send_seq;
     uint32_t recv_seq;
     uint32_t recv_win; // remote receive window
+    uint32_t wait_snd;
     uint32_t rttm, rtts, rttd, rto;
     uint32_t tick_query_rwin;
-    uint32_t wait_snd;
     uint32_t counter_send_1sttime;
     uint32_t counter_send_failed;
     uint32_t counter_resend_fast;
