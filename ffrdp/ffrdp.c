@@ -414,7 +414,7 @@ void ffrdp_update(void *ctxt)
             if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) break;
             if (!(p->flags & FLAG_FAST_RESEND)) ffrdp->counter_resend_rto++;
             else ffrdp->counter_resend_fast++;
-            p->tick_timeout+= (p->tick_timeout - p->tick_send) / 2; // rto = rto + rto / 2
+            p->tick_timeout = p->tick_send + MIN(((int32_t)p->tick_timeout - (int32_t)p->tick_send) * 3 / 2, FFRDP_MAX_RTO); // rto = rto + rto / 2
             p->flags       &=~FLAG_FAST_RESEND;
             if (ffrdp->rto == FFRDP_MAX_RTO) break; // if rto reach FFRDP_MAX_RTO, we only try to resend one packet
         }
