@@ -1,53 +1,53 @@
-ffrdp ÊÇÒ»¸ö»ùÓÚ udp + arq + fec µÄ¿ìËÙ¿É¿¿Ğ­Òé
+ffrdp æ˜¯ä¸€ä¸ªåŸºäº udp + arq + fec çš„å¿«é€Ÿå¯é åè®®
 
-£¨500 ĞĞ´úÂëÊµÏÖÁËÍêÕûµÄ udp + arq + fec£¬¼ò½à¸ßĞ§¡£github ÉÏÄ¿Ç°»¹ÕÒ²»µ½¸ü¼ò½àµÄ£©
+ï¼ˆ500 è¡Œä»£ç å®ç°äº†å®Œæ•´çš„ udp + arq + fecï¼Œç®€æ´é«˜æ•ˆã€‚github ä¸Šç›®å‰è¿˜æ‰¾ä¸åˆ°æ›´ç®€æ´çš„ï¼‰
 
 
-rto ¼ÆËã£º
-³õÊ¼£º
+rto è®¡ç®—ï¼š
+åˆå§‹ï¼š
 rtts = rttm;
 rttd = rttm / 2;
 
-µü´ú£º
+è¿­ä»£ï¼š
 rtts = (1 - alpha) * rtts + alpha * rttm; // alpha = 1 / 8
 rttd = (1 - beta ) * rttd + beta  * abs(rttm - rtts); // beta = 1 / 4
 
-Õı³££º
-rto  = rtts + r * rttd;
+æ­£å¸¸ï¼š
+rto  = rtts + r * rttd;7
 
-³¬Ê±£º
+è¶…æ—¶ï¼š
 rto  = 1.5 * rto;
 
 
-Ö¡¶¨Òå£º
-data frame: 0x00 seq0 seq1 seq2 data ... fec_seq0 fec_sec1
+å¸§å®šä¹‰ï¼š
+data frame: 0x00 seq0 seq1 seq2 data ... fec_seq0 fec_seq1
 ack  frame: 0x01 una0 una1 una2 mack0 mack1 wind0 wind1
 win0 frame: 0x02
 win1 frame: 0x03 wind0 wind1
 
 
-Ğ­ÒéÌØµã£º
-Ñ¡ÔñÖØ´«¡¢¿ìËÙÖØ´«¡¢·ÇÑÓ³Ù ACK¡¢UNA + MACK¡¢·ÇÍËÈÃÁ÷¿Ø¡¢FEC Ç°Ïò¾À´í
+åè®®ç‰¹ç‚¹ï¼š
+é€‰æ‹©é‡ä¼ ã€å¿«é€Ÿé‡ä¼ ã€éå»¶è¿Ÿ ACKã€UNA + MACKã€éé€€è®©æµæ§ã€FEC å‰å‘çº é”™
 
 
-Ğ­ÒéËµÃ÷£º
-seq una ³¤¶ÈÎª 24bit£¬recv_win_size Îª 16bit
-ack Ö¡°üº¬ÁË una, mack ºÍ recv_win_size ĞÅÏ¢
-mack 16bit ÊÇÒ»¸ö bitmap, °üº¬ÁË una Ö®ºó£¬µ«ÓÖÒÑ¾­±» ack µÄÖ¡ºÅ
-win0 ºÍ win1 ÃüÁîÓÃÓÚ²éÑ¯ºÍÓ¦´ğ¶Ô·½µÄ recv_win_size
-bye ÃüÁîÓÃÓÚ¿Í»§¶Ë¸ú·şÎñÆ÷¶ËËµÔÙ¼û
+åè®®è¯´æ˜ï¼š
+seq una é•¿åº¦ä¸º 24bitï¼Œrecv_win_size ä¸º 16bit
+ack å¸§åŒ…å«äº† una, mack å’Œ recv_win_size ä¿¡æ¯
+mack 16bit æ˜¯ä¸€ä¸ª bitmap, åŒ…å«äº† una ä¹‹åï¼Œä½†åˆå·²ç»è¢« ack çš„å¸§å·
+win0 å’Œ win1 å‘½ä»¤ç”¨äºæŸ¥è¯¢å’Œåº”ç­”å¯¹æ–¹çš„ recv_win_size
+bye å‘½ä»¤ç”¨äºå®¢æˆ·ç«¯è·ŸæœåŠ¡å™¨ç«¯è¯´å†è§
 
-ÀıÈç£ºuna: 16, mack: 0x0003 Õâ¸öÓ¦´ğ´ú±í
+ä¾‹å¦‚ï¼šuna: 16, mack: 0x0003 è¿™ä¸ªåº”ç­”ä»£è¡¨
 ack 1  1  1  1  0  1  1  0  0  0  0
 seq 12 13 14 15 16 17 18 19 20 21 22 ...
-ÕâĞ©Ö¡ÒÑ¾­±»½ÓÊÕ·½ÊÕµ½²¢Ó¦´ğ
+è¿™äº›å¸§å·²ç»è¢«æ¥æ”¶æ–¹æ”¶åˆ°å¹¶åº”ç­”
 
-una+mack µÄ·½Ê½±»ÓÃÓÚÑ¡ÔñÖØ´«ºÍ¿ìËÙÖØ´«
+una+mack çš„æ–¹å¼è¢«ç”¨äºé€‰æ‹©é‡ä¼ å’Œå¿«é€Ÿé‡ä¼ 
 
 
-FEC ËµÃ÷£º
-²ÉÓÃÒì»ò·½Ê½ÊµÏÖ FEC
-Õë¶Ô full frame ¼´Ö¡³¤¶ÈÎª MTU µÄÖ¡£¬½øĞĞ FEC ¾À´í
+FEC è¯´æ˜ï¼š
+é‡‡ç”¨å¼‚æˆ–æ–¹å¼å®ç° FEC
+é’ˆå¯¹ full frame å³å¸§é•¿åº¦ä¸º MTU çš„å¸§ï¼Œè¿›è¡Œ FEC çº é”™
 
 
 rockcarry
