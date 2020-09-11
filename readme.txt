@@ -1,5 +1,7 @@
 ffrdp 是一个基于 udp + arq + fec 的快速可靠协议
 
+（500 行代码实现了完整的 udp + arq + fec，简洁高效。github 上目前还找不到更简洁的）
+
 
 rto 计算：
 初始：
