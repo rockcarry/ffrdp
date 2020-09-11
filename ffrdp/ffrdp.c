@@ -566,11 +566,11 @@ static int  client_max_send_size = 16 * 1024;
 static pthread_mutex_t g_mutex;
 static void* server_thread(void *param)
 {
-    void    *ffrdp  = ffrdp_init(server_bind_ip, server_bind_port, 1);
     uint8_t *sendbuf= malloc(server_max_send_size);
     uint8_t *recvbuf= malloc(client_max_send_size);
+    void    *ffrdp  = NULL;
     uint32_t tick_start, total_bytes;
-    int      size, ret;
+    int      size, ret, client_connected = 0;
 
     (void)param;
     if (!sendbuf || !recvbuf) {
@@ -581,6 +581,10 @@ static void* server_thread(void *param)
     tick_start  = get_tick_count();
     total_bytes = 0;
     while (!g_exit) {
+        if (!ffrdp) {
+            ffrdp = ffrdp_init(server_bind_ip, server_bind_port, 1);
+            if (!ffrdp) { usleep(100 * 1000); continue; }
+        }
         size = 1 + rand() % server_max_send_size;
         *(uint32_t*)(sendbuf + 4) = get_tick_count();
         strcpy((char*)sendbuf + 8, "rockcarry server data");
@@ -591,7 +595,10 @@ static void* server_thread(void *param)
 
         ret = ffrdp_recv(ffrdp, (char*)recvbuf, client_max_send_size);
         if (ret > 0) {
-//          printf("ret: %d\n", ret);
+            if (client_connected == 0) {
+                client_connected = 1;
+                printf("client connected !\n");
+            }
             total_bytes += ret;
             if ((int32_t)get_tick_count() - (int32_t)tick_start > 10 * 1000) {
                 pthread_mutex_lock(&g_mutex);
@@ -604,6 +611,11 @@ static void* server_thread(void *param)
         }
 
         ffrdp_update(ffrdp);
+        if (client_connected && ffrdp_isdead(ffrdp)) {
+            printf("client lost !\n");
+            ffrdp_free(ffrdp); ffrdp = NULL;
+            client_connected = 0;
+        }
     }
 
 done:
@@ -615,11 +627,11 @@ done:
 
 static void* client_thread(void *param)
 {
-    void    *ffrdp  = ffrdp_init(client_cnnt_ip, client_cnnt_port, 0);
     uint8_t *sendbuf= malloc(client_max_send_size);
     uint8_t *recvbuf= malloc(server_max_send_size);
-    uint32_t tick_start, total_bytes;
-    int      size, ret;
+    void    *ffrdp  = NULL;
+    uint32_t tick_start, tick_recv, total_bytes;
+    int      size, ret, connect_ok = 0;
 
     (void)param;
     if (!sendbuf || !recvbuf) {
@@ -630,6 +642,10 @@ static void* client_thread(void *param)
     tick_start  = get_tick_count();
     total_bytes = 0;
     while (!g_exit) {
+        if (!ffrdp) {
+            ffrdp = ffrdp_init(client_cnnt_ip, client_cnnt_port, 0);
+            if (!ffrdp) { usleep(100 * 1000); continue; }
+        }
         size = 1 + rand() % client_max_send_size;
         *(uint32_t*)(sendbuf + 4) = get_tick_count();
         strcpy((char*)sendbuf + 8, "rockcarry client data");
@@ -641,7 +657,11 @@ static void* client_thread(void *param)
 
         ret = ffrdp_recv(ffrdp, (char*)recvbuf, server_max_send_size);
         if (ret > 0) {
-//          printf("ret: %d\n", ret);
+            if (connect_ok == 0) {
+                connect_ok = 1;
+                printf("connect to server ok !\n");
+            }
+            tick_recv    = get_tick_count();
             total_bytes += ret;
             if ((int32_t)get_tick_count() - (int32_t)tick_start > 10 * 1000) {
                 pthread_mutex_lock(&g_mutex);
@@ -654,6 +674,11 @@ static void* client_thread(void *param)
         }
 
         ffrdp_update(ffrdp);
+        if (connect_ok && get_tick_count() - tick_recv > 2000) {
+            printf("server lost !\n");
+            ffrdp_free(ffrdp); ffrdp = NULL;
+            connect_ok = 0;
+        }
     }
 
 done:
