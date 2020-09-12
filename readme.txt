@@ -49,6 +49,7 @@ FEC 说明：
 针对 full frame 即帧长度为 MTU 的帧，进行 FEC 纠错
 data frame 的最后两个字节用作 FEC 的 seq.
 
+
 rockcarry
 2020-9-1
 
