@@ -13,7 +13,7 @@ rtts = (1 - alpha) * rtts + alpha * rttm; // alpha = 1 / 8
 rttd = (1 - beta ) * rttd + beta  * abs(rttm - rtts); // beta = 1 / 4
 
 正常：
-rto  = rtts + r * rttd;7
+rto  = rtts + r * rttd;
 
 超时：
 rto  = 1.5 * rto;
@@ -35,6 +35,7 @@ seq una 长度为 24bit，recv_win_size 为 16bit
 ack 帧包含了 una, mack 和 recv_win_size 信息
 mack 16bit 是一个 bitmap, 包含了 una 之后，但又已经被 ack 的帧号
 win0 和 win1 命令用于查询和应答对方的 recv_win_size
+fec_seq 长度为 16bit 用于 FEC
 
 例如：una: 16, mack: 0x0003 这个应答代表
 ack 1  1  1  1  0  1  1  0  0  0  0
