@@ -348,7 +348,7 @@ int ffrdp_send(void *ctxt, char *buf, int len)
     int               n = len, size;
     if (  !ffrdp || ((ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0)
        || ((len + FFRDP_MTU_SIZE - 1) / FFRDP_MTU_SIZE + ffrdp->wait_snd > FFRDP_MAX_WAITSND)) {
-        ffrdp->counter_send_failed++;
+        if (ffrdp) ffrdp->counter_send_failed++;
         return -1;
     }
     while (n > 0) {
