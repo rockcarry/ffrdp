@@ -380,7 +380,7 @@ int ffrdp_isdead(void *ctxt)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ctxt) return -1;
-    return ffrdp->send_list_head && (int32_t)get_tick_count() - (int32_t)ffrdp->send_list_head->tick_send > FFRDP_DEAD_TIMEOUT;
+    return ffrdp->send_list_head && ffrdp->send_list_head->tick_send && (int32_t)get_tick_count() - (int32_t)ffrdp->send_list_head->tick_send > FFRDP_DEAD_TIMEOUT;
 }
 
 void ffrdp_update(void *ctxt)
