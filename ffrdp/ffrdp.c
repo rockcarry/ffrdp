@@ -67,8 +67,9 @@ typedef struct tagFFRDP_FRAME_NODE {
     struct tagFFRDP_FRAME_NODE *prev;
     uint16_t size; // frame size
     uint8_t *data; // frame data
-    #define FLAG_FIRST_SEND  (1 << 0) // after frame first send, this flag will be set
-    #define FLAG_FAST_RESEND (1 << 1) // data frame need fast resend when next update
+    #define FLAG_FIRST_SEND     (1 << 0) // after frame first send, this flag will be set
+    #define FLAG_TIMEOUT_RESEND (1 << 1) // data frame wait ack timeout and be resend
+    #define FLAG_FAST_RESEND    (1 << 2) // data frame need fast resend when next update
     uint32_t flags;        // frame flags
     uint32_t tick_send;    // frame send tick
     uint32_t tick_timeout; // frame ack timeout
@@ -413,10 +414,16 @@ void ffrdp_update(void *ctxt)
             }
         } else if ((p->flags & FLAG_FIRST_SEND) && ((int32_t)get_tick_count() - (int32_t)p->tick_timeout > 0 || (p->flags & FLAG_FAST_RESEND))) { // resend
             if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) break;
-            if (!(p->flags & FLAG_FAST_RESEND)) ffrdp->counter_resend_rto++;
-            else ffrdp->counter_resend_fast++;
-            p->tick_timeout+= MIN(((int32_t)p->tick_timeout - (int32_t)p->tick_send) * 3 / 2, FFRDP_MAX_RTO); // rto = rto + rto / 2
-            p->flags       &=~FLAG_FAST_RESEND;
+            if (!(p->flags & FLAG_FAST_RESEND)) {
+                p->flags |= FLAG_TIMEOUT_RESEND;
+                ffrdp->rto += ffrdp->rto / 2;
+                ffrdp->rto  = MIN(ffrdp->rto, FFRDP_MAX_RTO);
+                ffrdp->counter_resend_rto++;
+            } else {
+                p->flags &=~FLAG_FAST_RESEND;
+                ffrdp->counter_resend_fast++;
+            }
+            p->tick_timeout+= ffrdp->rto;
             if (ffrdp->rto == FFRDP_MAX_RTO) break; // if rto reach FFRDP_MAX_RTO, we only try to resend one packet
         }
     }
@@ -501,18 +508,19 @@ void ffrdp_update(void *ctxt)
 
             if (dist > 16 || !(p->flags & FLAG_FIRST_SEND)) break;
             else if (dist < 0 || (dist > 0 && (send_mack & (1 << (dist-1))))) { // this frame got ack
-                ffrdp->rttm = (int32_t)get_tick_count() - (int32_t)p->tick_send;
-                if (ffrdp->rtts == (uint32_t)-1) {
-                    ffrdp->rtts = ffrdp->rttm;
-                    ffrdp->rttd = ffrdp->rttm / 2;
-                } else {
-                    ffrdp->rtts = (7 * ffrdp->rtts + 1 * ffrdp->rttm) / 8;
-                    ffrdp->rttd = (3 * ffrdp->rttd + 1 * abs((int)ffrdp->rttm - (int)ffrdp->rtts)) / 4;
+                if (!(p->flags & FLAG_TIMEOUT_RESEND)) {
+                    ffrdp->rttm = (int32_t)get_tick_count() - (int32_t)p->tick_send;
+                    if (ffrdp->rtts == (uint32_t)-1) {
+                        ffrdp->rtts = ffrdp->rttm;
+                        ffrdp->rttd = ffrdp->rttm / 2;
+                    } else {
+                        ffrdp->rtts = (7 * ffrdp->rtts + 1 * ffrdp->rttm) / 8;
+                        ffrdp->rttd = (3 * ffrdp->rttd + 1 * abs((int)ffrdp->rttm - (int)ffrdp->rtts)) / 4;
+                    }
+                    ffrdp->rto = ffrdp->rtts + 4 * ffrdp->rttd;
+                    ffrdp->rto = MAX(FFRDP_MIN_RTO, ffrdp->rto);
+                    ffrdp->rto = MIN(FFRDP_MAX_RTO, ffrdp->rto);
                 }
-                ffrdp->rto = ffrdp->rtts + 4 * ffrdp->rttd;
-                ffrdp->rto = MAX(FFRDP_MIN_RTO, ffrdp->rto);
-                ffrdp->rto = MIN(FFRDP_MAX_RTO, ffrdp->rto);
-
                 t = p; p = p->next; list_remove(&ffrdp->send_list_head, &ffrdp->send_list_tail, t);
                 ffrdp->wait_snd--; continue;
             } else if (seq_distance(maxack, GET_FRAME_SEQ(p)) > 0) {
