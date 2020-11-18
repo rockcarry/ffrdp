@@ -586,8 +586,7 @@ static void* server_thread(void *param)
             if (!ffrdp) { usleep(100 * 1000); continue; }
         }
         size = 1 + rand() % server_max_send_size;
-        *(uint32_t*)(sendbuf + 4) = get_tick_count();
-        strcpy((char*)sendbuf + 8, "rockcarry server data");
+
         ret = ffrdp_send(ffrdp, (char*)sendbuf, size);
         if (ret != size) {
 //          printf("server send data failed: %d\n", size);
@@ -647,8 +646,6 @@ static void* client_thread(void *param)
             if (!ffrdp) { usleep(100 * 1000); continue; }
         }
         size = 1 + rand() % client_max_send_size;
-        *(uint32_t*)(sendbuf + 4) = get_tick_count();
-        strcpy((char*)sendbuf + 8, "rockcarry client data");
 
         ret = ffrdp_send(ffrdp, (char*)sendbuf, size);
         if (ret != size) {
