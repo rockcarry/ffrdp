@@ -39,8 +39,8 @@ static uint32_t get_tick_count()
 #define FFRDP_MTU_SIZE       1024 // should align to 4 bytes
 #define FFRDP_MIN_RTO        20
 #define FFRDP_MAX_RTO        2000
-#define FFRDP_WIN_CYCLE      100
 #define FFRDP_MAX_WAITSND    256
+#define FFRDP_POLL_CYCLE     100
 #define FFRDP_DEAD_TIMEOUT   3000
 #define FFRDP_DATFRM_FLOWCTL 32
 #define FFRDP_UDPRBUF_SIZE  (128 * FFRDP_MTU_SIZE)
@@ -431,7 +431,7 @@ void ffrdp_update(void *ctxt)
                 p->tick_timeout  = p->tick_send + ffrdp->rto;
                 p->flags        |= FLAG_FIRST_SEND;
                 ffrdp->counter_send_1sttime++;
-            } else if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_query_rwin > FFRDP_WIN_CYCLE) { // query remote receive window size
+            } else if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_query_rwin > FFRDP_POLL_CYCLE) { // query remote receive window size
                 data[0] = FFRDP_FRAME_TYPE_POLL; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
                 ffrdp->counter_send_poll++;
                 break;
@@ -482,9 +482,8 @@ void ffrdp_update(void *ctxt)
             una  = *(uint32_t*)(node->data + 0) >> 8;
             mack = *(uint32_t*)(node->data + 4) & 0xFFFF;
             dist = seq_distance(una, send_una);
-            if (dist == 0) {
-                send_mack|= mack;
-            } if (dist > 0) {
+            if (dist == 0) send_mack |= mack;
+            else if (dist > 0) {
                 send_una  = una;
                 send_mack = (send_mack >> dist) | mack;
                 ffrdp->recv_win = *(uint32_t*)(node->data + 4) >> 16; ffrdp->tick_query_rwin = get_tick_count();
