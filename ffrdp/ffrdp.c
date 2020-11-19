@@ -288,7 +288,7 @@ void* ffrdp_init(char *ip, int port, int server, int fec)
     }
 #endif
 
-    ffrdp->recv_win       = FFRDP_RECVBUF_SIZE / 2;
+    ffrdp->recv_win       = FFRDP_RECVBUF_SIZE;
     ffrdp->rtts           = (uint32_t) -1;
     ffrdp->rto            = FFRDP_MIN_RTO;
     ffrdp->fec_redundancy = MAX(0, MIN(fec, 63));
