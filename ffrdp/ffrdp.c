@@ -413,7 +413,7 @@ void ffrdp_update(void *ctxt)
     FFRDP_FRAME_NODE   *node    = NULL, *p = NULL, *t = NULL;
     struct sockaddr_in *dstaddr = NULL, srcaddr;
     uint32_t addrlen = sizeof(srcaddr);
-    int32_t  una, mack, ret, got_data = 0, send_una, send_mack = 0, recv_una, dist, maxack, i;
+    int32_t  una, mack, ret, got_data = 0, got_poll = 0, send_una, send_mack = 0, recv_una, dist, maxack, i;
     uint8_t  data[8];
 
     if (!ctxt) return;
@@ -486,14 +486,12 @@ void ffrdp_update(void *ctxt)
                 ffrdp->recv_win = *(uint32_t*)(node->data + 4) >> 16; ffrdp->tick_query_rwin = get_tick_count();
             }
             break;
-        case FFRDP_FRAME_TYPE_POLL:
-            ffrdp_send_ack(ffrdp, dstaddr); // send ack frame
-            break;
+        case FFRDP_FRAME_TYPE_POLL: got_poll = 1; break;
         }
     }
     if (node) free(node);
 
-    if (got_data) ffrdp_send_ack(ffrdp, dstaddr); // send ack frame
+    if (got_data || got_poll) ffrdp_send_ack(ffrdp, dstaddr); // send ack frame
     if (ffrdp->send_list_head && seq_distance(send_una, GET_FRAME_SEQ(ffrdp->send_list_head)) > 0) { // got ack frame
         for (p=ffrdp->send_list_head; p;) {
             dist = seq_distance(GET_FRAME_SEQ(p), send_una);
