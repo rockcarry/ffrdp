@@ -42,7 +42,7 @@ static uint32_t get_tick_count()
 #define FFRDP_WIN_CYCLE      100
 #define FFRDP_MAX_WAITSND    256
 #define FFRDP_DEAD_TIMEOUT   3000
-#define FFRDP_SNDPKT_FLOWCTL 32
+#define FFRDP_DATFRM_FLOWCTL 32
 #define FFRDP_UDPRBUF_SIZE  (128 * FFRDP_MTU_SIZE)
 #define FFRDP_SELECT_SLEEP   0
 #define FFRDP_SELECT_TIMEOUT 10000
@@ -91,7 +91,7 @@ typedef struct {
     uint32_t send_seq; // send seq
     uint32_t recv_seq; // send seq
     uint32_t recv_win; // remote receive window
-    uint32_t wait_snd; // packet number of wait to send
+    uint32_t wait_snd; // data frame number wait to send
     uint32_t rttm, rtts, rttd, rto;
     uint32_t tick_query_rwin;
     uint32_t counter_send_1sttime;
@@ -422,7 +422,7 @@ void ffrdp_update(void *ctxt)
     send_una = ffrdp->send_list_head ? GET_FRAME_SEQ(ffrdp->send_list_head) : 0;
     recv_una = ffrdp->recv_seq;
 
-    for (i=0,p=ffrdp->send_list_head; i<FFRDP_SNDPKT_FLOWCTL&&p; i++,p=p->next) {
+    for (i=0,p=ffrdp->send_list_head; i<FFRDP_DATFRM_FLOWCTL&&p; i++,p=p->next) {
         if (!(p->flags & FLAG_FIRST_SEND)) { // first send
             if (p->size - 4 - 2 <= (int)ffrdp->recv_win) {
                 if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) break;
@@ -451,7 +451,7 @@ void ffrdp_update(void *ctxt)
                 ffrdp->counter_resend_fast++;
             }
             p->tick_timeout+= ffrdp->rto;
-            if (ffrdp->rto == FFRDP_MAX_RTO) break; // if rto reach FFRDP_MAX_RTO, we only try to resend one packet
+            if (ffrdp->rto == FFRDP_MAX_RTO) break; // if rto reach FFRDP_MAX_RTO, we only try to resend one data frame
         }
     }
 
