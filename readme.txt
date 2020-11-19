@@ -20,9 +20,19 @@ rto  = 1.5 * rto;
 
 
 帧定义：
-data frame: 0x00 seq0 seq1 seq2 data ... fec_seq0 fec_seq1
+data frame:
+data_fec0  frame: 0x00 seq0 seq1 seq2 data ...
+data_fec3  frame: 0x00 seq0 seq1 seq2 data ... fec_seq0 fec_seq1
+data_fec4  frame: 0x00 seq0 seq1 seq2 data ... fec_seq0 fec_seq1
+... ...
+data_fec62 frame: 0x3E seq0 seq1 seq2 data ... fec_seq0 fec_seq1
+data_fec63 frame: 0x3F seq0 seq1 seq2 data ... fec_seq0 fec_seq1
+
 ack  frame: 0x01 una0 una1 una2 mack0 mack1 wind0 wind1
 poll frame: 0x02
+
+data_fec0 为不带 fec 的 data frame
+data_fecN 为每 N 帧带一个 fec 帧（N >= 1 && N <= 63）
 
 
 协议特点：
