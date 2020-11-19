@@ -96,9 +96,10 @@ typedef struct {
     uint32_t tick_query_rwin;
     uint32_t counter_send_1sttime;
     uint32_t counter_send_failed;
+    uint32_t counter_send_poll;
     uint32_t counter_resend_fast;
     uint32_t counter_resend_rto;
-    uint32_t counter_query_rwin;
+    uint32_t counter_reach_maxrto;
 
 #if FFRDP_ENABLE_FEC
     uint8_t  fec_txbuf[4 + FFRDP_MTU_SIZE + 2];
@@ -432,13 +433,16 @@ void ffrdp_update(void *ctxt)
                 ffrdp->counter_send_1sttime++;
             } else if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_query_rwin > FFRDP_WIN_CYCLE) { // query remote receive window size
                 data[0] = FFRDP_FRAME_TYPE_POLL; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
-                ffrdp->counter_query_rwin++;
+                ffrdp->counter_send_poll++;
                 break;
             }
         } else if ((p->flags & FLAG_FIRST_SEND) && ((int32_t)get_tick_count() - (int32_t)p->tick_timeout > 0 || (p->flags & FLAG_FAST_RESEND))) { // resend
             if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) break;
             if (!(p->flags & FLAG_FAST_RESEND)) {
-                p->flags |= FLAG_TIMEOUT_RESEND;
+                if (ffrdp->rto == FFRDP_MAX_RTO) {
+                    p->flags &= FLAG_TIMEOUT_RESEND;
+                    ffrdp->counter_reach_maxrto ++;
+                } else p->flags |= FLAG_TIMEOUT_RESEND;
                 ffrdp->rto += ffrdp->rto / 2;
                 ffrdp->rto  = MIN(ffrdp->rto, FFRDP_MAX_RTO);
                 ffrdp->counter_resend_rto++;
@@ -538,10 +542,11 @@ void ffrdp_dump(void *ctxt)
     printf("tick_query_rwin     : %u\n"  , ffrdp->tick_query_rwin     );
     printf("counter_send_1sttime: %u\n"  , ffrdp->counter_send_1sttime);
     printf("counter_send_failed : %u\n"  , ffrdp->counter_send_failed );
+    printf("counter_send_poll   : %u\n"  , ffrdp->counter_send_poll   );
     printf("counter_resend_rto  : %u\n"  , ffrdp->counter_resend_rto  );
     printf("counter_resend_fast : %u\n"  , ffrdp->counter_resend_fast );
     printf("counter_resend_ratio: %.2f%%\n", 100.0 * (ffrdp->counter_resend_rto + ffrdp->counter_resend_fast) / ffrdp->counter_send_1sttime);
-    printf("counter_query_rwin  : %u\n"  , ffrdp->counter_query_rwin  );
+    printf("counter_reach_maxrto: %u\n"  , ffrdp->counter_reach_maxrto);
 #if FFRDP_ENABLE_FEC
     printf("fec_txseq           : %d\n"  , ffrdp->fec_txseq           );
     printf("fec_rxseq           : %d\n"  , ffrdp->fec_rxseq           );
