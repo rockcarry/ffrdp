@@ -367,9 +367,9 @@ int ffrdp_send(void *ctxt, char *buf, int len)
         }
     }
     while (n > 0) {
-        size = MIN(FFRDP_MTU_SIZE, n);
         if (!(node = frame_node_new(ffrdp->fec_redundancy, FFRDP_MTU_SIZE))) break;
         SET_FRAME_SEQ(node, ffrdp->send_seq);
+        size = MIN(FFRDP_MTU_SIZE, n);
         memcpy(node->data + 4, buf, size);
         buf += size; n -= size;
         if (size == FFRDP_MTU_SIZE) {
