@@ -441,7 +441,7 @@ void ffrdp_update(void *ctxt)
             if (!(p->flags & FLAG_FAST_RESEND)) {
                 if (ffrdp->rto == FFRDP_MAX_RTO) {
                     p->flags &= ~FLAG_TIMEOUT_RESEND;
-                    ffrdp->counter_reach_maxrto ++;
+                    ffrdp->counter_reach_maxrto++;
                 } else p->flags |= FLAG_TIMEOUT_RESEND;
                 ffrdp->rto += ffrdp->rto / 2;
                 ffrdp->rto  = MIN(ffrdp->rto, FFRDP_MAX_RTO);
