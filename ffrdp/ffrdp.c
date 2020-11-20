@@ -36,12 +36,12 @@ static uint32_t get_tick_count()
 #endif
 
 #define FFRDP_RECVBUF_SIZE  (64 * 1024 - 4) // should < 64KB
-#define FFRDP_MTU_SIZE       1024 // should align to 4 bytes
+#define FFRDP_MTU_SIZE      (1500 - 8) // should align to 4 bytes
 #define FFRDP_MIN_RTO        20
 #define FFRDP_MAX_RTO        2000
 #define FFRDP_MAX_WAITSND    256
-#define FFRDP_POLL_CYCLE     100
-#define FFRDP_DEAD_TIMEOUT   3000
+#define FFRDP_POLL_CYCLE     500
+#define FFRDP_DEAD_TIMEOUT   5000
 #define FFRDP_DATFRM_FLOWCTL 32
 #define FFRDP_UDPRBUF_SIZE  (128 * FFRDP_MTU_SIZE)
 #define FFRDP_SELECT_SLEEP   0
