@@ -90,9 +90,9 @@ typedef struct {
     FFRDP_FRAME_NODE *send_list_tail;
     FFRDP_FRAME_NODE *recv_list_head;
     FFRDP_FRAME_NODE *recv_list_tail;
-    FFRDP_FRAME_NODE *pending_node;
-    uint32_t          pending_size;
-    uint32_t          pending_tick;
+    FFRDP_FRAME_NODE *cur_new_node;
+    uint32_t          cur_new_size;
+    uint32_t          cur_new_tick;
     uint32_t send_seq; // send seq
     uint32_t recv_seq; // send seq
     uint32_t recv_win; // remote receive window
@@ -335,7 +335,7 @@ void ffrdp_free(void *ctxt)
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ctxt) return;
     if (ffrdp->udp_fd > 0) closesocket(ffrdp->udp_fd);
-    if (ffrdp->pending_node) free(ffrdp->pending_node);
+    if (ffrdp->cur_new_node) free(ffrdp->cur_new_node);
     list_free(&ffrdp->send_list_head, &ffrdp->send_list_tail);
     list_free(&ffrdp->recv_list_head, &ffrdp->recv_list_tail);
     free(ffrdp);
@@ -355,18 +355,18 @@ int ffrdp_send(void *ctxt, char *buf, int len)
         return -1;
     }
     while (n > 0) {
-        if (!ffrdp->pending_node) ffrdp->pending_node = frame_node_new(ffrdp->fec_redundancy, FFRDP_MTU_SIZE);
-        if (!ffrdp->pending_node) break;
-        else SET_FRAME_SEQ(ffrdp->pending_node, ffrdp->send_seq);
-        size = MIN(n, (FFRDP_MTU_SIZE - (int)ffrdp->pending_size));
-        memcpy(ffrdp->pending_node->data + 4 + ffrdp->pending_size, buf, size);
-        ffrdp->pending_size += size; buf += size; n -= size;
-        if (ffrdp->pending_size == FFRDP_MTU_SIZE) {
-            list_enqueue(&ffrdp->send_list_head, &ffrdp->send_list_tail, ffrdp->pending_node);
+        if (!ffrdp->cur_new_node) ffrdp->cur_new_node = frame_node_new(ffrdp->fec_redundancy, FFRDP_MTU_SIZE);
+        if (!ffrdp->cur_new_node) break;
+        else SET_FRAME_SEQ(ffrdp->cur_new_node, ffrdp->send_seq);
+        size = MIN(n, (FFRDP_MTU_SIZE - (int)ffrdp->cur_new_size));
+        memcpy(ffrdp->cur_new_node->data + 4 + ffrdp->cur_new_size, buf, size);
+        ffrdp->cur_new_size += size; buf += size; n -= size;
+        if (ffrdp->cur_new_size == FFRDP_MTU_SIZE) {
+            list_enqueue(&ffrdp->send_list_head, &ffrdp->send_list_tail, ffrdp->cur_new_node);
             ffrdp->send_seq++; ffrdp->wait_snd++;
-            ffrdp->pending_node = NULL;
-            ffrdp->pending_size = 0;
-        } else ffrdp->pending_tick = get_tick_count();
+            ffrdp->cur_new_node = NULL;
+            ffrdp->cur_new_size = 0;
+        } else ffrdp->cur_new_tick = get_tick_count();
     }
     return len - n;
 }
@@ -431,13 +431,13 @@ void ffrdp_update(void *ctxt)
     send_una = ffrdp->send_list_head ? GET_FRAME_SEQ(ffrdp->send_list_head) : 0;
     recv_una = ffrdp->recv_seq;
 
-    if (ffrdp->pending_node && ((int32_t)get_tick_count() - (int32_t)ffrdp->pending_tick > FFRDP_FLUSH_TIMEOUT || ffrdp->flags & FLAG_FLUSH)) {
-        ffrdp->pending_node->data[0] = FFRDP_FRAME_TYPE_FEC0;
-        ffrdp->pending_node->size    = 4 + ffrdp->pending_size;
-        list_enqueue(&ffrdp->send_list_head, &ffrdp->send_list_tail, ffrdp->pending_node);
+    if (ffrdp->cur_new_node && ((int32_t)get_tick_count() - (int32_t)ffrdp->cur_new_tick > FFRDP_FLUSH_TIMEOUT || ffrdp->flags & FLAG_FLUSH)) {
+        ffrdp->cur_new_node->data[0] = FFRDP_FRAME_TYPE_FEC0;
+        ffrdp->cur_new_node->size    = 4 + ffrdp->cur_new_size;
+        list_enqueue(&ffrdp->send_list_head, &ffrdp->send_list_tail, ffrdp->cur_new_node);
         ffrdp->send_seq++; ffrdp->wait_snd++;
-        ffrdp->pending_node = NULL;
-        ffrdp->pending_size = 0;
+        ffrdp->cur_new_node = NULL;
+        ffrdp->cur_new_size = 0;
     }
 
     for (i=0,p=ffrdp->send_list_head; i<FFRDP_DATFRM_FLOWCTL&&p; i++,p=p->next) {
