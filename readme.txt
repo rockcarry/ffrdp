@@ -28,8 +28,8 @@ data_fec4  frame: 0x00 seq0 seq1 seq2 data ... fec_seq0 fec_seq1
 data_fec62 frame: 0x3E seq0 seq1 seq2 data ... fec_seq0 fec_seq1
 data_fec63 frame: 0x3F seq0 seq1 seq2 data ... fec_seq0 fec_seq1
 
-ack  frame: 0x01 una0 una1 una2 mack0 mack1 mack2 rwnd
-poll frame: 0x02
+ack   frame: 0x01 una0 una1 una2 mack0 mack1 mack2 rwnd
+query frame: 0x02
 
 data_fec0 为不带 fec 的 data frame
 data_fecN 为每 N 帧带一个 fec 帧（N >= 1 && N <= 63）
@@ -43,7 +43,7 @@ data_fecN 为每 N 帧带一个 fec 帧（N >= 1 && N <= 63）
 seq una 长度为 24bit，recv_win_size 为 16bit
 ack 帧包含了 una, mack 和 rwnd size 信息
 mack 24bit 是一个 bitmap, 包含了 una 之后，但又已经被 ack 的帧号
-poll 命令用于查询 ack
+query 命令用于查询 ack
 fec_seq 长度为 16bit 用于 FEC
 
 例如：una: 16, mack: 0x000003 这个应答代表
