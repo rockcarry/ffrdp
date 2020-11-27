@@ -231,17 +231,19 @@ static int ffrdp_sleep(FFRDPCONTEXT *ffrdp, int flag)
 
 static int ffrdp_send_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame, struct sockaddr_in *dstaddr)
 {
+    if (frame->size == 4 + FFRDP_MSS_SIZE + 2) {
+        *(uint16_t*)(frame->data + 4 + FFRDP_MSS_SIZE) = (uint16_t)ffrdp->fec_txseq++;
+        ffrdp->counter_fec_tx_full++;  // full frame
+    } else {
+        ffrdp->counter_fec_tx_short++; // short frame
+    }
     if (sendto(ffrdp->udp_fd, frame->data, frame->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)) != frame->size) return -1;
-    if (frame->size != 4 + FFRDP_MSS_SIZE + 2) { // short frame
-        ffrdp->counter_fec_tx_short++;
-    } else { // full frame
+
+    if (frame->size == 4 + FFRDP_MSS_SIZE + 2) { // full frame
         uint32_t *psrc = (uint32_t*)frame->data, *pdst = (uint32_t*)ffrdp->fec_txbuf, i;
-        *(uint16_t*)(frame->data + 4 + FFRDP_MSS_SIZE) = (uint16_t)ffrdp->fec_txseq;
-        ffrdp->fec_txseq++; ffrdp->counter_fec_tx_full++;
         for (i=0; i<(4+FFRDP_MSS_SIZE)/sizeof(uint32_t); i++) *pdst++ ^= *psrc++; // make xor fec frame
         if (ffrdp->fec_txseq % ffrdp->fec_redundancy == ffrdp->fec_redundancy - 1) {
-            *(uint16_t*)(ffrdp->fec_txbuf + 4 + FFRDP_MSS_SIZE) = ffrdp->fec_txseq++;
-            ffrdp->fec_txbuf[0] = ffrdp->fec_redundancy;
+            *(uint16_t*)(ffrdp->fec_txbuf + 4 + FFRDP_MSS_SIZE) = ffrdp->fec_txseq++; ffrdp->fec_txbuf[0] = ffrdp->fec_redundancy;
             sendto(ffrdp->udp_fd, ffrdp->fec_txbuf, sizeof(ffrdp->fec_txbuf), 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)); // send fec frame
             memset(ffrdp->fec_txbuf, 0, sizeof(ffrdp->fec_txbuf)); // clear tx_fecbuf
             ffrdp->counter_fec_tx_full++;
@@ -262,10 +264,11 @@ static int ffrdp_recv_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame)
     }
     if (fecseq / fecrdc != ffrdp->fec_rxseq / fecrdc) { //group changed
         memcpy(ffrdp->fec_rxbuf, frame->data, sizeof(ffrdp->fec_rxbuf));
-        ffrdp->fec_rxseq = fecseq; ffrdp->fec_rxmask = 1 << (fecseq % fecrdc); ffrdp->fec_rxcnt = 1;
+        ffrdp->fec_rxseq = fecseq; ffrdp->fec_rxmask = 1 << (fecseq % fecrdc); ffrdp->fec_rxcnt = 0;
         return fecseq % fecrdc != fecrdc - 1 ? 0 : -1;
     } else ffrdp->fec_rxseq = fecseq; // group not changed
     if (fecseq % fecrdc == fecrdc - 1) { // it's redundance frame
+        if (ffrdp->fec_rxcnt == fecrdc - 1) return -1;
         if (ffrdp->fec_rxcnt != fecrdc - 2) { ffrdp->counter_fec_failed++; return -1; }
         type = frame->data[0];
         psrc = (uint32_t*)ffrdp->fec_rxbuf; pdst = (uint32_t*)frame->data;
