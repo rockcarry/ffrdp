@@ -46,7 +46,7 @@ static uint32_t get_tick_count()
 #define FFRDP_DEF_CWND_SIZE  32
 #define FFRDP_MAX_CWND_SIZE  64
 #define FFRDP_RECVBUF_SIZE  (128 * (FFRDP_MSS_SIZE + 0))
-#define FFRDP_UDPSBUF_SIZE  (2   * (FFRDP_MSS_SIZE + 6))
+#define FFRDP_UDPSBUF_SIZE  (64  * (FFRDP_MSS_SIZE + 6))
 #define FFRDP_UDPRBUF_SIZE  (128 * (FFRDP_MSS_SIZE + 6))
 #define FFRDP_SELECT_SLEEP   0
 #define FFRDP_SELECT_TIMEOUT 10000
@@ -602,7 +602,7 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("counter_send_query  : %u\n"  , ffrdp->counter_send_query  );
     printf("counter_resend_rto  : %u\n"  , ffrdp->counter_resend_rto  );
     printf("counter_resend_fast : %u\n"  , ffrdp->counter_resend_fast );
-    printf("counter_resend_ratio: %.2f%%\n", 100.0 * (ffrdp->counter_resend_rto + ffrdp->counter_resend_fast) / ffrdp->counter_send_1sttime);
+    printf("counter_resend_ratio: %.2f%%\n", 100.0 * (ffrdp->counter_resend_rto + ffrdp->counter_resend_fast) / MAX(ffrdp->counter_send_1sttime, 1));
     printf("counter_reach_maxrto: %u\n"  , ffrdp->counter_reach_maxrto);
     printf("fec_txseq           : %d\n"  , ffrdp->fec_txseq           );
     printf("fec_rxseq           : %d\n"  , ffrdp->fec_rxseq           );
