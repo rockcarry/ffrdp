@@ -74,6 +74,7 @@ typedef struct tagFFRDP_FRAME_NODE {
     #define FLAG_TIMEOUT_RESEND (1 << 1) // data frame wait ack timeout and be resend
     #define FLAG_FAST_RESEND    (1 << 2) // data frame need fast resend when next update
     uint32_t flags;        // frame flags
+    uint32_t tick_new;     // frame new tick
     uint32_t tick_send;    // frame send tick
     uint32_t tick_timeout; // frame ack timeout
 } FFRDP_FRAME_NODE;
@@ -165,6 +166,7 @@ static FFRDP_FRAME_NODE* frame_node_new(int type, int size) // create a new fram
     node->size    = 4 + size + (type ? 2 : 0);
     node->data    = (uint8_t*)node + sizeof(FFRDP_FRAME_NODE);
     node->data[0] = type;
+    node->tick_new= get_tick_count();
     return node;
 }
 
@@ -399,7 +401,7 @@ int ffrdp_isdead(void *ctxt)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ctxt) return -1;
-    return ffrdp->send_list_head && (ffrdp->send_list_head->flags & FLAG_FIRST_SEND) && (int32_t)get_tick_count() - (int32_t)ffrdp->send_list_head->tick_send > FFRDP_DEAD_TIMEOUT;
+    return ffrdp->send_list_head && (ffrdp->send_list_head->flags & FLAG_FIRST_SEND) && (int32_t)get_tick_count() - (int32_t)ffrdp->send_list_head->tick_new > FFRDP_DEAD_TIMEOUT;
 }
 
 static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, struct sockaddr_in *dstaddr)
@@ -491,7 +493,8 @@ void ffrdp_update(void *ctxt)
             if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) break;
             if (!(p->flags & FLAG_FAST_RESEND)) {
                 if (ffrdp->rto == FFRDP_MAX_RTO) {
-                    p->flags &= ~FLAG_TIMEOUT_RESEND;
+                    p->tick_send = get_tick_count();
+                    p->flags    &=~FLAG_TIMEOUT_RESEND;
                     ffrdp->counter_reach_maxrto++;
                 } else p->flags |= FLAG_TIMEOUT_RESEND;
                 ffrdp->rto += ffrdp->rto / 2;
@@ -530,8 +533,7 @@ void ffrdp_update(void *ctxt)
             una  = *(uint32_t*)(node->data + 0) >> 8;
             mack = *(uint32_t*)(node->data + 4) & 0xFFFFFF;
             dist = seq_distance(una, send_una);
-            if (dist == 0) send_mack |= mack;
-            else if (dist > 0) {
+            if (dist >= 0) {
                 send_una    = una;
                 send_mack   = (send_mack >> dist) | mack;
                 ffrdp->swnd = node->data[7]; ffrdp->tick_query_rwnd = get_tick_count();
