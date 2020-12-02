@@ -74,9 +74,9 @@ typedef struct tagFFRDP_FRAME_NODE {
     #define FLAG_TIMEOUT_RESEND (1 << 1) // data frame wait ack timeout and be resend
     #define FLAG_FAST_RESEND    (1 << 2) // data frame need fast resend when next update
     uint32_t flags;        // frame flags
-    uint32_t tick_new;     // frame new tick
+    uint32_t tick_1sts;    // frame first time send tick
     uint32_t tick_send;    // frame send tick
-    uint32_t tick_timeout; // frame ack timeout
+    uint32_t tick_timeout; // frame ack timeout tick
 } FFRDP_FRAME_NODE;
 
 typedef struct {
@@ -102,7 +102,8 @@ typedef struct {
     uint32_t wait_snd; // data frame number wait to send
     uint32_t rttm, rtts, rttd, rto;
     uint32_t swnd, cwnd, ssthresh;
-    uint32_t tick_query_rwnd;
+    uint32_t tick_recv_ack;
+    uint32_t tick_send_query;
     uint32_t tick_ffrdp_dump;
     uint32_t counter_send_bytes;
     uint32_t counter_recv_bytes;
@@ -166,7 +167,6 @@ static FFRDP_FRAME_NODE* frame_node_new(int type, int size) // create a new fram
     node->size    = 4 + size + (type ? 2 : 0);
     node->data    = (uint8_t*)node + sizeof(FFRDP_FRAME_NODE);
     node->data[0] = type;
-    node->tick_new= get_tick_count();
     return node;
 }
 
@@ -401,7 +401,12 @@ int ffrdp_isdead(void *ctxt)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ctxt) return -1;
-    return ffrdp->send_list_head && (ffrdp->send_list_head->flags & FLAG_FIRST_SEND) && (int32_t)get_tick_count() - (int32_t)ffrdp->send_list_head->tick_new > FFRDP_DEAD_TIMEOUT;
+    if (!ffrdp->send_list_head) return 0;
+    if (ffrdp->send_list_head->flags & FLAG_FIRST_SEND) {
+        return (int32_t)get_tick_count() - (int32_t)ffrdp->send_list_head->tick_1sts > FFRDP_DEAD_TIMEOUT;
+    } else {
+        return (int32_t)ffrdp->tick_send_query - (int32_t)ffrdp->tick_recv_ack > FFRDP_DEAD_TIMEOUT;
+    }
 }
 
 static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, struct sockaddr_in *dstaddr)
@@ -479,13 +484,13 @@ void ffrdp_update(void *ctxt)
         if (!(p->flags & FLAG_FIRST_SEND)) { // first send
             if (ffrdp->swnd > 0) {
                 if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) { ffrdp_congestion_control(ffrdp, CEVENT_SEND_FAILED); break; }
-                p->tick_send     = get_tick_count();
-                p->tick_timeout  = p->tick_send + ffrdp->rto;
-                p->flags        |= FLAG_FIRST_SEND;
+                p->tick_1sts = p->tick_send = get_tick_count();
+                p->tick_timeout = p->tick_send + ffrdp->rto;
+                p->flags       |= FLAG_FIRST_SEND;
                 ffrdp->swnd--; ffrdp->counter_send_1sttime++;
-            } else if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_query_rwnd > FFRDP_QUERY_CYCLE) { // query remote receive window size
+            } else if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_send_query > FFRDP_QUERY_CYCLE) { // query remote receive window size
                 data[0] = FFRDP_FRAME_TYPE_QUERY; sendto(ffrdp->udp_fd, data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
-                ffrdp->counter_send_query++;
+                ffrdp->tick_send_query = get_tick_count(); ffrdp->counter_send_query++;
                 break;
             }
         } else if ((p->flags & FLAG_FIRST_SEND) && ((int32_t)get_tick_count() - (int32_t)p->tick_timeout > 0 || (p->flags & FLAG_FAST_RESEND))) { // resend
@@ -536,7 +541,7 @@ void ffrdp_update(void *ctxt)
             if (dist >= 0) {
                 send_una    = una;
                 send_mack   = (send_mack >> dist) | mack;
-                ffrdp->swnd = node->data[7]; ffrdp->tick_query_rwnd = get_tick_count();
+                ffrdp->swnd = node->data[7]; ffrdp->tick_recv_ack = get_tick_count();
             }
         } else if (node->data[0] == FFRDP_FRAME_TYPE_QUERY) got_query = 1;
     }
@@ -598,7 +603,6 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("recv_seq            : %u\n"  , ffrdp->recv_seq            );
     printf("wait_snd            : %u\n"  , ffrdp->wait_snd            );
     printf("swnd, cwnd, ssthresh: %u, %u, %u\n", ffrdp->swnd, ffrdp->cwnd, ffrdp->ssthresh);
-    printf("tick_query_rwnd     : %u\n"  , ffrdp->tick_query_rwnd     );
     printf("counter_send_1sttime: %u\n"  , ffrdp->counter_send_1sttime);
     printf("counter_send_failed : %u\n"  , ffrdp->counter_send_failed );
     printf("counter_send_query  : %u\n"  , ffrdp->counter_send_query  );
