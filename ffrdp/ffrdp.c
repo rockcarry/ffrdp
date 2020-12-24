@@ -358,13 +358,13 @@ void* ffrdp_init(char *ip, int port, char *txkey, char *rxkey, int server, int s
     if (txkey) {
 #ifdef CONFIG_ENABLE_AES256
         ffrdp->flags |= FLAG_TX_AES256;
-        AES_set_encrypt_key(txkey, 256, &ffrdp->aes_encrypt_key);
+        AES_set_encrypt_key((uint8_t*)txkey, 256, &ffrdp->aes_encrypt_key);
 #endif
     }
     if (rxkey) {
 #ifdef CONFIG_ENABLE_AES256
         ffrdp->flags |= FLAG_RX_AES256;
-        AES_set_decrypt_key(rxkey, 256, &ffrdp->aes_decrypt_key);
+        AES_set_decrypt_key((uint8_t*)rxkey, 256, &ffrdp->aes_decrypt_key);
 #endif
     }
     return ffrdp;
