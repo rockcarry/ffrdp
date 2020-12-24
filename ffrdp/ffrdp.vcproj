@@ -184,6 +184,10 @@
 				RelativePath=".\ffrdp.c"
 				>
 			</File>
+			<File
+				RelativePath=".\test.c"
+				>
+			</File>
 		</Filter>
 		<Filter
 			Name="Header Files"
