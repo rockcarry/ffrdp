@@ -40,8 +40,8 @@
 			<Tool
 				Name="VCCLCompilerTool"
 				Optimization="0"
-				AdditionalIncludeDirectories="../pthread-win32/include"
-				PreprocessorDefinitions="WIN32;_DEBUG;_CONSOLE"
+				AdditionalIncludeDirectories="../pthread-win32/include;../openssl-win32/include"
+				PreprocessorDefinitions="WIN32;_DEBUG;_CONSOLE;CONFIG_ENABLE_AES256"
 				MinimalRebuild="true"
 				BasicRuntimeChecks="3"
 				RuntimeLibrary="3"
@@ -61,9 +61,9 @@
 			/>
 			<Tool
 				Name="VCLinkerTool"
-				AdditionalDependencies="ws2_32.lib pthread.lib winmm.lib"
+				AdditionalDependencies="ws2_32.lib winmm.lib pthread.lib libcrypto.lib"
 				LinkIncremental="2"
-				AdditionalLibraryDirectories="../pthread-win32/lib"
+				AdditionalLibraryDirectories="../pthread-win32/lib;../openssl-win32/lib"
 				GenerateDebugInformation="true"
 				SubSystem="1"
 				TargetMachine="1"
@@ -91,6 +91,7 @@
 			/>
 			<Tool
 				Name="VCPostBuildEventTool"
+				CommandLine="copy &quot;$(SolutionDir)\pthreads-win32\dll\*.dll&quot; &quot;$(TargetDir)&quot; /y&#x0D;&#x0A;copy &quot;$(SolutionDir)\openssl-win32\dll\*.dll&quot; &quot;$(TargetDir)&quot; /y&#x0D;&#x0A;"
 			/>
 		</Configuration>
 		<Configuration
@@ -118,8 +119,8 @@
 			/>
 			<Tool
 				Name="VCCLCompilerTool"
-				AdditionalIncludeDirectories="../pthread-win32/include"
-				PreprocessorDefinitions="WIN32;NDEBUG;_CONSOLE"
+				AdditionalIncludeDirectories="../pthread-win32/include;../openssl-win32/include"
+				PreprocessorDefinitions="WIN32;NDEBUG;_CONSOLE;CONFIG_ENABLE_AES256"
 				RuntimeLibrary="2"
 				UsePrecompiledHeader="0"
 				WarningLevel="3"
@@ -137,9 +138,9 @@
 			/>
 			<Tool
 				Name="VCLinkerTool"
-				AdditionalDependencies="ws2_32.lib pthread.lib winmm.lib"
+				AdditionalDependencies="ws2_32.lib winmm.lib pthread.lib libcrypto.lib"
 				LinkIncremental="1"
-				AdditionalLibraryDirectories="../pthread-win32/lib"
+				AdditionalLibraryDirectories="../pthread-win32/lib;../openssl-win32/lib"
 				GenerateDebugInformation="true"
 				SubSystem="1"
 				OptimizeReferences="2"
@@ -169,6 +170,7 @@
 			/>
 			<Tool
 				Name="VCPostBuildEventTool"
+				CommandLine="copy &quot;$(SolutionDir)\pthreads-win32\dll\*.dll&quot; &quot;$(TargetDir)&quot; /y"
 			/>
 		</Configuration>
 	</Configurations>
