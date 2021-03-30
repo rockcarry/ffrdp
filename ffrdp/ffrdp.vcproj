@@ -91,7 +91,7 @@
 			/>
 			<Tool
 				Name="VCPostBuildEventTool"
-				CommandLine="copy &quot;$(SolutionDir)\pthreads-win32\dll\*.dll&quot; &quot;$(TargetDir)&quot; /y&#x0D;&#x0A;copy &quot;$(SolutionDir)\openssl-win32\dll\*.dll&quot; &quot;$(TargetDir)&quot; /y&#x0D;&#x0A;"
+				CommandLine="copy &quot;$(SolutionDir)\pthread-win32\dll\*.dll&quot; &quot;$(TargetDir)&quot; /y&#x0D;&#x0A;copy &quot;$(SolutionDir)\openssl-win32\dll\*.dll&quot; &quot;$(TargetDir)&quot; /y&#x0D;&#x0A;"
 			/>
 		</Configuration>
 		<Configuration
@@ -170,7 +170,7 @@
 			/>
 			<Tool
 				Name="VCPostBuildEventTool"
-				CommandLine="copy &quot;$(SolutionDir)\pthreads-win32\dll\*.dll&quot; &quot;$(TargetDir)&quot; /y"
+				CommandLine="copy &quot;$(SolutionDir)\pthread-win32\dll\*.dll&quot; &quot;$(TargetDir)&quot; /y"
 			/>
 		</Configuration>
 	</Configurations>
