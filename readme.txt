@@ -2,6 +2,8 @@
 
 （500 行代码实现了完整的 udp + arq + fec，简洁高效。github 上目前还找不到更简洁的）
 
+livedesk + fanplayer 使用 ffrdp 实现了 100ms 以内低延迟的 wifi 无线音视频实时传输
+
 
 rto 计算：
 初始：
