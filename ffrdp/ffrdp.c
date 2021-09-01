@@ -89,6 +89,7 @@ typedef struct {
     uint32_t flags;
     SOCKET   udp_fd;
     struct   sockaddr_in server_addr;
+    struct   sockaddr_in client_addr;
 
     FFRDP_FRAME_NODE *send_list_head;
     FFRDP_FRAME_NODE *send_list_tail;
@@ -505,7 +506,7 @@ void ffrdp_update(void *ctxt)
     uint8_t  data[8];
 
     if (!ctxt) return;
-    if (!(ffrdp->flags & FLAG_SERVER) && !(ffrdp->flags & FLAG_CONNECTED)) dstaddr = &ffrdp->server_addr;
+    dstaddr  = ffrdp->flags & FLAG_SERVER ? &ffrdp->client_addr : &ffrdp->server_addr;
     send_una = ffrdp->send_list_head ? GET_FRAME_SEQ(ffrdp->send_list_head) : 0;
     recv_una = ffrdp->recv_seq;
 
@@ -554,13 +555,18 @@ void ffrdp_update(void *ctxt)
     if (ffrdp_sleep(ffrdp, FFRDP_SELECT_SLEEP) != 0) return;
     for (node=NULL;;) { // receive data
         if (!node && !(node = frame_node_new(FFRDP_FRAME_TYPE_FEC2, FFRDP_MAX_MSS))) break;;
-        if ((ffrdp->flags & FLAG_CONNECTED) == 0) {
-            if ((ret = recvfrom(ffrdp->udp_fd, node->data, node->size, 0, (struct sockaddr*)&srcaddr, &addrlen)) <= 0) break;
-            connect(ffrdp->udp_fd, (struct sockaddr*)&srcaddr, addrlen); ffrdp->flags |= FLAG_CONNECTED;
-        } else if ((ret = recv(ffrdp->udp_fd, node->data, node->size, 0)) <= 0) break;
+        if ((ret = recvfrom(ffrdp->udp_fd, node->data, node->size, 0, (struct sockaddr*)&srcaddr, &addrlen)) <= 0) break;
+        if ((ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0) {
+            if (ffrdp->flags & FLAG_CONNECTED) {
+                if (memcmp(&srcaddr, &ffrdp->client_addr, sizeof(srcaddr)) != 0) continue;
+            } else {
+                ffrdp->flags |= FLAG_CONNECTED;
+                memcpy(&ffrdp->client_addr, &srcaddr, sizeof(ffrdp->client_addr));
+            }
+        }
 
         if (node->data[0] <= FFRDP_FRAME_TYPE_FEC32) { // data frame
-            node->size = ret; // frame size is the return size of recv
+            node->size = ret; // frame size is the return size of recvfrom
             if (ffrdp_recv_data_frame(ffrdp, node) == 0) {
                 dist = seq_distance(GET_FRAME_SEQ(node), recv_una);
                 if (dist == 0) { recv_una++; }
