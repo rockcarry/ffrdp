@@ -306,7 +306,7 @@ static int ffrdp_recv_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame)
     return 0;
 }
 
-void* ffrdp_init(char *ip, int port, char *txkey, char *rxkey, int server, int smss, int sfec)
+void* ffrdp_init(const char *ip, int port, const char *txkey, const char *rxkey, int server, int smss, int sfec)
 {
     FFRDPCONTEXT *ffrdp = NULL;
     unsigned long opt;
@@ -353,6 +353,9 @@ void* ffrdp_init(char *ip, int port, char *txkey, char *rxkey, int server, int s
         if (bind(ffrdp->udp_fd, (struct sockaddr*)&ffrdp->server_addr, sizeof(ffrdp->server_addr)) == -1) {
             printf("failed to bind !\n");
             goto failed;
+        } else {
+            int len = sizeof (ffrdp->server_addr);
+            getsockname(ffrdp->udp_fd, (struct sockaddr*)&ffrdp->server_addr, &len);
         }
     }
 
@@ -376,6 +379,18 @@ failed:
     return NULL;
 }
 
+int ffrdp_getport(void *ctxt)
+{
+    FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
+    if (!ctxt) return -1;
+
+    if (ffrdp->flags & FLAG_SERVER) {
+        return htons(ffrdp->server_addr.sin_port);
+    }
+
+    return -1;
+}
+
 void ffrdp_free(void *ctxt)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
@@ -391,7 +406,7 @@ void ffrdp_free(void *ctxt)
 #endif
 }
 
-int ffrdp_send(void *ctxt, char *buf, int len)
+int ffrdp_send(void *ctxt, const char *buf, int len)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     int           n = len, size;
@@ -431,6 +446,13 @@ int ffrdp_recv(void *ctxt, char *buf, int len)
         ffrdp->recv_size-= ret; ffrdp->counter_recv_bytes += ret;
     }
     return ret;
+}
+
+int ffrdp_peeksize(void *ctxt)
+{
+    if (!ctxt) return -1;
+
+    return ((FFRDPCONTEXT *)ctxt)->recv_size;
 }
 
 int ffrdp_isdead(void *ctxt)
