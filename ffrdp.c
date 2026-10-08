@@ -34,7 +34,7 @@ static uint32_t get_tick_count()
 #endif
 
 #define FFRDP_MAX_MSS       (1500 - 8) // should align to 4 bytes and <= 1500 - 8
-#define FFRDP_MIN_RTO        20
+#define FFRDP_MIN_RTO        16
 #define FFRDP_MAX_RTO        2000
 #define FFRDP_MAX_WAITSND    256
 #define FFRDP_QUERY_CYCLE    500
@@ -44,9 +44,9 @@ static uint32_t get_tick_count()
 #define FFRDP_DEF_CWND_SIZE  32
 #define FFRDP_MAX_CWND_SIZE  64
 #define FFRDP_RECVBUF_SIZE  (128 * (FFRDP_MAX_MSS + 0))
-#define FFRDP_UDPSBUF_SIZE  (64  * (FFRDP_MAX_MSS + 6))
+#define FFRDP_UDPSBUF_SIZE  (128 * (FFRDP_MAX_MSS + 6))
 #define FFRDP_UDPRBUF_SIZE  (128 * (FFRDP_MAX_MSS + 6))
-#define FFRDP_SELECT_SLEEP   0
+#define FFRDP_SELECT_SLEEP   1
 #define FFRDP_SELECT_TIMEOUT 10000
 #define FFRDP_USLEEP_TIMEOUT 1000
 
@@ -120,7 +120,6 @@ typedef struct {
     AES_KEY  aes_decrypt_key;
 #endif
 
-    #define DEADLINK_SENDERR_THRESHOLD 300
     uint32_t counter_udpsenderr;
     uint32_t counter_send_bytes;
     uint32_t counter_recv_bytes;
@@ -209,7 +208,7 @@ static void list_enqueue(FFRDP_FRAME_NODE **head, FFRDP_FRAME_NODE **tail, FFRDP
         for (p = *tail; p; p = p->prev) {
             seqcur = GET_FRAME_SEQ(p);
             dist   = seq_distance(seqnew, seqcur);
-            if (dist == 0) return;
+            if (dist == 0) { free(node); return; } // duplicated frame, drop it and free memory
             if (dist >  0) {
                 if (p->next) p->next->prev = node;
                 else *tail = node;
@@ -442,7 +441,7 @@ int ffrdp_isdead(void *ctxt)
     if (ffrdp->send_list_head->flags & FLAG_FIRST_SEND) {
         return (int32_t)get_tick_count() - (int32_t)ffrdp->send_list_head->tick_1sts > FFRDP_DEAD_TIMEOUT;
     } else {
-        return (int32_t)ffrdp->tick_send_query - (int32_t)ffrdp->tick_recv_ack > FFRDP_DEAD_TIMEOUT || ffrdp->counter_udpsenderr > DEADLINK_SENDERR_THRESHOLD;
+        return (int32_t)ffrdp->tick_send_query - (int32_t)ffrdp->tick_recv_ack > FFRDP_DEAD_TIMEOUT;
     }
 }
 
@@ -588,8 +587,8 @@ void ffrdp_update(void *ctxt)
     if (node) free(node);
 
     if (got_data || got_query) ffrdp_recvdata_and_sendack(ffrdp, dstaddr); // send ack frame
-    if (ffrdp->send_list_head && seq_distance(send_una, GET_FRAME_SEQ(ffrdp->send_list_head)) > 0) { // handle frame ack
-        for (p=ffrdp->send_list_head; p;) {
+    if (ffrdp->send_list_head && seq_distance(send_una, GET_FRAME_SEQ(ffrdp->send_list_head)) >= 0) { // handle frame ack
+        for (p = ffrdp->send_list_head; p;) {
             dist = seq_distance(GET_FRAME_SEQ(p), send_una);
             for (i=23; i>=0 && !(send_mack&(1<<i)); i--);
             if (i < 0) maxack = (send_una - 1) & 0xFFFFFF;

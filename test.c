@@ -47,7 +47,7 @@ static void* server_thread(void *param)
     total_bytes = 0;
     while (!g_exit) {
         if (!ffrdp) {
-            ffrdp = ffrdp_init(server_bind_ip, server_bind_port, NULL, NULL, 1, 1024, 10);
+            ffrdp = ffrdp_init(server_bind_ip, server_bind_port, NULL, NULL, 1, 1280, 0);
             if (!ffrdp) { usleep(100 * 1000); continue; }
         }
         size = 1 + rand() % server_max_send_size;
