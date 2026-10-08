@@ -2,10 +2,13 @@
 
 （500 行代码实现了完整的 udp + arq + fec，简洁高效。github 上目前还找不到更简洁的）
 
-livedesk + fanplayer 使用 ffrdp 实现了 100ms 以内低延迟的 wifi 无线音视频实时传输
+rto 计算
+--------
 
+测量：
+rttm = 当前时间 - 报文发送时间
+（关键限制：不能对重传报文段测量 rttm，因为收到 ACK 时无法判断它确认的是原始报文还是重传报文）
 
-rto 计算：
 初始：
 rtts = rttm;
 rttd = rttm / 2;
@@ -15,11 +18,13 @@ rtts = (1 - alpha) * rtts + alpha * rttm; // alpha = 1 / 8
 rttd = (1 - beta ) * rttd + beta  * abs(rttm - rtts); // beta = 1 / 4
 
 正常：
-rto  = rtts + r * rttd;
+rto  = rtts + 4 * rttd;
 
 超时：
 rto  = 1.5 * rto;
 
+约束：
+rto 下界 FFRDP_MIN_RTO，上界 FFRDP_MAX_RTO
 
 帧定义：
 data frame:
@@ -38,6 +43,7 @@ data_full  frame 为不带 fec 的 data 长帧
 data_short frame 为不带 fec 的 data 短帧
 data_fecN 为每 N 帧带一个 fec 帧（N >= 2 && N <= 32）
 
+（seq: 帧序号，una: 未确认的帧序号）
 
 协议特点：
 选择重传、快速重传、非延迟 ACK、UNA + MACK、非退让流控、FEC 前向纠错

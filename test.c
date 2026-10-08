@@ -5,7 +5,6 @@
 #include <pthread.h>
 #include "ffrdp.h"
 
-#pragma warning(disable:4996) // disable warnings
 #define usleep(t) Sleep((t) / 1000)
 #define get_tick_count GetTickCount
 
