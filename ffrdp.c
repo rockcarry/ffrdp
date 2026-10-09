@@ -106,6 +106,7 @@ typedef struct {
     uint32_t tick_recv_ack;
     uint32_t tick_send_query;
     uint32_t tick_ffrdp_dump;
+    uint32_t tick_rto_backoff; // tick of last rto backoff, rto backs off once per round
 
     uint8_t  fec_txbuf[4 + FFRDP_MAX_MSS + 2];
     uint8_t  fec_rxbuf[4 + FFRDP_MAX_MSS + 2];
@@ -329,6 +330,7 @@ void* ffrdp_init(char *ip, int port, char *txkey, char *rxkey, int server, int s
     ffrdp->smss     = MAX(1, MIN(smss, FFRDP_MAX_MSS));
     ffrdp->fec_txredundancy = MAX(0, MIN(sfec, FFRDP_FRAME_TYPE_FEC32));
     ffrdp->tick_ffrdp_dump  = get_tick_count();
+    ffrdp->tick_rto_backoff = ffrdp->tick_ffrdp_dump - ffrdp->rto; // allow the first timeout to backoff
 
     ffrdp->server_addr.sin_family      = AF_INET;
     ffrdp->server_addr.sin_port        = htons(port);
@@ -539,10 +541,13 @@ void ffrdp_update(void *ctxt)
                 if (ffrdp->rto == FFRDP_MAX_RTO) {
                     p->tick_send = get_tick_count();
                     p->flags    &=~FLAG_TIMEOUT_RESEND;
-                    ffrdp->counter_reach_maxrto++;
                 } else p->flags |= FLAG_TIMEOUT_RESEND;
-                ffrdp->rto += ffrdp->rto / 2;
-                ffrdp->rto  = MIN(ffrdp->rto, FFRDP_MAX_RTO);
+                if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_rto_backoff >= (int32_t)ffrdp->rto) { // rto backs off once per round, not once per frame
+                    ffrdp->tick_rto_backoff = get_tick_count();
+                    if (ffrdp->rto == FFRDP_MAX_RTO) ffrdp->counter_reach_maxrto++;
+                    ffrdp->rto += ffrdp->rto / 2;
+                    ffrdp->rto  = MIN(ffrdp->rto, FFRDP_MAX_RTO);
+                }
                 ffrdp->counter_resend_rto++;
             } else {
                 p->flags &= ~(FLAG_FAST_RESEND|FLAG_TIMEOUT_RESEND);
