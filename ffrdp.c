@@ -152,6 +152,8 @@ typedef struct {
     uint32_t counter_ack_una_dup; // ack frames whose una is the same as the previous one: the peer reports no progress
     uint32_t counter_rto_head ;   // rto retransmits of the send list head, the frame that blocks the stream
     uint32_t counter_rto_chain;   // rto retransmits of a frame queued behind the head
+    uint32_t counter_rto_stale;   // rto retransmits of a frame the peer had already reported as received
+    uint32_t counter_rto_behind;  // rto retransmits of a frame the peer had not reported yet
     uint32_t ack_una;             // last una seen in an ack frame
     uint32_t reserved;
 } FFRDPCONTEXT;
@@ -566,6 +568,10 @@ void ffrdp_update(void *ctxt)
             if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) break;
             if (!(p->flags & FLAG_FAST_RESEND)) {
                 if (p == ffrdp->send_list_head) ffrdp->counter_rto_head++; else ffrdp->counter_rto_chain++;
+                // was this frame already reported as received (una passed it) when the timer fired?
+                // stale: we were told, but had not removed it -> the retransmit is pure waste.
+                if (seq_distance(GET_FRAME_SEQ(p), (uint32_t)ffrdp->ack_una) < 0) ffrdp->counter_rto_stale++;
+                else ffrdp->counter_rto_behind++;
                 if (ffrdp->rto == FFRDP_MAX_RTO) {
                     p->tick_send = get_tick_count();
                     p->flags    &=~FLAG_TIMEOUT_RESEND;
@@ -719,6 +725,8 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("counter_ack_una_dup : %u\n"  , ffrdp->counter_ack_una_dup );
     printf("counter_rto_head    : %u\n"  , ffrdp->counter_rto_head    );
     printf("counter_rto_chain   : %u\n"  , ffrdp->counter_rto_chain   );
+    printf("counter_rto_stale   : %u\n"  , ffrdp->counter_rto_stale   );
+    printf("counter_rto_behind  : %u\n"  , ffrdp->counter_rto_behind  );
     printf("update period avg/max: %u, %u ms (%u calls, cost max %u ms)\n",
            ffrdp->counter_upd_gap / MAX(ffrdp->counter_upd_cnt - 1, 1), ffrdp->counter_upd_gap_max,
            ffrdp->counter_upd_cnt, ffrdp->counter_upd_cost_max);
