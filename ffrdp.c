@@ -719,19 +719,21 @@ void ffrdp_update(void *ctxt)
                                 if (waste >= FFRDP_WASTE_HI) {
                                     if (ffrdp->rto_floor < ffrdp->rto) ffrdp->rto_floor = ffrdp->rto;
                                     ffrdp->rto_floor = MIN(ffrdp->rto_floor * 5 / 4, (uint32_t)FFRDP_RTO_FLOOR_MAX);
-                                    // a floor far above the link's own round trip buys less than it costs: keep
-                                    // the repair delay bounded relative to the baseline as well
-                                    {   uint32_t rtt = (ffrdp->rtts == (uint32_t)-1 || ffrdp->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : ffrdp->rtts;
-                                        uint32_t cap = MAX(3 * rtt, 100u);
-                                        if (ffrdp->rto_floor > cap) ffrdp->rto_floor = cap;
-                                    }
                                 } else if (waste < FFRDP_WASTE_LO) {
                                     ffrdp->rto_floor = 0;      // the retransmits are reaching a peer that did not have them: repair fast
                                 } else {
                                     ffrdp->rto_floor = ffrdp->rto_floor * 9 / 10; // in between: give ground slowly
                                 }
-                            } else if (ffrdp->rto_floor) {
-                                ffrdp->rto_floor = ffrdp->rto_floor * 9 / 10; // too little evidence to raise, but a quiet link keeps nothing
+                            }
+                            // The cap is applied on every window, not only when the floor is raised: a floor
+                            // that was reasonable while the link had a long round trip must come down by
+                            // itself once the link speeds up, even if by then nothing is being retransmitted
+                            // any more. Note that a quiet window is *not* fed into the decay path above --
+                            // on a rate limited link a quiet window is usually the floor doing its job, and
+                            // decaying on it would make the loop undo its own progress.
+                            {   uint32_t rtt = (ffrdp->rtts == (uint32_t)-1 || ffrdp->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : ffrdp->rtts;
+                                uint32_t cap = MAX(3 * rtt, 100u);
+                                if (ffrdp->rto_floor > cap) ffrdp->rto_floor = cap;
                             }
                             ffrdp->win_need = ffrdp->win_dup = 0;
                         }
