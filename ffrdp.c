@@ -43,6 +43,15 @@ static uint32_t get_tick_count()
 #define FFRDP_MIN_CWND_SIZE  1
 #define FFRDP_DEF_CWND_SIZE  32
 #define FFRDP_MAX_CWND_SIZE  64
+// the delay probe: take half the in-flight away for a moment and watch whether the round trip follows.
+#define FFRDP_PROBE_HOLD_MS      500  // held for 2 round trips plus this much, long enough to drain a queue
+#define FFRDP_PROBE_RTT_DROP_PCT 85   // the round trip must fall below this percentage of the pre-probe value
+#define FFRDP_PROBE_RATE_KEEP_PCT 85  // ... while the rate the peer confirms stays above this percentage
+#define FFRDP_PROBE_WASTE_PCT    3    // only probe a path that is actually spending retransmits
+#define FFRDP_PROBE_MIN_OUT      8    // ... and has a pipe worth halving
+#define FFRDP_PROBE_GAP_MS       10000
+#define FFRDP_PROBE_GAP_MAX_MS   60000
+#define FFRDP_PROBE_HEALTHY_PCT  1    // below this much waste the kept window is given back a little
 #define FFRDP_RTO_FLOOR_MAX  1000 // ms: a longer repair delay than this is never worth paying
 #define FFRDP_RTO_WIN        128  // retransmits per evidence window, so the loop reacts in about a second
 #define FFRDP_WASTE_MIN      16   // retransmits a window must contain before it is allowed to decide anything
@@ -167,6 +176,30 @@ typedef struct {
     uint32_t counter_rto_stale;   // rto retransmits of a frame the peer had already reported as received
     uint32_t counter_rto_behind;  // rto retransmits of a frame the peer had not reported yet
     uint32_t ack_una;             // last una seen in an ack frame
+    // ---- delay probe (step28): is the delay we see our own queue, or the path's? ----
+    // No observation can tell those apart: the lowest round trip ever seen already contains a queue
+    // that never drains, so the delay-versus-minimum comparison that every delay based scheme uses is
+    // blind exactly where it is needed. The only way to know is an experiment -- take half the frames
+    // out of flight and see whether the delay follows -- and the only reason it is safe to run is that
+    // a link that queues and a link that loses answer differently: if the delay falls while the rate
+    // the peer confirms does not, the queue was ours; if the delay does not fall, the delay belongs to
+    // the path and the window goes straight back. Needs nothing from the peer.
+    uint32_t probe_state;         // 0 idle, 1 probing
+    uint32_t probe_tick;          // when the current probe started
+    uint32_t probe_hold;          // how long the reduced window is held
+    uint32_t probe_cap;           // the reduced in-flight limit under test
+    uint32_t probe_rtt_ref;       // lowest round trip just before the probe
+    uint32_t probe_best;          // lowest round trip seen during the probe
+    uint32_t probe_del_ref;       // delivered frames at the start of the probe
+    uint32_t probe_rate_ref;      // frames per second the peer confirmed just before the probe
+    uint32_t probe_gap;           // current back off between probes
+    uint32_t probe_next;          // earliest tick for the next probe
+    uint32_t cap, cap_kept;       // in-flight limit enforced now, and the one a probe proved
+    uint32_t rate_tick, rate_del_ref, rate_now; // delivered frames per second, sampled once a second
+    uint32_t counter_delivered;   // frames the peer has confirmed and we have let go of
+    uint32_t win_first;           // first transmissions in this evidence window
+    uint32_t counter_probe, counter_probe_keep, counter_probe_revert;
+    uint32_t counter_probe_narrow, counter_giveback;
     uint32_t reserved;
 } FFRDPCONTEXT;
 
@@ -579,7 +612,7 @@ void ffrdp_update(void *ctxt)
                 p->tick_1sts = p->tick_send = get_tick_count();
                 p->tick_timeout = p->tick_send + ffrdp->rto;
                 p->flags       |= FLAG_FIRST_SEND;
-                ffrdp->swnd--; ffrdp->counter_send_1sttime++;
+                ffrdp->swnd--; ffrdp->counter_send_1sttime++; ffrdp->win_first++;
             } else if (ffrdp->tick_send_query == 0 || (int32_t)get_tick_count() - (int32_t)ffrdp->tick_send_query > FFRDP_QUERY_CYCLE) { // query remote receive window size
                 data[0] = FFRDP_FRAME_TYPE_QUERY; sendto(ffrdp->udp_fd, (void*)data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
                 ffrdp->tick_send_query = get_tick_count(); ffrdp->counter_send_query++;
@@ -668,7 +701,12 @@ void ffrdp_update(void *ctxt)
             if (dist >= 0) {
                 send_una    = una;
                 send_mack   = (send_mack >> dist) | mack;
-                ffrdp->swnd = node->data[7]; ffrdp->tick_recv_ack = get_tick_count();
+                // the peer's window is a buffer size, not a rate: on the measured link it allowed 148
+                // frames where the path carried five, and the rest sat in its buffer as a standing queue
+                // of about 200ms. cap is what a probe has proven, and what is being tested right now.
+                ffrdp->swnd = node->data[7];
+                if (ffrdp->cap && ffrdp->swnd > ffrdp->cap) ffrdp->swnd = ffrdp->cap;
+                ffrdp->tick_recv_ack = get_tick_count();
             }
         } else if (node->data[0] == FFRDP_FRAME_TYPE_QUERY) got_query = 1;
     }
@@ -744,14 +782,14 @@ void ffrdp_update(void *ctxt)
                                 uint32_t cap = MAX(3 * rtt, 100u);
                                 if (ffrdp->rto_floor > cap) ffrdp->rto_floor = cap;
                             }
-                            ffrdp->win_need = ffrdp->win_dup = 0;
+                            ffrdp->win_need = ffrdp->win_dup = ffrdp->win_first = 0;
                         }
                         ffrdp->rto = MAX(ffrdp->rtts + 4 * ffrdp->rttd, ffrdp->rto_floor);
                         ffrdp->rto = MAX(FFRDP_MIN_RTO, ffrdp->rto);
                         ffrdp->rto = MIN(FFRDP_MAX_RTO, ffrdp->rto);
                     }
                 }
-                t = p; p = p->next; list_remove(&ffrdp->send_list_head, &ffrdp->send_list_tail, t); continue;
+                t = p; p = p->next; list_remove(&ffrdp->send_list_head, &ffrdp->send_list_tail, t); ffrdp->counter_delivered++; continue;
             } else if (seq_distance(maxack, GET_FRAME_SEQ(p)) > 0) {
                 // the peer reported something above this frame, so it is either lost or merely late.
                 // how long to wait before believing it is not a guess: it comes from the peer's own
@@ -765,6 +803,73 @@ void ffrdp_update(void *ctxt)
                 }
             }
             p = p->next;
+        }
+    }
+    {   // delay probe: take half the in-flight away for a moment and see whether the round trip follows.
+        // if it does and the confirmed rate does not, the delay was our own queue, so the smaller window
+        // is kept and the experiment repeats later; if the delay does not follow, it belongs to the path
+        // and the window goes straight back. that asymmetry is the whole safety of this: a link that
+        // loses frames rather than queueing them fails the first test and is left exactly as it was.
+        uint32_t now = get_tick_count();
+        FFRDP_FRAME_NODE *q;
+        if (!ffrdp->probe_gap) ffrdp->probe_gap = FFRDP_PROBE_GAP_MS;
+        ffrdp->cap = ffrdp->probe_state ? ffrdp->probe_cap : ffrdp->cap_kept;
+        if ((int32_t)now - (int32_t)ffrdp->rate_tick >= 1000) {
+            ffrdp->rate_now     = ffrdp->counter_delivered - ffrdp->rate_del_ref;
+            ffrdp->rate_tick    = now;
+            ffrdp->rate_del_ref = ffrdp->counter_delivered;
+        }
+        if (ffrdp->probe_state == 0) {
+            uint32_t waste = ffrdp->win_need * 100 / MAX(ffrdp->win_first, 1);
+            if ((int32_t)now - (int32_t)ffrdp->probe_next >= 0) {
+                uint32_t out = 0;
+                for (q = ffrdp->send_list_head; q; q = q->next) out++;
+                if (waste >= FFRDP_PROBE_WASTE_PCT && out >= FFRDP_PROBE_MIN_OUT) {
+                    uint32_t rtt = (ffrdp->rtts == (uint32_t)-1 || ffrdp->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : ffrdp->rtts;
+                    ffrdp->probe_state   = 1;
+                    ffrdp->probe_tick    = now;
+                    ffrdp->probe_hold    = 2 * rtt + FFRDP_PROBE_HOLD_MS;
+                    ffrdp->probe_cap     = MAX(out / 2, 4);
+                    ffrdp->probe_rtt_ref = ffrdp->rttm;
+                    ffrdp->probe_rate_ref= ffrdp->rate_now;
+                    ffrdp->probe_best    = 0xFFFFFFFF;
+                    ffrdp->probe_del_ref = ffrdp->counter_delivered;
+                    ffrdp->cap           = ffrdp->probe_cap;
+                    ffrdp->counter_probe++;
+                } else if (waste < FFRDP_PROBE_HEALTHY_PCT && ffrdp->cap_kept) {
+                    // nothing is being wasted any more: give a little of the window back, so a path that
+                    // has become faster is not held down for ever by a limit proven on an older path.
+                    ffrdp->cap_kept   = MIN(ffrdp->cap_kept + MAX(ffrdp->cap_kept / 4, 1), (uint32_t)FFRDP_MAX_CWND_SIZE * 4);
+                    ffrdp->cap        = ffrdp->cap_kept;
+                    ffrdp->probe_next = now + FFRDP_PROBE_GAP_MS;
+                    ffrdp->counter_giveback++;
+                } else {
+                    ffrdp->probe_next = now + FFRDP_PROBE_GAP_MS;
+                }
+            }
+        } else {
+            if (ffrdp->rttm && ffrdp->rttm != (uint32_t)-1 && ffrdp->rttm < ffrdp->probe_best) ffrdp->probe_best = ffrdp->rttm;
+            if ((int32_t)now - (int32_t)ffrdp->probe_tick >= (int32_t)ffrdp->probe_hold) {
+                uint32_t span      = MAX(now - ffrdp->probe_tick, 1);
+                uint32_t rate_held = (ffrdp->counter_delivered - ffrdp->probe_del_ref) * 1000 / span;
+                uint32_t rtt_down  = ffrdp->probe_best != 0xFFFFFFFF && ffrdp->probe_rtt_ref &&
+                                     ffrdp->probe_best * 100 < ffrdp->probe_rtt_ref * FFRDP_PROBE_RTT_DROP_PCT;
+                uint32_t rate_kept = rate_held * 100 >= ffrdp->probe_rate_ref * FFRDP_PROBE_RATE_KEEP_PCT;
+                if (rtt_down && rate_kept) {
+                    ffrdp->cap_kept  = ffrdp->probe_cap;
+                    ffrdp->probe_gap = FFRDP_PROBE_GAP_MS;
+                    ffrdp->counter_probe_keep++;
+                } else {
+                    // the delay did not follow, or it did but the confirming rate fell with it: either way
+                    // the smaller window bought nothing, so go back to what was proven and wait longer.
+                    if (rtt_down) ffrdp->counter_probe_narrow++;
+                    ffrdp->probe_gap = MIN(ffrdp->probe_gap * 2, (uint32_t)FFRDP_PROBE_GAP_MAX_MS);
+                    ffrdp->counter_probe_revert++;
+                }
+                ffrdp->probe_state = 0;
+                ffrdp->cap         = ffrdp->cap_kept;
+                ffrdp->probe_next  = now + ffrdp->probe_gap;
+            }
         }
     }
     {   // cost of one pass, so a slow application or a slow peer can be told apart from a slow link
@@ -796,6 +901,18 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("wait_snd            : %u\n"  , ffrdp->wait_snd            );
     printf("rmss, smss          : %u, %u\n"    , ffrdp->rmss, ffrdp->smss);
     printf("swnd, cwnd, ssthresh: %u, %u, %u\n", ffrdp->swnd, ffrdp->cwnd, ffrdp->ssthresh);
+    {   // the delay probe: how many frames are really outstanding, what limit is enforced, and what the
+        // experiment reported. rtt ref->best is the number to read: if best is well below ref the window
+        // was keeping a queue alive; if they are close the delay is the path's and nothing was touched.
+        FFRDP_FRAME_NODE *q; uint32_t out = 0;
+        for (q = ffrdp->send_list_head; q; q = q->next) out++;
+        printf("inflight, cap       : %u, %u (kept %u; probes %u keep %u revert %u too-far %u giveback %u)\n",
+               out, ffrdp->cap, ffrdp->cap_kept, ffrdp->counter_probe, ffrdp->counter_probe_keep,
+               ffrdp->counter_probe_revert, ffrdp->counter_probe_narrow, ffrdp->counter_giveback);
+        printf("probe rtt ref/best  : %u, %u\n",
+               ffrdp->probe_rtt_ref, ffrdp->probe_best == 0xFFFFFFFF ? 0 : ffrdp->probe_best);
+        printf("confirmed rate      : %u frames/s\n", ffrdp->rate_now);
+    }
     printf("fec_txredundancy    : %d\n"  , ffrdp->fec_txredundancy    );
     printf("fec_rxredundancy    : %d\n"  , ffrdp->fec_rxredundancy    );
     printf("fec_txseq           : %d\n"  , ffrdp->fec_txseq           );
