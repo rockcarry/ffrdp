@@ -147,6 +147,10 @@ typedef struct {
     uint32_t counter_upd_gap;     // sum of the gaps between ffrdp_update calls, in ms
     uint32_t counter_upd_gap_max; // longest gap between two calls, in ms
     uint32_t counter_upd_cost_max;// longest time spent inside one call, in ms
+    uint32_t counter_ack_una_dup; // ack frames whose una is the same as the previous one: the peer reports no progress
+    uint32_t counter_rto_head ;   // rto retransmits of the send list head, the frame that blocks the stream
+    uint32_t counter_rto_chain;   // rto retransmits of a frame queued behind the head
+    uint32_t ack_una;             // last una seen in an ack frame
     uint32_t reserved;
 } FFRDPCONTEXT;
 
@@ -559,6 +563,7 @@ void ffrdp_update(void *ctxt)
             ffrdp_congestion_control(ffrdp, CEVENT_ACK_TIMEOUT);
             if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) break;
             if (!(p->flags & FLAG_FAST_RESEND)) {
+                if (p == ffrdp->send_list_head) ffrdp->counter_rto_head++; else ffrdp->counter_rto_chain++;
                 if (ffrdp->rto == FFRDP_MAX_RTO) {
                     p->tick_send = get_tick_count();
                     p->flags    &=~FLAG_TIMEOUT_RESEND;
@@ -606,6 +611,8 @@ void ffrdp_update(void *ctxt)
             una  = *(uint32_t*)(node->data + 0) >> 8;
             mack = *(uint32_t*)(node->data + 4) & 0xFFFFFF;
             ffrdp->counter_ack_recv++;
+            if (ffrdp->counter_ack_recv > 1 && (uint32_t)una == ffrdp->ack_una) ffrdp->counter_ack_una_dup++; // the peer did not move
+            ffrdp->ack_una = (uint32_t)una;
             if (mack) { // the peer reported frames that arrived after a hole
                 ffrdp->counter_ack_mack++;
                 for (i = 23; i >= 0 && !(mack & (1 << i)); i--);
@@ -701,6 +708,9 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("counter_ack_hole    : %u\n"  , ffrdp->counter_ack_hole    );
     printf("counter_rto_backoff : %u\n"  , ffrdp->counter_rto_backoff );
     printf("counter_timeout_evt : %u\n"  , ffrdp->counter_timeout_evt );
+    printf("counter_ack_una_dup : %u\n"  , ffrdp->counter_ack_una_dup );
+    printf("counter_rto_head    : %u\n"  , ffrdp->counter_rto_head    );
+    printf("counter_rto_chain   : %u\n"  , ffrdp->counter_rto_chain   );
     printf("update period avg/max: %u, %u ms (%u calls, cost max %u ms)\n",
            ffrdp->counter_upd_gap / MAX(ffrdp->counter_upd_cnt - 1, 1), ffrdp->counter_upd_gap_max,
            ffrdp->counter_upd_cnt, ffrdp->counter_upd_cost_max);
