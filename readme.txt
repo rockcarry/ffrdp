@@ -172,6 +172,7 @@ FFRDP_INFLIGHT_MAX    64   帧           // 在途量默认上限（= 优化前�
 参考资料：
 OPTIMIZATION.md  优化原理、决策依据、被否掉的路线、实测数据
 NOTES.md         按时间顺序的完整开发记录（含每次上机的原始 log）
+tools/sim/README.md  仿真工具用法：差分 A/B、17 个内置场景、输出解读与使用纪律
 
 
 2026-10 更新：
