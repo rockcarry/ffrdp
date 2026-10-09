@@ -705,12 +705,15 @@ void ffrdp_update(void *ctxt)
                         // the decision is taken once per evidence window, and both directions move on that
                         // same clock: raising per window while decaying per ack means the decay wins on any
                         // link with a high ack rate, and the floor then never moves at all.
-                        if (ffrdp->win_need == 0) ffrdp->tick_win = get_tick_count();
+                        // the evidence window closes on whichever comes first: enough retransmits to speak
+                        // with, or two seconds. a window with too little evidence may never *raise* the
+                        // floor (a handful of retransmits can read 100% pointless by accident), but it does
+                        // let it decay: a link that has gone quiet has nothing a long rto would be
+                        // repairing, and leaving the floor up would only hang repair delay on a link that
+                        // has become fast again.
                         if (ffrdp->win_need >= FFRDP_RTO_WIN ||
-                            (ffrdp->win_need && (int32_t)get_tick_count() - (int32_t)ffrdp->tick_win > 2000)) {
-                            // small windows are noise: a handful of retransmits can read 100% pointless by
-                            // accident, and acting on that raises the rto on links whose repairs are real.
-                            // below the floor a window simply does not get to decide.
+                            (int32_t)get_tick_count() - (int32_t)ffrdp->tick_win >= 2000) {
+                            ffrdp->tick_win = get_tick_count();
                             if (ffrdp->win_need >= FFRDP_WASTE_MIN) {
                                 uint32_t waste = ffrdp->win_need ? ffrdp->win_dup * 100 / ffrdp->win_need : 0;
                                 if (waste >= FFRDP_WASTE_HI) {
@@ -727,6 +730,8 @@ void ffrdp_update(void *ctxt)
                                 } else {
                                     ffrdp->rto_floor = ffrdp->rto_floor * 9 / 10; // in between: give ground slowly
                                 }
+                            } else if (ffrdp->rto_floor) {
+                                ffrdp->rto_floor = ffrdp->rto_floor * 9 / 10; // too little evidence to raise, but a quiet link keeps nothing
                             }
                             ffrdp->win_need = ffrdp->win_dup = 0;
                         }
