@@ -24,6 +24,10 @@ static double g_cap = 0;      // shaper rate, bytes per ms, 0 = unlimited
 static int    g_qmax = 0;     // shaper queue limit in bytes
 static double g_busy = 0;     // when the shaper finishes the packets already queued
 static int    g_qbytes = 0;   // bytes currently in the shaper queue
+static double g_pcap = 0;     // policer rate, bytes per ms, 0 = unlimited
+static int    g_pburst = 0;   // token bucket depth in bytes
+static double g_ptok = 0;     // tokens left
+static int    g_plast = 0;    // tick of the last refill
 static unsigned long g_alloc = 0, g_freed = 0;
 
 uint32_t sim_tick(void) { return g_vtick; } // replaces get_tick_count() in ffrdp.c
@@ -46,6 +50,7 @@ void sim_reset(void)
     for (i = 0; i < 2; i++) { qh[i] = qt[i] = qn[i] = 0; gburstleft[i] = 0; gloss[i] = 0; gpn[i] = 0; }
     cursid = 0; gstep = 0; g_vtick = 0; gdelay = 0; gjitter = 0; gburst = 0;
     g_cap = 0; g_qmax = 0; g_busy = 0; g_qbytes = 0;
+    g_pcap = 0; g_pburst = 0; g_ptok = 0; g_plast = 0;
     g_alloc = g_freed = 0;
 }
 
@@ -61,6 +66,14 @@ void sim_config(double loss, int burst, int delay, int jitter)
 void sim_shaper(double bytes_per_ms, int queue_bytes)
 {
     g_cap = bytes_per_ms; g_qmax = queue_bytes; g_busy = 0; g_qbytes = 0;
+}
+
+// token bucket: over the rate the excess is dropped, not queued (that is what the
+// measurement shows - the achieved rate stays flat while the loss grows with the
+// excess). Applies to the direction sent by side 0, i.e. the uplink of the client.
+void sim_policer(double bytes_per_ms, int burst_bytes)
+{
+    g_pcap = bytes_per_ms; g_pburst = burst_bytes; g_ptok = burst_bytes; g_plast = 0;
 }
 
 void sim_begin(int idx) { cursid = idx; }
@@ -107,6 +120,15 @@ int sim_send(void *buf, int len) // the fake sendto
     int idx = 1 - cursid, drop = 0;
     unsigned k = ++gpn[idx];
     unsigned r = hash(k, idx) % 100000u;
+    if (g_pcap > 0 && cursid == 0) { // token bucket on the uplink of side 0
+        int dt = gstep - g_plast;
+        if (dt > 0) {
+            g_plast  = gstep;
+            g_ptok  += dt * g_pcap;
+            if (g_ptok > g_pburst) g_ptok = g_pburst;
+        }
+        if (g_ptok < len) drop = 1; else g_ptok -= len;
+    }
     if (gburst) {
         if (gburstleft[idx] > 0) { gburstleft[idx]--; drop = 1; }
         else if (r < (unsigned)(gloss[idx] * 100000)) { gburstleft[idx] = gburst - 1; drop = 1; }
