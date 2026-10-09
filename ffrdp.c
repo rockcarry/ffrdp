@@ -47,7 +47,11 @@ static uint32_t get_tick_count()
 #define FFRDP_PROBE_HOLD_MS      500  // held for 2 round trips plus this much, long enough to drain a queue
 #define FFRDP_PROBE_RTT_DROP_PCT 85   // the round trip must fall below this percentage of the pre-probe value
 #define FFRDP_PROBE_RATE_KEEP_PCT 85  // ... while the rate the peer confirms stays above this percentage
-#define FFRDP_PROBE_WASTE_PCT    3    // only probe a path that is actually spending retransmits
+#define FFRDP_PROBE_WASTE_PM     5    // retransmits per thousand first transmissions, over the last second
+#define FFRDP_PROBE_MIN_RTT_MS   50   // ... on a path slow enough for the delay to be worth attacking. what a
+                                      // probe can win is bounded by the round trip itself, so a path that is
+                                      // already quick is left alone -- which is also what keeps clean links
+                                      // out of the experiment entirely.
 #define FFRDP_PROBE_MIN_WIN      8    // ... at least this many of them, so one out of a handful of frames
                                       //     in a short window cannot look like a wasted path
 #define FFRDP_PROBE_MIN_OUT      8    // ... and has a pipe worth halving
@@ -831,7 +835,7 @@ void ffrdp_update(void *ctxt)
             // sampling noise, not a wasteful path. the counters can also be cleared by a dump, so a
             // count that moved backwards is read as no evidence at all.
             ffrdp->probe_waste = (resend >= ffrdp->probe_resend_seen && firsts >= ffrdp->probe_first_seen)
-                               ? (resend - ffrdp->probe_resend_seen) * 100 / MAX(firsts - ffrdp->probe_first_seen, 1)
+                               ? (resend - ffrdp->probe_resend_seen) * 1000 / MAX(firsts - ffrdp->probe_first_seen, 1)
                                : 0;
             ffrdp->probe_resend_seen = resend;
             ffrdp->probe_first_seen  = firsts;
@@ -844,7 +848,8 @@ void ffrdp_update(void *ctxt)
                 // application has queued but that have not been sent yet, and halving those would not
                 // halve what is in flight at all.
                 for (q = ffrdp->send_list_head; q; q = q->next) if (q->flags & FLAG_FIRST_SEND) out++;
-                if (waste >= FFRDP_PROBE_WASTE_PCT && out >= FFRDP_PROBE_MIN_OUT) {
+                if (waste >= FFRDP_PROBE_WASTE_PM && ffrdp->rttm != (uint32_t)-1 &&
+                    ffrdp->rttm >= FFRDP_PROBE_MIN_RTT_MS && out >= FFRDP_PROBE_MIN_OUT) {
                     uint32_t rtt = (ffrdp->rtts == (uint32_t)-1 || ffrdp->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : ffrdp->rtts;
                     ffrdp->probe_state   = 1;
                     ffrdp->probe_tick    = now;
@@ -931,8 +936,9 @@ void ffrdp_dump(void *ctxt, int clearhistory)
                ffrdp->counter_probe_revert, ffrdp->counter_probe_narrow, ffrdp->counter_giveback);
         // what the probe's trigger sees at the moment it is asked: need is retransmits, first is first
         // transmissions, both since the evidence window last closed, and out is what is on the wire.
-        printf("probe trigger       : waste %u%% over last second, out %u (needs %u%% and %u frames)\n",
-               ffrdp->probe_waste, out, FFRDP_PROBE_WASTE_PCT, FFRDP_PROBE_MIN_OUT);
+        printf("probe trigger       : waste %u per mille, rttm %u, out %u (needs %u pm, %u ms, %u frames)\n",
+               ffrdp->probe_waste, ffrdp->rttm, out,
+               FFRDP_PROBE_WASTE_PM, FFRDP_PROBE_MIN_RTT_MS, FFRDP_PROBE_MIN_OUT);
         printf("probe rtt ref/best  : %u, %u\n",
                ffrdp->probe_rtt_ref, ffrdp->probe_best == 0xFFFFFFFF ? 0 : ffrdp->probe_best);
         printf("confirmed rate      : %u frames/s\n", ffrdp->rate_now);
