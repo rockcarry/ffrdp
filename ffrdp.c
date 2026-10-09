@@ -62,7 +62,9 @@ static uint32_t get_tick_count()
 #define FFRDP_PROBE_RTT_DROP_PCT 85   // the round trip must fall below this percentage of the pre-probe value
 #define FFRDP_PROBE_RATE_KEEP_PCT 85  // ... while the rate the peer confirms stays above this percentage
 #ifndef FFRDP_PROBE_ENABLE
-#define FFRDP_PROBE_ENABLE       0    // 0 = off. this is a diagnostic, not an optimisation: on the measured
+#define FFRDP_PROBE_ENABLE       1    // on by default: it is a net win wherever a queue is being held, and
+                                      // where there is none the rate guard reverts it and nothing is lost.
+                                      // set to 0 only to compare against the behaviour without it.
 #endif
                                       // path the experiment answered "the delay is not ours" (halving the
                                       // frames in flight left the lowest round trip unchanged), so there is
