@@ -53,7 +53,7 @@ rto_floor —— 由"对端证据"驱动的下限
 
       waste >= 80%  => rto_floor = min(rto_floor * 5 / 4, 1000)  // 抬高下限，减少伪超时
       waste <  40%  => rto_floor = 0                             // 重传是真修复，立刻归还下限
-      其余           => rto_floor = rto_floor * 9 / 10            // 中间地带，缓慢让步
+      其余          => rto_floor = rto_floor * 9 / 10            // 中间地带，缓慢让步
 
       每个窗口之后再施加相对上限：rto_floor = min(rto_floor, max(3 * rtts, 100))
       （链路变快时下限会自动回落）
@@ -70,7 +70,7 @@ rto_floor —— 由"对端证据"驱动的下限
 做法：等待时长 hole_wait 同样由对端重复上报决定：
       waste >= 80% => 等 3 * rtt（最多 300ms）
       waste <  40% => 0（立刻重传，与原来的行为完全一致）
-      其余          => rtt
+      其余         => rtt
 
 理由：与 rto_floor 同一个原则 —— 不用有歧义的信号（丢包 / 乱序分不清），用接收端的报告。
 
@@ -163,7 +163,7 @@ FFRDP_RTO_FLOOR_MAX   1000 ms           // rto_floor 的上限
 FFRDP_MAX_WAITSND     256  帧           // 应用侧发送队列上限
 FFRDP_RECVBUF_SIZE    128  帧（≈186KB） // 接收缓冲
 FFRDP_QUERY_CYCLE     500  ms
-FFRDP_RTO_WIN         128  次重传        // 证据窗口
+FFRDP_RTO_WIN         128  次重传       // 证据窗口
 FFRDP_WASTE_HI / LO   80 / 40 %
 FFRDP_MAX_CWND_SIZE   64   帧
 FFRDP_INFLIGHT_MAX    64   帧           // 在途量默认上限（= 优化前行为）；实际值由探测得出
@@ -174,12 +174,12 @@ OPTIMIZATION.md  优化原理、决策依据、被否掉的路线、实测数据
 NOTES.md         按时间顺序的完整开发记录（含每次上机的原始 log）
 
 
-rockcarry
-2020-9-1
-
 2026-10 更新：
   * 帧类型取值按代码订正：ACK 0x40 -> 0x21，QUERY 0x41 -> 0x22，FEC32 0x3E -> 0x20
   * ACK 长度与 rwnd 位宽按代码订正：基本长度 8 字节，rwnd 为 8bit（原写 16bit）
   * 补充：rto_floor、hole_wait、在途量闸门 + 延迟探测（协议行为的一部分）
   * mack 的示例按代码修正（原例与 una=16 不自洽）
   * 补充参数表与参考资料
+
+
+rockcarry@163.com
