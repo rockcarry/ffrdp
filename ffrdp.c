@@ -47,6 +47,11 @@ static uint32_t get_tick_count()
 #define FFRDP_PROBE_HOLD_MS      500  // held for 2 round trips plus this much, long enough to drain a queue
 #define FFRDP_PROBE_RTT_DROP_PCT 85   // the round trip must fall below this percentage of the pre-probe value
 #define FFRDP_PROBE_RATE_KEEP_PCT 85  // ... while the rate the peer confirms stays above this percentage
+#define FFRDP_PROBE_ENABLE       0    // 0 = off. this is a diagnostic, not an optimisation: on the measured
+                                      // path the experiment answered "the delay is not ours" (halving the
+                                      // frames in flight left the lowest round trip unchanged), so there is
+                                      // nothing left for it to win, only the cost of running it. turn it on
+                                      // to ask the same question of a new path.
 #define FFRDP_PROBE_WASTE_PM     5    // retransmits per thousand first transmissions, over the last second
 #define FFRDP_PROBE_MIN_RTT_MS   50   // ... on a path slow enough for the delay to be worth attacking. what a
                                       // probe can win is bounded by the round trip itself, so a path that is
@@ -848,7 +853,7 @@ void ffrdp_update(void *ctxt)
                 // application has queued but that have not been sent yet, and halving those would not
                 // halve what is in flight at all.
                 for (q = ffrdp->send_list_head; q; q = q->next) if (q->flags & FLAG_FIRST_SEND) out++;
-                if (waste >= FFRDP_PROBE_WASTE_PM && ffrdp->rttm != (uint32_t)-1 &&
+                if (FFRDP_PROBE_ENABLE && waste >= FFRDP_PROBE_WASTE_PM && ffrdp->rttm != (uint32_t)-1 &&
                     ffrdp->rttm >= FFRDP_PROBE_MIN_RTT_MS && out >= FFRDP_PROBE_MIN_OUT) {
                     uint32_t rtt = (ffrdp->rtts == (uint32_t)-1 || ffrdp->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : ffrdp->rtts;
                     ffrdp->probe_state   = 1;
