@@ -140,6 +140,8 @@ typedef struct {
     uint32_t counter_ack_recv   ; // ack frames received
     uint32_t counter_ack_mack   ; // ack frames carrying out of order (mack) info
     uint32_t counter_ack_hole   ; // ack frames reporting a gap below the highest acked frame
+    uint32_t counter_recv_ooo   ; // data frames that arrived out of order: there is a hole below them
+    uint32_t counter_recv_far   ; // ... and they are more than 23 ahead of the hole, so the 24 bit ack mask cannot carry them
     uint32_t counter_rto_backoff; // times the rto was multiplied
     uint32_t counter_timeout_evt; // updates in which at least one frame timed out
     uint32_t tick_last_upd  ;     // tick of the previous ffrdp_update call
@@ -604,6 +606,10 @@ void ffrdp_update(void *ctxt)
             if (ffrdp_recv_data_frame(ffrdp, node) == 0) {
                 dist = seq_distance(GET_FRAME_SEQ(node), recv_una);
                 if (dist == 0) { recv_una++; }
+                // out of order arrival = this frame is ahead of a hole. If this counter grows while the
+                // peer's acks carry no mack bit, then the hole is never being reported, and the sender
+                // has no choice but to wait for timeouts.
+                if (dist > 0) { ffrdp->counter_recv_ooo++; if (dist > 23) ffrdp->counter_recv_far++; }
                 if (dist >= 0) { list_enqueue(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, node); node = NULL; }
                 got_data = 1;
             }
@@ -706,6 +712,8 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("counter_ack_recv    : %u\n"  , ffrdp->counter_ack_recv    );
     printf("counter_ack_mack    : %u\n"  , ffrdp->counter_ack_mack    );
     printf("counter_ack_hole    : %u\n"  , ffrdp->counter_ack_hole    );
+    printf("counter_recv_ooo    : %u\n"  , ffrdp->counter_recv_ooo    );
+    printf("counter_recv_far    : %u\n"  , ffrdp->counter_recv_far    );
     printf("counter_rto_backoff : %u\n"  , ffrdp->counter_rto_backoff );
     printf("counter_timeout_evt : %u\n"  , ffrdp->counter_timeout_evt );
     printf("counter_ack_una_dup : %u\n"  , ffrdp->counter_ack_una_dup );
