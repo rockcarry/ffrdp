@@ -48,6 +48,8 @@ static uint32_t get_tick_count()
 #define FFRDP_PROBE_RTT_DROP_PCT 85   // the round trip must fall below this percentage of the pre-probe value
 #define FFRDP_PROBE_RATE_KEEP_PCT 85  // ... while the rate the peer confirms stays above this percentage
 #define FFRDP_PROBE_WASTE_PCT    3    // only probe a path that is actually spending retransmits
+#define FFRDP_PROBE_MIN_WIN      8    // ... at least this many of them, so one out of a handful of frames
+                                      //     in a short window cannot look like a wasted path
 #define FFRDP_PROBE_MIN_OUT      8    // ... and has a pipe worth halving
 #define FFRDP_PROBE_GAP_MS       10000
 #define FFRDP_PROBE_GAP_MAX_MS   60000
@@ -176,6 +178,9 @@ typedef struct {
     uint32_t counter_rto_stale;   // rto retransmits of a frame the peer had already reported as received
     uint32_t counter_rto_behind;  // rto retransmits of a frame the peer had not reported yet
     uint32_t ack_una;             // last una seen in an ack frame
+    uint32_t reserved;            // ffrdp_dump clears everything up to here: nothing that must outlive a
+                                  // dump, and nothing a decision depends on, may sit above this line
+                                  // (the probe would otherwise be reset exactly when it is about to run).
     // ---- delay probe (step28): is the delay we see our own queue, or the path's? ----
     // No observation can tell those apart: the lowest round trip ever seen already contains a queue
     // that never drains, so the delay-versus-minimum comparison that every delay based scheme uses is
@@ -196,11 +201,12 @@ typedef struct {
     uint32_t probe_next;          // earliest tick for the next probe
     uint32_t cap, cap_kept;       // in-flight limit enforced now, and the one a probe proved
     uint32_t rate_tick, rate_del_ref, rate_now; // delivered frames per second, sampled once a second
+    uint32_t probe_waste;         // retransmits as a percentage of first transmissions over the last second
+    uint32_t probe_resend_seen, probe_first_seen; // ... the raw counts that percentage is taken against
     uint32_t counter_delivered;   // frames the peer has confirmed and we have let go of
     uint32_t win_first;           // first transmissions in this evidence window
     uint32_t counter_probe, counter_probe_keep, counter_probe_revert;
     uint32_t counter_probe_narrow, counter_giveback;
-    uint32_t reserved;
 } FFRDPCONTEXT;
 
 static uint32_t ringbuf_write(uint8_t *rbuf, uint32_t maxsize, uint32_t tail, uint8_t *src, uint32_t len)
@@ -815,15 +821,29 @@ void ffrdp_update(void *ctxt)
         if (!ffrdp->probe_gap) ffrdp->probe_gap = FFRDP_PROBE_GAP_MS;
         ffrdp->cap = ffrdp->probe_state ? ffrdp->probe_cap : ffrdp->cap_kept;
         if ((int32_t)now - (int32_t)ffrdp->rate_tick >= 1000) {
+            uint32_t resend = ffrdp->counter_resend_rto + ffrdp->counter_resend_fast;
+            uint32_t firsts = ffrdp->counter_send_1sttime;
             ffrdp->rate_now     = ffrdp->counter_delivered - ffrdp->rate_del_ref;
             ffrdp->rate_tick    = now;
             ffrdp->rate_del_ref = ffrdp->counter_delivered;
+            // the trigger needs evidence over a whole second. the window the rto floor uses holds a few
+            // tens of frames, and one retransmit out of thirty is a ratio of three percent -- that is
+            // sampling noise, not a wasteful path. the counters can also be cleared by a dump, so a
+            // count that moved backwards is read as no evidence at all.
+            ffrdp->probe_waste = (resend >= ffrdp->probe_resend_seen && firsts >= ffrdp->probe_first_seen)
+                               ? (resend - ffrdp->probe_resend_seen) * 100 / MAX(firsts - ffrdp->probe_first_seen, 1)
+                               : 0;
+            ffrdp->probe_resend_seen = resend;
+            ffrdp->probe_first_seen  = firsts;
         }
         if (ffrdp->probe_state == 0) {
-            uint32_t waste = ffrdp->win_need * 100 / MAX(ffrdp->win_first, 1);
+            uint32_t waste = ffrdp->probe_waste;
             if ((int32_t)now - (int32_t)ffrdp->probe_next >= 0) {
                 uint32_t out = 0;
-                for (q = ffrdp->send_list_head; q; q = q->next) out++;
+                // count only frames that are really on the wire: the list also holds frames the
+                // application has queued but that have not been sent yet, and halving those would not
+                // halve what is in flight at all.
+                for (q = ffrdp->send_list_head; q; q = q->next) if (q->flags & FLAG_FIRST_SEND) out++;
                 if (waste >= FFRDP_PROBE_WASTE_PCT && out >= FFRDP_PROBE_MIN_OUT) {
                     uint32_t rtt = (ffrdp->rtts == (uint32_t)-1 || ffrdp->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : ffrdp->rtts;
                     ffrdp->probe_state   = 1;
@@ -905,10 +925,14 @@ void ffrdp_dump(void *ctxt, int clearhistory)
         // experiment reported. rtt ref->best is the number to read: if best is well below ref the window
         // was keeping a queue alive; if they are close the delay is the path's and nothing was touched.
         FFRDP_FRAME_NODE *q; uint32_t out = 0;
-        for (q = ffrdp->send_list_head; q; q = q->next) out++;
+        for (q = ffrdp->send_list_head; q; q = q->next) if (q->flags & FLAG_FIRST_SEND) out++;
         printf("inflight, cap       : %u, %u (kept %u; probes %u keep %u revert %u too-far %u giveback %u)\n",
                out, ffrdp->cap, ffrdp->cap_kept, ffrdp->counter_probe, ffrdp->counter_probe_keep,
                ffrdp->counter_probe_revert, ffrdp->counter_probe_narrow, ffrdp->counter_giveback);
+        // what the probe's trigger sees at the moment it is asked: need is retransmits, first is first
+        // transmissions, both since the evidence window last closed, and out is what is on the wire.
+        printf("probe trigger       : waste %u%% over last second, out %u (needs %u%% and %u frames)\n",
+               ffrdp->probe_waste, out, FFRDP_PROBE_WASTE_PCT, FFRDP_PROBE_MIN_OUT);
         printf("probe rtt ref/best  : %u, %u\n",
                ffrdp->probe_rtt_ref, ffrdp->probe_best == 0xFFFFFFFF ? 0 : ffrdp->probe_best);
         printf("confirmed rate      : %u frames/s\n", ffrdp->rate_now);
