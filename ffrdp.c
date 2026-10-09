@@ -50,7 +50,9 @@ static uint32_t get_tick_count()
 // from keeping 64 of them in flight, which is exactly the 219ms the ping sees while the test runs. 16 is
 // several times the product, so it cannot starve the link, and it should take that 219ms down to ~50ms.
 // Try 8 to push further (still above the product); override with -DFFRDP_INFLIGHT_MAX=n.
+#ifndef FFRDP_INFLIGHT_MAX
 #define FFRDP_INFLIGHT_MAX   64   // default ceiling for frames on the wire. The number that is useful on a
+#endif
                                   // given path cannot be picked in advance: the simulator (fast links, coarse
                                   // acks) breaks below 64, while the target path needs 2..6 to stop holding a
                                   // 219ms queue. So the default is the harmless value, and the probe (see
@@ -59,7 +61,9 @@ static uint32_t get_tick_count()
 #define FFRDP_PROBE_HOLD_MS      500  // held for 2 round trips plus this much, long enough to drain a queue
 #define FFRDP_PROBE_RTT_DROP_PCT 85   // the round trip must fall below this percentage of the pre-probe value
 #define FFRDP_PROBE_RATE_KEEP_PCT 85  // ... while the rate the peer confirms stays above this percentage
+#ifndef FFRDP_PROBE_ENABLE
 #define FFRDP_PROBE_ENABLE       0    // 0 = off. this is a diagnostic, not an optimisation: on the measured
+#endif
                                       // path the experiment answered "the delay is not ours" (halving the
                                       // frames in flight left the lowest round trip unchanged), so there is
                                       // nothing left for it to win, only the cost of running it. turn it on
@@ -75,10 +79,14 @@ static uint32_t get_tick_count()
 #define FFRDP_PROBE_GAP_MS       10000
 #define FFRDP_PROBE_GAP_MAX_MS   60000
 #define FFRDP_PROBE_HEALTHY_PCT  1    // below this much waste the kept window is given back a little
+#ifndef FFRDP_RTO_FLOOR_MAX
 #define FFRDP_RTO_FLOOR_MAX  1000 // ms: a longer repair delay than this is never worth paying
+#endif
 #define FFRDP_RTO_WIN        128  // retransmits per evidence window, so the loop reacts in about a second
 #define FFRDP_WASTE_MIN      16   // retransmits a window must contain before it is allowed to decide anything
+#ifndef FFRDP_WASTE_HI
 #define FFRDP_WASTE_HI       80   // % of our retransmits the peer already had => the rto is sitting too short
+#endif
 #define FFRDP_WASTE_LO       40   // % below which the repairs are real and the floor is given back
 #define FFRDP_RECVBUF_SIZE  (128 * (FFRDP_MAX_MSS + 0))
 #define FFRDP_UDPSBUF_SIZE  (128 * (FFRDP_MAX_MSS + 6))
