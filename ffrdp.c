@@ -43,6 +43,11 @@ static uint32_t get_tick_count()
 #define FFRDP_MIN_CWND_SIZE  1
 #define FFRDP_DEF_CWND_SIZE  32
 #define FFRDP_MAX_CWND_SIZE  64
+#define FFRDP_RTO_FLOOR_MAX  1000 // ms: a longer repair delay than this is never worth paying
+#define FFRDP_RTO_WIN        128  // retransmits per evidence window, so the loop reacts in about a second
+#define FFRDP_WASTE_MIN      32   // retransmits a window must contain before it is allowed to decide anything
+#define FFRDP_WASTE_HI       80   // % of our retransmits the peer already had => the rto is sitting too short
+#define FFRDP_WASTE_LO       40   // % below which the repairs are real and the floor is given back
 #define FFRDP_RECVBUF_SIZE  (128 * (FFRDP_MAX_MSS + 0))
 #define FFRDP_UDPSBUF_SIZE  (128 * (FFRDP_MAX_MSS + 6))
 #define FFRDP_UDPRBUF_SIZE  (128 * (FFRDP_MAX_MSS + 6))
@@ -103,6 +108,9 @@ typedef struct {
     uint32_t wait_snd; // data frame number wait to send
     uint32_t rttm, rtts, rttd, rto;
     uint32_t rmss, smss, swnd, cwnd, ssthresh;
+    uint32_t rto_floor;           // persistent lower bound on the rto, moved only by the peer's duplicate reports
+    uint32_t win_need, win_dup;   // retransmits attempted in this evidence window, and how many the peer called pointless
+    uint32_t tick_win;            // when the current evidence window was opened
     uint32_t tick_recv_ack;
     uint32_t tick_send_query;
     uint32_t tick_ffrdp_dump;
@@ -132,6 +140,9 @@ typedef struct {
     uint32_t counter_resend_rto;
     uint32_t counter_reach_maxrto;
     uint32_t counter_txfull , counter_rxfull ;
+    uint32_t counter_recv_dup;   // data frames that arrived although we already had them
+    uint32_t counter_ack_dup;    // ... as reported back to us by the peer: retransmits of ours that were pointless
+    uint32_t dup_seen;           // duplicates seen since our last ack, the value that ack carries
     uint32_t counter_txshort, counter_rxshort;
     uint32_t counter_fec_tx;
     uint32_t counter_fec_rx;
@@ -470,8 +481,8 @@ int ffrdp_isdead(void *ctxt)
 static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, struct sockaddr_in *dstaddr)
 {
     FFRDP_FRAME_NODE *p;
-    int32_t dist, recv_mack, recv_wnd, size, i;
-    uint8_t data[8];
+    int32_t dist, recv_mack, recv_wnd, size, i, alen;
+    uint8_t data[9];
     while (ffrdp->recv_list_head) {
         dist = seq_distance(GET_FRAME_SEQ(ffrdp->recv_list_head), ffrdp->recv_seq);
         if (dist == 0 && (size = frame_payload_size(ffrdp->recv_list_head)) <= (int)(sizeof(ffrdp->recv_buff) - ffrdp->recv_size)) {
@@ -493,7 +504,17 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, struct sockaddr_in *
     *(uint32_t*)(data + 0) = (FFRDP_FRAME_TYPE_ACK << 0) | (ffrdp->recv_seq << 8);
     *(uint32_t*)(data + 4) = (recv_mack <<  0);
     *(uint32_t*)(data + 4)|= (recv_wnd  << 24);
-    sendto(ffrdp->udp_fd, (void*)data, sizeof(data), 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)); // send ack frame
+    // one byte of independent evidence for the sender: how many frames arrived since our last ack that we
+    // already had, i.e. how many of its retransmits were pointless. the sender's own retransmit counter
+    // cannot answer that (it counts attempts, not arrivals), this can. a peer that does not send the byte
+    // simply leaves the field zero, and then the sender's floor never moves -- old peers stay safe.
+    // pay for the extra byte only when there is something to say: on a link where nothing is being
+    // retransmitted twice the ack stays exactly as long as it always was, so nothing about the sender's
+    // behaviour can change there at all.
+    if (ffrdp->dup_seen) { data[8] = (uint8_t)MIN(ffrdp->dup_seen, 255); alen = (int32_t)sizeof(data); }
+    else                 { alen = 8; }
+    ffrdp->dup_seen = 0;
+    sendto(ffrdp->udp_fd, (void*)data, alen, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)); // send ack frame
 }
 
 enum { CEVENT_ACK_OK, CEVENT_ACK_TIMEOUT, CEVENT_FAST_RESEND, CEVENT_SEND_FAILED };
@@ -584,6 +605,7 @@ void ffrdp_update(void *ctxt)
                     ffrdp->counter_rto_backoff++;
                 }
                 ffrdp->counter_resend_rto++;
+                ffrdp->win_need++;
                 got_timeout = 1;
             } else {
                 p->flags &= ~(FLAG_FAST_RESEND|FLAG_TIMEOUT_RESEND);
@@ -616,6 +638,9 @@ void ffrdp_update(void *ctxt)
                 // peer's acks carry no mack bit, then the hole is never being reported, and the sender
                 // has no choice but to wait for timeouts.
                 if (dist > 0) { ffrdp->counter_recv_ooo++; if (dist > 23) ffrdp->counter_recv_far++; }
+                // below the range we have already taken in: the peer sent this again although we had it,
+                // which is exactly the waste we want to count and report back.
+                if (dist < 0) { ffrdp->counter_recv_dup++; ffrdp->dup_seen++; }
                 if (dist >= 0) { list_enqueue(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, node); node = NULL; }
                 got_data = 1;
             }
@@ -623,6 +648,9 @@ void ffrdp_update(void *ctxt)
             una  = *(uint32_t*)(node->data + 0) >> 8;
             mack = *(uint32_t*)(node->data + 4) & 0xFFFFFF;
             ffrdp->counter_ack_recv++;
+            // the peer's count of our retransmits that it had already accepted. this is the one piece of
+            // evidence our own counters cannot fake, so it is what the rto floor is driven by.
+            if (ret >= 9 && node->data[8]) { ffrdp->counter_ack_dup += node->data[8]; ffrdp->win_dup += node->data[8]; }
             if (ffrdp->counter_ack_recv > 1 && (uint32_t)una == ffrdp->ack_una) ffrdp->counter_ack_una_dup++; // the peer did not move
             ffrdp->ack_una = (uint32_t)una;
             if (mack) { // the peer reported frames that arrived after a hole
@@ -662,9 +690,46 @@ void ffrdp_update(void *ctxt)
                         ffrdp->rtts = (7 * ffrdp->rtts + 1 * ffrdp->rttm) / 8;
                         ffrdp->rttd = (3 * ffrdp->rttd + 1 * abs((int)ffrdp->rttm - (int)ffrdp->rtts)) / 4;
                     }
-                    ffrdp->rto = ffrdp->rtts + 4 * ffrdp->rttd;
-                    ffrdp->rto = MAX(FFRDP_MIN_RTO, ffrdp->rto);
-                    ffrdp->rto = MIN(FFRDP_MAX_RTO, ffrdp->rto);
+                    {   // The peer's duplicate reports are the one piece of evidence on this path that our own
+                        // retransmit counter cannot corrupt: it says, from the receiving end, how many of the
+                        // frames we sent a second time it had already accepted. When that share is high the rto
+                        // is still sitting inside the round trip distribution, and every one of those
+                        // retransmits is paid for on the wire for nothing -- so push the floor up until they
+                        // stop. The floor starts from the current rto when it is lower, so a single step is
+                        // immediately binding: a raiser seeded below the rto is exactly what made the earlier
+                        // attempts at this do nothing at all.
+                        // the decision is taken once per evidence window, and both directions move on that
+                        // same clock: raising per window while decaying per ack means the decay wins on any
+                        // link with a high ack rate, and the floor then never moves at all.
+                        if (ffrdp->win_need == 0) ffrdp->tick_win = get_tick_count();
+                        if (ffrdp->win_need >= FFRDP_RTO_WIN ||
+                            (ffrdp->win_need && (int32_t)get_tick_count() - (int32_t)ffrdp->tick_win > 2000)) {
+                            // small windows are noise: a handful of retransmits can read 100% pointless by
+                            // accident, and acting on that raises the rto on links whose repairs are real.
+                            // below the floor a window simply does not get to decide.
+                            if (ffrdp->win_need >= FFRDP_WASTE_MIN) {
+                                uint32_t waste = ffrdp->win_need ? ffrdp->win_dup * 100 / ffrdp->win_need : 0;
+                                if (waste >= FFRDP_WASTE_HI) {
+                                    if (ffrdp->rto_floor < ffrdp->rto) ffrdp->rto_floor = ffrdp->rto;
+                                    ffrdp->rto_floor = MIN(ffrdp->rto_floor * 5 / 4, (uint32_t)FFRDP_RTO_FLOOR_MAX);
+                                    // a floor far above the link's own round trip buys less than it costs: keep
+                                    // the repair delay bounded relative to the baseline as well
+                                    {   uint32_t rtt = (ffrdp->rtts == (uint32_t)-1 || ffrdp->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : ffrdp->rtts;
+                                        uint32_t cap = MAX(4 * rtt, 200u);
+                                        if (ffrdp->rto_floor > cap) ffrdp->rto_floor = cap;
+                                    }
+                                } else if (waste < FFRDP_WASTE_LO) {
+                                    ffrdp->rto_floor = 0;      // the retransmits are reaching a peer that did not have them: repair fast
+                                } else {
+                                    ffrdp->rto_floor = ffrdp->rto_floor * 9 / 10; // in between: give ground slowly
+                                }
+                            }
+                            ffrdp->win_need = ffrdp->win_dup = 0;
+                        }
+                        ffrdp->rto = MAX(ffrdp->rtts + 4 * ffrdp->rttd, ffrdp->rto_floor);
+                        ffrdp->rto = MAX(FFRDP_MIN_RTO, ffrdp->rto);
+                        ffrdp->rto = MIN(FFRDP_MAX_RTO, ffrdp->rto);
+                    }
                 }
                 t = p; p = p->next; list_remove(&ffrdp->send_list_head, &ffrdp->send_list_tail, t); continue;
             } else if (seq_distance(maxack, GET_FRAME_SEQ(p)) > 0) {
@@ -733,6 +798,10 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("counter_rto_head    : %u\n"  , ffrdp->counter_rto_head    );
     printf("counter_rto_chain   : %u\n"  , ffrdp->counter_rto_chain   );
     printf("counter_rto_stale   : %u\n"  , ffrdp->counter_rto_stale   );
+    printf("counter_recv_dup    : %u\n"  , ffrdp->counter_recv_dup    );
+    printf("counter_ack_dup     : %u\n"  , ffrdp->counter_ack_dup     );
+    printf("rto_floor, waste%%   : %u, %.1f%%\n", ffrdp->rto_floor,
+           100.0 * ffrdp->counter_ack_dup / MAX(ffrdp->counter_resend_rto + ffrdp->counter_resend_fast, 1));
     printf("counter_rto_behind  : %u\n"  , ffrdp->counter_rto_behind  );
     printf("update period avg/max: %u, %u ms (%u calls, cost max %u ms)\n",
            ffrdp->counter_upd_gap / MAX(ffrdp->counter_upd_cnt - 1, 1), ffrdp->counter_upd_gap_max,
