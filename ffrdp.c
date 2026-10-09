@@ -967,6 +967,10 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     secs = ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_ffrdp_dump) / 1000;
     secs = secs ? secs : 1;
     printf("rttm: %u, rtts: %u, rttd: %u, rto: %u\n", ffrdp->rttm, ffrdp->rtts, ffrdp->rttd, ffrdp->rto);
+    // which binary is this? the compile stamp makes a stale executable impossible to mistake for a fresh
+    // one: if this time is older than the build you just ran, you are running something else.
+    printf("build               : probe %d, inflight default %u, compiled %s %s\n",
+           FFRDP_PROBE_ENABLE, (uint32_t)FFRDP_INFLIGHT_MAX, __DATE__, __TIME__);
     // rttm is the LATEST sample (its name is misleading); rtt_min is the lowest of this interval, rtts the
     // smoothed typical latency, rttd the jitter. rto is a timer, not a delay: never read it as latency.
     printf("rtt_min, rtts, rttd: %u, %u, %u (min / typical / jitter, ms)\n",
