@@ -67,7 +67,10 @@ int main(int argc, char *argv[])
     s0.ooo = c1->counter_recv_ooo; s0.far = c1->counter_recv_far; // c1's view of what c0 sent
 #endif
 #ifdef SPUR
-    s0.spur = c0->counter_rto_spurious; s0.rfl = c0->counter_rto_floor; // pointless retransmits proven by timing
+    s0.spur = c0->counter_rto_spurious; // pointless retransmits proven by timing
+#endif
+#ifdef RTO_FLOOR
+    s0.rfl = c0->counter_rto_floor;     // only exists in builds that carry the rto floor experiment
 #endif
 #ifdef HAVE_INFLIGHT
     s0.inflight = c0->inflight;
