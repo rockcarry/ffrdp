@@ -43,6 +43,7 @@ static uint32_t get_tick_count()
 #define FFRDP_MIN_CWND_SIZE  1
 #define FFRDP_DEF_CWND_SIZE  32
 #define FFRDP_MAX_CWND_SIZE  64
+
 // step29: the real brake -- the number of frames allowed on the wire at once. The peer's advertised window
 // cannot serve as one: it is handed out again on every ack, so a limit placed on it never binds (measured:
 // 63 frames in flight while the cap read 22). Measured on the target path: link ~365KB/s, idle round trip
@@ -50,46 +51,41 @@ static uint32_t get_tick_count()
 // from keeping 64 of them in flight, which is exactly the 219ms the ping sees while the test runs. 16 is
 // several times the product, so it cannot starve the link, and it should take that 219ms down to ~50ms.
 // Try 8 to push further (still above the product); override with -DFFRDP_INFLIGHT_MAX=n.
-#ifndef FFRDP_INFLIGHT_MAX
 #define FFRDP_INFLIGHT_MAX   64   // default ceiling for frames on the wire. The number that is useful on a
-#endif
                                   // given path cannot be picked in advance: the simulator (fast links, coarse
                                   // acks) breaks below 64, while the target path needs 2..6 to stop holding a
                                   // 219ms queue. So the default is the harmless value, and the probe (see
                                   // FFRDP_PROBE_ENABLE) is what experiments its way down to the right one.
+
 // the delay probe: take half the in-flight away for a moment and watch whether the round trip follows.
-#define FFRDP_PROBE_HOLD_MS      500  // held for 2 round trips plus this much, long enough to drain a queue
-#define FFRDP_PROBE_RTT_DROP_PCT 85   // the round trip must fall below this percentage of the pre-probe value
+#define FFRDP_PROBE_HOLD_MS       500 // held for 2 round trips plus this much, long enough to drain a queue
+#define FFRDP_PROBE_RTT_DROP_PCT  85  // the round trip must fall below this percentage of the pre-probe value
 #define FFRDP_PROBE_RATE_KEEP_PCT 85  // ... while the rate the peer confirms stays above this percentage
-#ifndef FFRDP_PROBE_ENABLE
-#define FFRDP_PROBE_ENABLE       1    // on by default: it is a net win wherever a queue is being held, and
+#define FFRDP_PROBE_ENABLE        1   // on by default: it is a net win wherever a queue is being held, and
                                       // where there is none the rate guard reverts it and nothing is lost.
                                       // set to 0 only to compare against the behaviour without it.
-#endif
                                       // path the experiment answered "the delay is not ours" (halving the
                                       // frames in flight left the lowest round trip unchanged), so there is
                                       // nothing left for it to win, only the cost of running it. turn it on
                                       // to ask the same question of a new path.
-#define FFRDP_PROBE_WASTE_PM     5    // retransmits per thousand first transmissions, over the last second
-#define FFRDP_PROBE_MIN_RTT_MS   50   // ... on a path slow enough for the delay to be worth attacking. what a
+#define FFRDP_PROBE_WASTE_PM      5   // retransmits per thousand first transmissions, over the last second
+#define FFRDP_PROBE_MIN_RTT_MS    50  // ... on a path slow enough for the delay to be worth attacking. what a
                                       // probe can win is bounded by the round trip itself, so a path that is
                                       // already quick is left alone -- which is also what keeps clean links
                                       // out of the experiment entirely.
-#define FFRDP_PROBE_MIN_WIN      8    // ... at least this many of them, so one out of a handful of frames
+#define FFRDP_PROBE_MIN_WIN       8   // ... at least this many of them, so one out of a handful of frames
                                       //     in a short window cannot look like a wasted path
-#define FFRDP_PROBE_MIN_OUT      8    // ... and has a pipe worth halving
-#define FFRDP_PROBE_GAP_MS       10000
-#define FFRDP_PROBE_GAP_MAX_MS   60000
-#define FFRDP_PROBE_HEALTHY_PCT  1    // below this much waste the kept window is given back a little
-#ifndef FFRDP_RTO_FLOOR_MAX
+#define FFRDP_PROBE_MIN_OUT       8   // ... and has a pipe worth halving
+#define FFRDP_PROBE_GAP_MS        10000
+#define FFRDP_PROBE_GAP_MAX_MS    60000
+#define FFRDP_PROBE_HEALTHY_PCT   1   // below this much waste the kept window is given back a little
+
 #define FFRDP_RTO_FLOOR_MAX  1000 // ms: a longer repair delay than this is never worth paying
-#endif
 #define FFRDP_RTO_WIN        128  // retransmits per evidence window, so the loop reacts in about a second
 #define FFRDP_WASTE_MIN      16   // retransmits a window must contain before it is allowed to decide anything
-#ifndef FFRDP_WASTE_HI
 #define FFRDP_WASTE_HI       80   // % of our retransmits the peer already had => the rto is sitting too short
-#endif
 #define FFRDP_WASTE_LO       40   // % below which the repairs are real and the floor is given back
+
 #define FFRDP_RECVBUF_SIZE  (128 * (FFRDP_MAX_MSS + 0))
 #define FFRDP_UDPSBUF_SIZE  (128 * (FFRDP_MAX_MSS + 6))
 #define FFRDP_UDPRBUF_SIZE  (128 * (FFRDP_MAX_MSS + 6))
@@ -968,6 +964,8 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     if (!ctxt) return;
     secs = ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_ffrdp_dump) / 1000;
     secs = secs ? secs : 1;
+    printf("total_send, total_recv: %.2fMB, %.2fMB\n"    , ffrdp->counter_send_bytes / (1024.0 * 1024), ffrdp->counter_recv_bytes / (1024.0 * 1024));
+    printf("averg_send, averg_recv: %.2fKB/s, %.2fKB/s\n", ffrdp->counter_send_bytes / (1024.0 * secs), ffrdp->counter_recv_bytes / (1024.0 * secs));
     printf("rttm: %u, rtts: %u, rttd: %u, rto: %u\n", ffrdp->rttm, ffrdp->rtts, ffrdp->rttd, ffrdp->rto);
     // which binary is this? the compile stamp makes a stale executable impossible to mistake for a fresh
     // one: if this time is older than the build you just ran, you are running something else.
@@ -975,11 +973,9 @@ void ffrdp_dump(void *ctxt, int clearhistory)
            FFRDP_PROBE_ENABLE, (uint32_t)FFRDP_INFLIGHT_MAX, __DATE__, __TIME__);
     // rttm is the LATEST sample (its name is misleading); rtt_min is the lowest of this interval, rtts the
     // smoothed typical latency, rttd the jitter. rto is a timer, not a delay: never read it as latency.
-    printf("rtt_min, rtts, rttd: %u, %u, %u (min / typical / jitter, ms)\n",
+    printf("rtt_min, rtts, rttd : %u, %u, %u (min / typical / jitter, ms)\n",
            ffrdp->rtt_min, ffrdp->rtts, ffrdp->rttd);
     printf("elapsed             : %d s (dump interval %d s)\n", ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_ffrdp_init) / 1000, secs);
-    printf("total_send, total_recv: %.2fMB, %.2fMB\n"    , ffrdp->counter_send_bytes / (1024.0 * 1024), ffrdp->counter_recv_bytes / (1024.0 * 1024));
-    printf("averg_send, averg_recv: %.2fKB/s, %.2fKB/s\n", ffrdp->counter_send_bytes / (1024.0 * secs), ffrdp->counter_recv_bytes / (1024.0 * secs));
     printf("recv_size           : %d\n"  , ffrdp->recv_size           );
     printf("flags               : %x\n"  , ffrdp->flags               );
     printf("send_seq            : %u\n"  , ffrdp->send_seq            );
@@ -997,7 +993,7 @@ void ffrdp_dump(void *ctxt, int clearhistory)
                ffrdp->counter_probe_revert, ffrdp->counter_probe_narrow, ffrdp->counter_giveback);
         // step29: the brake that actually holds. it limits frames on the wire, so the round trip stops
         // carrying a queue we built ourselves; the peer's credit is left alone (it never limited anything).
-        printf("in-flight limit      : %u frames (default %u; the probe lowers it when it proves a win)\n",
+        printf("in-flight limit     : %u frames (default %u; the probe lowers it when it proves a win)\n",
                ffrdp->inflight_max ? ffrdp->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX,
                (uint32_t)FFRDP_INFLIGHT_MAX);
         // what the probe's trigger sees at the moment it is asked: need is retransmits, first is first
@@ -1050,7 +1046,7 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("rto_floor, waste%%   : %u, %.1f%%\n", ffrdp->rto_floor,
            100.0 * ffrdp->counter_ack_dup / MAX(ffrdp->counter_resend_rto + ffrdp->counter_resend_fast, 1));
     printf("counter_rto_behind  : %u\n"  , ffrdp->counter_rto_behind  );
-    printf("update period avg/max: %u, %u ms (%u calls, cost max %u ms)\n",
+    printf("update period avgmax: %u, %u ms (%u calls, cost max %u ms)\n",
            ffrdp->counter_upd_gap / MAX(ffrdp->counter_upd_cnt - 1, 1), ffrdp->counter_upd_gap_max,
            ffrdp->counter_upd_cnt, ffrdp->counter_upd_cost_max);
     printf("counter_txfull      : %u\n"  , ffrdp->counter_txfull      );
