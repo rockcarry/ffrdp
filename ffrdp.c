@@ -43,6 +43,18 @@ static uint32_t get_tick_count()
 #define FFRDP_MIN_CWND_SIZE  1
 #define FFRDP_DEF_CWND_SIZE  32
 #define FFRDP_MAX_CWND_SIZE  64
+// step29: the real brake -- the number of frames allowed on the wire at once. The peer's advertised window
+// cannot serve as one: it is handed out again on every ack, so a limit placed on it never binds (measured:
+// 63 frames in flight while the cap read 22). Measured on the target path: link ~365KB/s, idle round trip
+// 5..16ms, so the bandwidth-delay product is 1..6 frames -- and the standing queue we were holding came
+// from keeping 64 of them in flight, which is exactly the 219ms the ping sees while the test runs. 16 is
+// several times the product, so it cannot starve the link, and it should take that 219ms down to ~50ms.
+// Try 8 to push further (still above the product); override with -DFFRDP_INFLIGHT_MAX=n.
+#define FFRDP_INFLIGHT_MAX   64   // default ceiling for frames on the wire. The number that is useful on a
+                                  // given path cannot be picked in advance: the simulator (fast links, coarse
+                                  // acks) breaks below 64, while the target path needs 2..6 to stop holding a
+                                  // 219ms queue. So the default is the harmless value, and the probe (see
+                                  // FFRDP_PROBE_ENABLE) is what experiments its way down to the right one.
 // the delay probe: take half the in-flight away for a moment and watch whether the round trip follows.
 #define FFRDP_PROBE_HOLD_MS      500  // held for 2 round trips plus this much, long enough to drain a queue
 #define FFRDP_PROBE_RTT_DROP_PCT 85   // the round trip must fall below this percentage of the pre-probe value
@@ -175,6 +187,7 @@ typedef struct {
     uint32_t counter_recv_ooo   ; // data frames that arrived out of order: there is a hole below them
     uint32_t counter_recv_far   ; // ... and they are more than 23 ahead of the hole, so the 24 bit ack mask cannot carry them
     uint32_t rtt_min            ; // lowest round trip seen this interval: the path's floor, the number to judge latency by
+    uint32_t inflight_used      ; // frames actually on the wire (recounted every pass): what step29 limits
 
     uint32_t counter_rto_backoff; // times the rto was multiplied
     uint32_t counter_timeout_evt; // updates in which at least one frame timed out
@@ -211,6 +224,7 @@ typedef struct {
     uint32_t probe_gap;           // current back off between probes
     uint32_t probe_next;          // earliest tick for the next probe
     uint32_t cap, cap_kept;       // in-flight limit enforced now, and the one a probe proved
+    uint32_t inflight_max;        // the frames-on-the-wire ceiling actually used (0 = FFRDP_INFLIGHT_MAX)
     uint32_t rate_tick, rate_del_ref, rate_now; // delivered frames per second, sampled once a second
     uint32_t probe_waste;         // retransmits as a percentage of first transmissions over the last second
     uint32_t probe_resend_seen, probe_first_seen; // ... the raw counts that percentage is taken against
@@ -622,14 +636,22 @@ void ffrdp_update(void *ctxt)
         ffrdp->cur_new_size = 0;
     }
 
+    {   // count what is really on the wire, fresh every pass, so no counter can drift or leak
+        FFRDP_FRAME_NODE *q;
+        for (ffrdp->inflight_used = 0, q = ffrdp->send_list_head; q; q = q->next) if (q->flags & FLAG_FIRST_SEND) ffrdp->inflight_used++;
+    }
     for (i = 0, p = ffrdp->send_list_head; i < (int32_t)ffrdp->cwnd && p; i++, p = p->next) {
         if (!(p->flags & FLAG_FIRST_SEND)) { // first send
+            // frames are first sent in sequence order, so everything already sent sits in front of this
+            // one and breaking here skips nothing that needed attention. retransmits are untouched: this
+            // only stops adding new frames to a wire that already holds FFRDP_INFLIGHT_MAX of them.
+            if (ffrdp->inflight_used >= MAX(ffrdp->inflight_max ? ffrdp->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX, 4u)) break;
             if (ffrdp->swnd > 0) {
                 if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) { ffrdp_congestion_control(ffrdp, CEVENT_SEND_FAILED); break; }
                 p->tick_1sts = p->tick_send = get_tick_count();
                 p->tick_timeout = p->tick_send + ffrdp->rto;
                 p->flags       |= FLAG_FIRST_SEND;
-                ffrdp->swnd--; ffrdp->counter_send_1sttime++; ffrdp->win_first++;
+                ffrdp->swnd--; ffrdp->counter_send_1sttime++; ffrdp->win_first++; ffrdp->inflight_used++;
             } else if (ffrdp->tick_send_query == 0 || (int32_t)get_tick_count() - (int32_t)ffrdp->tick_send_query > FFRDP_QUERY_CYCLE) { // query remote receive window size
                 data[0] = FFRDP_FRAME_TYPE_QUERY; sendto(ffrdp->udp_fd, (void*)data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
                 ffrdp->tick_send_query = get_tick_count(); ffrdp->counter_send_query++;
@@ -833,7 +855,12 @@ void ffrdp_update(void *ctxt)
         uint32_t now = get_tick_count();
         FFRDP_FRAME_NODE *q;
         if (!ffrdp->probe_gap) ffrdp->probe_gap = FFRDP_PROBE_GAP_MS;
-        ffrdp->cap = ffrdp->probe_state ? ffrdp->probe_cap : ffrdp->cap_kept;
+        // the probe now drives the real brake (frames on the wire), not the peer's credit: the credit is
+        // handed out again on every ack, so limiting it never bound anything and the experiment could not
+        // change the round trip even in principle. without a proven cap the ceiling stays at its default.
+        ffrdp->inflight_max = ffrdp->probe_state ? ffrdp->probe_cap
+                            : (ffrdp->cap_kept ? ffrdp->cap_kept : (uint32_t)FFRDP_INFLIGHT_MAX);
+        ffrdp->cap = ffrdp->inflight_max;
         if ((int32_t)now - (int32_t)ffrdp->rate_tick >= 1000) {
             uint32_t resend = ffrdp->counter_resend_rto + ffrdp->counter_resend_fast;
             uint32_t firsts = ffrdp->counter_send_1sttime;
@@ -874,7 +901,7 @@ void ffrdp_update(void *ctxt)
                 } else if (waste < FFRDP_PROBE_HEALTHY_PCT && ffrdp->cap_kept) {
                     // nothing is being wasted any more: give a little of the window back, so a path that
                     // has become faster is not held down for ever by a limit proven on an older path.
-                    ffrdp->cap_kept   = MIN(ffrdp->cap_kept + MAX(ffrdp->cap_kept / 4, 1), (uint32_t)FFRDP_MAX_CWND_SIZE * 4);
+                    ffrdp->cap_kept   = MIN(ffrdp->cap_kept + MAX(ffrdp->cap_kept / 4, 1), (uint32_t)FFRDP_INFLIGHT_MAX);
                     ffrdp->cap        = ffrdp->cap_kept;
                     ffrdp->probe_next = now + FFRDP_PROBE_GAP_MS;
                     ffrdp->counter_giveback++;
@@ -948,6 +975,11 @@ void ffrdp_dump(void *ctxt, int clearhistory)
         printf("inflight, cap       : %u, %u (kept %u; probes %u keep %u revert %u too-far %u giveback %u)\n",
                out, ffrdp->cap, ffrdp->cap_kept, ffrdp->counter_probe, ffrdp->counter_probe_keep,
                ffrdp->counter_probe_revert, ffrdp->counter_probe_narrow, ffrdp->counter_giveback);
+        // step29: the brake that actually holds. it limits frames on the wire, so the round trip stops
+        // carrying a queue we built ourselves; the peer's credit is left alone (it never limited anything).
+        printf("in-flight limit      : %u frames (default %u; the probe lowers it when it proves a win)\n",
+               ffrdp->inflight_max ? ffrdp->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX,
+               (uint32_t)FFRDP_INFLIGHT_MAX);
         // what the probe's trigger sees at the moment it is asked: need is retransmits, first is first
         // transmissions, both since the evidence window last closed, and out is what is on the wire.
         printf("probe trigger       : waste %u per mille, rttm %u, out %u (needs %u pm, %u ms, %u frames)\n",
