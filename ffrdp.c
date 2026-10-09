@@ -893,8 +893,14 @@ void ffrdp_update(void *ctxt)
                 // application has queued but that have not been sent yet, and halving those would not
                 // halve what is in flight at all.
                 for (q = ffrdp->send_list_head; q; q = q->next) if (q->flags & FLAG_FIRST_SEND) out++;
-                if (FFRDP_PROBE_ENABLE && waste >= FFRDP_PROBE_WASTE_PM && ffrdp->rttm != (uint32_t)-1 &&
-                    ffrdp->rttm >= FFRDP_PROBE_MIN_RTT_MS && out >= FFRDP_PROBE_MIN_OUT) {
+                // what earns an experiment is a path that is holding a queue, and rtt_min now makes that
+                // visible directly: typical round trip far above the path's floor is a queue by definition,
+                // and it is the delay a ping sees while the transfer runs. a retransmit count is a much
+                // weaker trigger -- on this path it is down to a few per mille once the floor is up -- so it
+                // stays only as a second way in for paths whose floor is already low.
+                if (FFRDP_PROBE_ENABLE && out >= FFRDP_PROBE_MIN_OUT &&
+                    ((ffrdp->rtt_min && ffrdp->rtts != (uint32_t)-1 && ffrdp->rtts > 4 * ffrdp->rtt_min) ||
+                     waste >= FFRDP_PROBE_WASTE_PM)) {
                     uint32_t rtt = (ffrdp->rtts == (uint32_t)-1 || ffrdp->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : ffrdp->rtts;
                     ffrdp->probe_state   = 1;
                     ffrdp->probe_tick    = now;
@@ -993,6 +999,12 @@ void ffrdp_dump(void *ctxt, int clearhistory)
         printf("probe trigger       : waste %u per mille, rttm %u, out %u (needs %u pm, %u ms, %u frames)\n",
                ffrdp->probe_waste, ffrdp->rttm, out,
                FFRDP_PROBE_WASTE_PM, FFRDP_PROBE_MIN_RTT_MS, FFRDP_PROBE_MIN_OUT);
+        // the queue test, which is what actually earns a probe: typical round trip against the path's own
+        // floor. >=4x means a queue is being held, and that is the number to watch fall when the probe wins.
+        printf("queue test          : rtts %u vs rtt_min %u -> %ux (probe needs >4x, or waste >= %u pm)\n",
+               ffrdp->rtts, ffrdp->rtt_min,
+               ffrdp->rtt_min && ffrdp->rtts != (uint32_t)-1 ? ffrdp->rtts / ffrdp->rtt_min : 0,
+               FFRDP_PROBE_WASTE_PM);
         printf("probe rtt ref/best  : %u, %u\n",
                ffrdp->probe_rtt_ref, ffrdp->probe_best == 0xFFFFFFFF ? 0 : ffrdp->probe_best);
         printf("confirmed rate      : %u frames/s\n", ffrdp->rate_now);
