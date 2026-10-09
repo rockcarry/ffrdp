@@ -106,6 +106,7 @@ typedef struct {
     uint32_t tick_recv_ack;
     uint32_t tick_send_query;
     uint32_t tick_ffrdp_dump;
+    uint32_t tick_ffrdp_init;  // tick of ffrdp_init, for the elapsed time in the dump
     uint32_t tick_rto_backoff; // tick of last rto backoff, rto backs off once per round
 
     uint8_t  fec_txbuf[4 + FFRDP_MAX_MSS + 2];
@@ -136,6 +137,11 @@ typedef struct {
     uint32_t counter_fec_rx;
     uint32_t counter_fec_ok;
     uint32_t counter_fec_failed;
+    uint32_t counter_ack_recv   ; // ack frames received
+    uint32_t counter_ack_mack   ; // ack frames carrying out of order (mack) info
+    uint32_t counter_ack_hole   ; // ack frames reporting a gap below the highest acked frame
+    uint32_t counter_rto_backoff; // times the rto was multiplied
+    uint32_t counter_timeout_evt; // updates in which at least one frame timed out
     uint32_t reserved;
 } FFRDPCONTEXT;
 
@@ -330,6 +336,7 @@ void* ffrdp_init(char *ip, int port, char *txkey, char *rxkey, int server, int s
     ffrdp->smss     = MAX(1, MIN(smss, FFRDP_MAX_MSS));
     ffrdp->fec_txredundancy = MAX(0, MIN(sfec, FFRDP_FRAME_TYPE_FEC32));
     ffrdp->tick_ffrdp_dump  = get_tick_count();
+    ffrdp->tick_ffrdp_init  = ffrdp->tick_ffrdp_dump;
     ffrdp->tick_rto_backoff = ffrdp->tick_ffrdp_dump - ffrdp->rto; // allow the first timeout to backoff
 
     ffrdp->server_addr.sin_family      = AF_INET;
@@ -504,7 +511,7 @@ void ffrdp_update(void *ctxt)
     FFRDP_FRAME_NODE   *node    = NULL, *p = NULL, *t = NULL;
     struct sockaddr_in *dstaddr = NULL, srcaddr;
     socklen_t addrlen = sizeof(srcaddr);
-    int32_t   una, mack, ret, got_data = 0, got_query = 0, send_una, send_mack = 0, recv_una, dist, maxack, i;
+    int32_t   una, mack, ret, got_data = 0, got_query = 0, got_timeout = 0, send_una, send_mack = 0, recv_una, dist, maxack, i, j;
     uint8_t   data[8];
 
     if (!ctxt) return;
@@ -547,8 +554,10 @@ void ffrdp_update(void *ctxt)
                     if (ffrdp->rto == FFRDP_MAX_RTO) ffrdp->counter_reach_maxrto++;
                     ffrdp->rto += ffrdp->rto / 2;
                     ffrdp->rto  = MIN(ffrdp->rto, FFRDP_MAX_RTO);
+                    ffrdp->counter_rto_backoff++;
                 }
                 ffrdp->counter_resend_rto++;
+                got_timeout = 1;
             } else {
                 p->flags &= ~(FLAG_FAST_RESEND|FLAG_TIMEOUT_RESEND);
                 ffrdp->counter_resend_fast++;
@@ -556,6 +565,7 @@ void ffrdp_update(void *ctxt)
             p->tick_timeout+= ffrdp->rto;
         }
     }
+    if (got_timeout) ffrdp->counter_timeout_evt++;
 
     if (ffrdp_sleep(ffrdp, FFRDP_SELECT_SLEEP) != 0) return;
     for (node = NULL;;) { // receive data
@@ -581,6 +591,13 @@ void ffrdp_update(void *ctxt)
         } else if (node->data[0] == FFRDP_FRAME_TYPE_ACK) { // ack frame
             una  = *(uint32_t*)(node->data + 0) >> 8;
             mack = *(uint32_t*)(node->data + 4) & 0xFFFFFF;
+            ffrdp->counter_ack_recv++;
+            if (mack) { // the peer reported frames that arrived after a hole
+                ffrdp->counter_ack_mack++;
+                for (i = 23; i >= 0 && !(mack & (1 << i)); i--);
+                for (j = 0; j < i && (mack & (1 << j)); j++);
+                if (j < i) ffrdp->counter_ack_hole++; // a gap below the highest acked frame
+            }
             dist = seq_distance(una, send_una);
             if (dist >= 0) {
                 send_una    = una;
@@ -639,6 +656,7 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     secs = ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_ffrdp_dump) / 1000;
     secs = secs ? secs : 1;
     printf("rttm: %u, rtts: %u, rttd: %u, rto: %u\n", ffrdp->rttm, ffrdp->rtts, ffrdp->rttd, ffrdp->rto);
+    printf("elapsed             : %d s (dump interval %d s)\n", ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_ffrdp_init) / 1000, secs);
     printf("total_send, total_recv: %.2fMB, %.2fMB\n"    , ffrdp->counter_send_bytes / (1024.0 * 1024), ffrdp->counter_recv_bytes / (1024.0 * 1024));
     printf("averg_send, averg_recv: %.2fKB/s, %.2fKB/s\n", ffrdp->counter_send_bytes / (1024.0 * secs), ffrdp->counter_recv_bytes / (1024.0 * secs));
     printf("recv_size           : %d\n"  , ffrdp->recv_size           );
@@ -660,6 +678,11 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("counter_resend_fast : %u\n"  , ffrdp->counter_resend_fast );
     printf("counter_resend_ratio: %.2f%%\n", 100.0 * (ffrdp->counter_resend_rto + ffrdp->counter_resend_fast) / MAX(ffrdp->counter_send_1sttime, 1));
     printf("counter_reach_maxrto: %u\n"  , ffrdp->counter_reach_maxrto);
+    printf("counter_ack_recv    : %u\n"  , ffrdp->counter_ack_recv    );
+    printf("counter_ack_mack    : %u\n"  , ffrdp->counter_ack_mack    );
+    printf("counter_ack_hole    : %u\n"  , ffrdp->counter_ack_hole    );
+    printf("counter_rto_backoff : %u\n"  , ffrdp->counter_rto_backoff );
+    printf("counter_timeout_evt : %u\n"  , ffrdp->counter_timeout_evt );
     printf("counter_txfull      : %u\n"  , ffrdp->counter_txfull      );
     printf("counter_txshort     : %u\n"  , ffrdp->counter_txshort     );
     printf("counter_rxfull      : %u\n"  , ffrdp->counter_rxfull      );
