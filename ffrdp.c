@@ -174,6 +174,8 @@ typedef struct {
     uint32_t counter_ack_hole   ; // ack frames reporting a gap below the highest acked frame
     uint32_t counter_recv_ooo   ; // data frames that arrived out of order: there is a hole below them
     uint32_t counter_recv_far   ; // ... and they are more than 23 ahead of the hole, so the 24 bit ack mask cannot carry them
+    uint32_t rtt_min            ; // lowest round trip seen this interval: the path's floor, the number to judge latency by
+
     uint32_t counter_rto_backoff; // times the rto was multiplied
     uint32_t counter_timeout_evt; // updates in which at least one frame timed out
     uint32_t tick_last_upd  ;     // tick of the previous ffrdp_update call
@@ -741,6 +743,9 @@ void ffrdp_update(void *ctxt)
                 ffrdp_congestion_control(ffrdp, CEVENT_ACK_OK);
                 if (!(p->flags & FLAG_TIMEOUT_RESEND)) {
                     ffrdp->rttm = (int32_t)get_tick_count() - (int32_t)p->tick_send;
+                    // rttm above is only the latest sample despite its name; this is the one that says how
+                    // quick the path can be at all, and the one a queue on the path would show up in.
+                    if (ffrdp->rtt_min == 0 || ffrdp->rttm < ffrdp->rtt_min) ffrdp->rtt_min = ffrdp->rttm;
                     if (ffrdp->rtts == (uint32_t)-1) {
                         ffrdp->rtts = ffrdp->rttm;
                         ffrdp->rttd = ffrdp->rttm / 2;
@@ -921,6 +926,10 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     secs = ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_ffrdp_dump) / 1000;
     secs = secs ? secs : 1;
     printf("rttm: %u, rtts: %u, rttd: %u, rto: %u\n", ffrdp->rttm, ffrdp->rtts, ffrdp->rttd, ffrdp->rto);
+    // rttm is the LATEST sample (its name is misleading); rtt_min is the lowest of this interval, rtts the
+    // smoothed typical latency, rttd the jitter. rto is a timer, not a delay: never read it as latency.
+    printf("rtt_min, rtts, rttd: %u, %u, %u (min / typical / jitter, ms)\n",
+           ffrdp->rtt_min, ffrdp->rtts, ffrdp->rttd);
     printf("elapsed             : %d s (dump interval %d s)\n", ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_ffrdp_init) / 1000, secs);
     printf("total_send, total_recv: %.2fMB, %.2fMB\n"    , ffrdp->counter_send_bytes / (1024.0 * 1024), ffrdp->counter_recv_bytes / (1024.0 * 1024));
     printf("averg_send, averg_recv: %.2fKB/s, %.2fKB/s\n", ffrdp->counter_send_bytes / (1024.0 * secs), ffrdp->counter_recv_bytes / (1024.0 * secs));
