@@ -29,7 +29,7 @@ int main(int argc, char *argv[])
     int    spikep= argc > 11 ? atoi(argv[11]) : 0; // %,    share of packets hit by a delay spike
     int    spikem= argc > 12 ? atoi(argv[12]) : 0; // ms,   extra delay of a spike
     static unsigned char sbuf[64 * 1024], rbuf[64 * 1024];
-    struct { unsigned rto, fast, cwnd, ssth, wait, fail, rttd, maxrto, first, ack, mack, hole, tev, rbk, inflight, tx, rx, ooo, far, dup, adup, spur, rfl; } s0, s1;
+    struct { unsigned rto, fast, cwnd, ssth, wait, fail, rttd, maxrto, first, ack, mack, hole, tev, rbk, inflight, tx, rx, ooo, far, dup, adup, spur, rfl, flr; } s0, s1;
     FFRDPCONTEXT *c0, *c1;
     unsigned long r0 = 0, r1 = 0;
     int i, ret;
@@ -65,6 +65,14 @@ int main(int argc, char *argv[])
 #endif
 #ifdef RECV_OOO
     s0.ooo = c1->counter_recv_ooo; s0.far = c1->counter_recv_far; // c1's view of what c0 sent
+#endif
+#ifdef DUP_REPORT
+    s0.dup  = c1->counter_recv_dup; // what c1 actually received a second time
+    s0.adup = c0->counter_ack_dup;  // ... and what c0 was told about it
+    s0.flr  = c0->rto_floor;
+#endif
+#ifdef DUP_REPORT
+    printf("       rto_floor=%u ms (the peer called %u of our retransmits pointless)\n", s0.flr, s0.adup);
 #endif
 #ifdef SPUR
     s0.spur = c0->counter_rto_spurious; // pointless retransmits proven by timing
