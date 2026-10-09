@@ -123,9 +123,9 @@ typedef struct {
 #endif
 
     uint32_t counter_udpsenderr;
-    uint32_t counter_send_bytes;
-    uint32_t counter_recv_bytes;
-    uint32_t counter_send_1sttime;
+    uint32_t counter_send_bytes;   // payload of the frames the peer acked: bytes DELIVERED, not bytes put on the wire
+    uint32_t counter_recv_bytes;   // ... of the frames we acked
+    uint32_t counter_send_1sttime; // first transmissions: the denominator of counter_resend_ratio
     uint32_t counter_send_failed;
     uint32_t counter_send_query;
     uint32_t counter_resend_fast;
@@ -713,7 +713,14 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("counter_send_query  : %u\n"  , ffrdp->counter_send_query  );
     printf("counter_resend_rto  : %u\n"  , ffrdp->counter_resend_rto  );
     printf("counter_resend_fast : %u\n"  , ffrdp->counter_resend_fast );
+    // counter_resend_ratio is per first transmission: how many retransmits each attempt to send a frame
+    // turned into. it is not normalised by delivery, so a sender that is stalling (few attempts, few
+    // retransmits, little delivered) shows a flattering number. the two below are normalised, and they
+    // are the ones to read: how much of what went on the wire was a retransmission, and how many
+    // retransmits were spent per megabyte actually delivered.
     printf("counter_resend_ratio: %.2f%%\n", 100.0 * (ffrdp->counter_resend_rto + ffrdp->counter_resend_fast) / MAX(ffrdp->counter_send_1sttime, 1));
+    printf("counter_resend_waste: %.2f%%\n", 100.0 * (ffrdp->counter_resend_rto + ffrdp->counter_resend_fast) / MAX(ffrdp->counter_txfull, 1));
+    printf("counter_resend_perMB: %.1f\n"  , (ffrdp->counter_resend_rto + ffrdp->counter_resend_fast) * 1048576.0 / MAX(ffrdp->counter_send_bytes, 1));
     printf("counter_reach_maxrto: %u\n"  , ffrdp->counter_reach_maxrto);
     printf("counter_ack_recv    : %u\n"  , ffrdp->counter_ack_recv    );
     printf("counter_ack_mack    : %u\n"  , ffrdp->counter_ack_mack    );
