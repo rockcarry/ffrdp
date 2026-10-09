@@ -26,6 +26,7 @@ for t in $TESTS; do
         sed "s|#include \"../../ffrdp.c\"|#include \"ffrdp_$v.c\"|" $t.c > ${t}_$v.c
         EXTRA=""; grep -q counter_ack_recv ffrdp_$v.c && EXTRA="$EXTRA -DNEW_COUNTERS"
         grep -q counter_recv_ooo ffrdp_$v.c && EXTRA="$EXTRA -DRECV_OOO"
+        grep -q counter_recv_dup ffrdp_$v.c && EXTRA="$EXTRA -DDUP_REPORT"
         grep -q 'uint32_t rmss, smss, swnd, inflight' ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_INFLIGHT"
         eval gcc $CFLAGS $EXTRA ${t}_$v.c simnet.o -o ${t}_$v
     done

@@ -29,7 +29,7 @@ int main(int argc, char *argv[])
     int    spikep= argc > 11 ? atoi(argv[11]) : 0; // %,    share of packets hit by a delay spike
     int    spikem= argc > 12 ? atoi(argv[12]) : 0; // ms,   extra delay of a spike
     static unsigned char sbuf[64 * 1024], rbuf[64 * 1024];
-    struct { unsigned rto, fast, cwnd, ssth, wait, fail, rttd, maxrto, first, ack, mack, hole, tev, rbk, inflight, tx, rx, ooo, far; } s0, s1;
+    struct { unsigned rto, fast, cwnd, ssth, wait, fail, rttd, maxrto, first, ack, mack, hole, tev, rbk, inflight, tx, rx, ooo, far, dup, adup; } s0, s1;
     FFRDPCONTEXT *c0, *c1;
     unsigned long r0 = 0, r1 = 0;
     int i, ret;
@@ -58,13 +58,16 @@ int main(int argc, char *argv[])
     s1.maxrto = c1->counter_reach_maxrto;
     s0.tx = c0->counter_txfull; s0.rx = c1->counter_rxfull; // frames c0 sent vs frames c1 received: the real air loss
     s1.tx = c1->counter_txfull; s1.rx = c0->counter_rxfull;
-    s0.ooo = s0.far = 0;
+    s0.ooo = s0.far = s0.dup = s0.adup = 0;
 #ifdef NEW_COUNTERS
     s0.ack = c0->counter_ack_recv; s0.mack = c0->counter_ack_mack; s0.hole = c0->counter_ack_hole;
     s0.tev = c0->counter_timeout_evt; s0.rbk = c0->counter_rto_backoff;
 #endif
 #ifdef RECV_OOO
     s0.ooo = c1->counter_recv_ooo; s0.far = c1->counter_recv_far; // c1's view of what c0 sent
+#endif
+#ifdef DUP_REPORT
+    s0.dup = c1->counter_recv_dup; s0.adup = c0->counter_ack_dup; // duplicates reported back to c0
 #endif
 #ifdef HAVE_INFLIGHT
     s0.inflight = c0->inflight;
@@ -79,8 +82,8 @@ int main(int argc, char *argv[])
            r0 / 1048576.0, 100.0 * (s1.rto + s1.fast) / (s1.first ? s1.first : 1),
            s1.maxrto, sim_alloc() - sim_freed());
 #ifdef NEW_COUNTERS
-    printf("       c0 ack_recv=%u mack=%u hole=%u timeout_evt=%u rto_backoff=%u | peer recv_ooo=%u recv_far=%u\n",
-           s0.ack, s0.mack, s0.hole, s0.tev, s0.rbk, s0.ooo, s0.far);
+    printf("       c0 ack_recv=%u mack=%u hole=%u timeout_evt=%u rto_backoff=%u | peer recv_ooo=%u recv_far=%u | dup=%u ack_dup=%u\n",
+           s0.ack, s0.mack, s0.hole, s0.tev, s0.rbk, s0.ooo, s0.far, s0.dup, s0.adup);
 #endif
     printf("       air loss c0->c1=%.2f%% (%u/%u)  c1->c0=%.2f%% (%u/%u)\n",
            100.0 * (s0.tx - s0.rx) / (s0.tx ? s0.tx : 1), s0.rx, s0.tx,
