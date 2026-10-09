@@ -14,6 +14,7 @@ void  sim_begin(int idx);
 void  sim_config(double loss, int burst, int delay, int jitter);
 void  sim_shaper(double bytes_per_ms, int queue_bytes); // shared ack/data shaper, like an AP policing udp
 void  sim_policer(double bytes_per_ms, int burst_bytes); // token bucket on the direction sent by side 0, drops the burst excess
+void  sim_spike(int percent, int extra_ms);             // heavy tailed delay: a retry storm delays everything behind it
 void  sim_setstep(int step);
 void  sim_advance(uint32_t ms);      // jump the virtual clock forward
 void  sim_inject(int idx, void *buf, int len); // queue a raw packet for one side

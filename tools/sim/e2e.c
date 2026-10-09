@@ -26,6 +26,8 @@ int main(int argc, char *argv[])
     int    qmax  = argc > 8 ? atoi(argv[8]) : 0;   // KB,   shared shaper queue limit
     double pcap  = argc > 9 ? atof(argv[9]) : 0;   // KB/s, uplink token bucket rate (side 0), 0 = unlimited
     int    pburst= argc > 10 ? atoi(argv[10]) : 0; // KB,   token bucket depth
+    int    spikep= argc > 11 ? atoi(argv[11]) : 0; // %,    share of packets hit by a delay spike
+    int    spikem= argc > 12 ? atoi(argv[12]) : 0; // ms,   extra delay of a spike
     static unsigned char sbuf[64 * 1024], rbuf[64 * 1024];
     struct { unsigned rto, fast, cwnd, ssth, wait, fail, rttd, maxrto, first, ack, mack, hole, tev, rbk, inflight, tx, rx; } s0, s1;
     FFRDPCONTEXT *c0, *c1;
@@ -36,6 +38,7 @@ int main(int argc, char *argv[])
     sim_config(loss, burst, delay, jit);
     if (cap  > 0) sim_shaper (cap  * 1024.0 / 1000.0, qmax * 1024);  // KB/s -> bytes per ms
     if (pcap > 0) sim_policer(pcap * 1024.0 / 1000.0, pburst * 1024);
+    if (spikep > 0) sim_spike(spikep, spikem);
     c0 = ffrdp_init("127.0.0.1", 8001, NULL, NULL, 0, 1280, 0);
     c1 = ffrdp_init("127.0.0.1", 8002, NULL, NULL, 1, 1280, 0);
     if (!c0 || !c1) { printf("init failed\n"); return -1; }
@@ -63,10 +66,10 @@ int main(int argc, char *argv[])
     s0.inflight = c0->inflight;
 #endif
     ffrdp_free(c0); ffrdp_free(c1); // everything must be returned, so the residual is a leak
-    printf("loss=%.3f burst=%d delay=%d jit=%d cap=%.0fKB/s q=%dKB pol=%.0fKB/s/%dKB | "
+    printf("loss=%.3f burst=%d delay=%d jit=%d cap=%.0fKB/s q=%dKB pol=%.0fKB/s/%dKB spike=%d%%/%dms | "
            "c0 recv=%6.2fMB resend=%5.2f%% (rto %4u fast %4u) cwnd=%2u ssth=%2u wait=%3u fail=%4u rttd=%u | "
            "c1 recv=%6.2fMB resend=%5.2f%% maxrto=%u leaked=%lu\n",
-           loss, burst, delay, jit, cap, qmax, pcap, pburst,
+           loss, burst, delay, jit, cap, qmax, pcap, pburst, spikep, spikem,
            r1 / 1048576.0, 100.0 * (s0.rto + s0.fast) / (s0.first ? s0.first : 1),
            s0.rto, s0.fast, s0.cwnd, s0.ssth, s0.wait, s0.fail, s0.rttd,
            r0 / 1048576.0, 100.0 * (s1.rto + s1.fast) / (s1.first ? s1.first : 1),

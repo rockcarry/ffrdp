@@ -28,6 +28,8 @@ static double g_pcap = 0;     // policer rate, bytes per ms, 0 = unlimited
 static int    g_pburst = 0;   // token bucket depth in bytes
 static double g_ptok = 0;     // tokens left
 static int    g_plast = 0;    // tick of the last refill
+static int    g_spikep = 0;   // percent of packets hit by a delay spike
+static int    g_spikems = 0;  // extra delay of a spike, ms
 static unsigned long g_alloc = 0, g_freed = 0;
 
 uint32_t sim_tick(void) { return g_vtick; } // replaces get_tick_count() in ffrdp.c
@@ -51,6 +53,7 @@ void sim_reset(void)
     cursid = 0; gstep = 0; g_vtick = 0; gdelay = 0; gjitter = 0; gburst = 0;
     g_cap = 0; g_qmax = 0; g_busy = 0; g_qbytes = 0;
     g_pcap = 0; g_pburst = 0; g_ptok = 0; g_plast = 0;
+    g_spikep = 0; g_spikems = 0;
     g_alloc = g_freed = 0;
 }
 
@@ -74,6 +77,15 @@ void sim_shaper(double bytes_per_ms, int queue_bytes)
 void sim_policer(double bytes_per_ms, int burst_bytes)
 {
     g_pcap = bytes_per_ms; g_pburst = burst_bytes; g_ptok = burst_bytes; g_plast = 0;
+}
+
+// A small fraction of the packets is delayed a lot (a retry storm on the air).
+// Because everything behind it is pushed back as well, the rtt distribution gets a
+// long tail - and the frames that hit that tail are exactly the ones that time out,
+// so they never enter the rtt samples (Karn). That is what keeps rto too small.
+void sim_spike(int percent, int extra_ms)
+{
+    g_spikep = percent; g_spikems = extra_ms;
 }
 
 void sim_begin(int idx) { cursid = idx; }
@@ -109,6 +121,10 @@ static void push(int idx, void *buf, int len, unsigned k)
     due  = start + gdelay + (gjitter > 0 ? (int)(hash(k, 7 + idx) % (unsigned)(gjitter + 1)) : 0);
     prev = (qt[idx] + MAXQ - 1) % MAXQ;
     if (qn[idx] > 0 && due < q[idx][prev].due) due = q[idx][prev].due; // keep fifo order
+    // a small share of packets is delayed a lot on its own. Those frames time out, and
+    // because Karn drops the samples of retransmitted frames, the long tail never reaches
+    // rtts/rttd - so rto stays tuned to the fast part and the tail keeps timing out.
+    if (g_spikep > 0 && (int)(hash(k, 3 + idx) % 100u) < g_spikep) due += g_spikems;
     q[idx][qt[idx]].due = due;
     qt[idx] = (qt[idx] + 1) % MAXQ; qn[idx]++;
 }
