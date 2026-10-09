@@ -48,14 +48,13 @@ static uint32_t get_tick_count()
 // cannot serve as one: it is handed out again on every ack, so a limit placed on it never binds (measured:
 // 63 frames in flight while the cap read 22). Measured on the target path: link ~365KB/s, idle round trip
 // 5..16ms, so the bandwidth-delay product is 1..6 frames -- and the standing queue we were holding came
-// from keeping 64 of them in flight, which is exactly the 219ms the ping sees while the test runs. 16 is
-// several times the product, so it cannot starve the link, and it should take that 219ms down to ~50ms.
-// Try 8 to push further (still above the product); override with -DFFRDP_INFLIGHT_MAX=n.
+// from keeping 64 of them in flight, which is exactly the 219ms the ping sees while the test runs.
 #define FFRDP_INFLIGHT_MAX   64   // default ceiling for frames on the wire. The number that is useful on a
                                   // given path cannot be picked in advance: the simulator (fast links, coarse
                                   // acks) breaks below 64, while the target path needs 2..6 to stop holding a
                                   // 219ms queue. So the default is the harmless value, and the probe (see
                                   // FFRDP_PROBE_ENABLE) is what experiments its way down to the right one.
+                                  // It is a source constant, not a build switch: change it here and rebuild.
 
 // the delay probe: take half the in-flight away for a moment and watch whether the round trip follows.
 #define FFRDP_PROBE_HOLD_MS       500 // held for 2 round trips plus this much, long enough to drain a queue
@@ -63,19 +62,20 @@ static uint32_t get_tick_count()
 #define FFRDP_PROBE_RATE_KEEP_PCT 85  // ... while the rate the peer confirms stays above this percentage
 #define FFRDP_PROBE_ENABLE        1   // on by default: it is a net win wherever a queue is being held, and
                                       // where there is none the rate guard reverts it and nothing is lost.
-                                      // set to 0 only to compare against the behaviour without it.
-                                      // path the experiment answered "the delay is not ours" (halving the
-                                      // frames in flight left the lowest round trip unchanged), so there is
-                                      // nothing left for it to win, only the cost of running it. turn it on
-                                      // to ask the same question of a new path.
+                                      // it is also how a new path gets asked "is the delay ours?", so it is
+                                      // left on rather than built specially for the question.
+// the queue test: how far the typical round trip sits above the path's own floor is what decides whether an
+// experiment is worth running. at 4x the probe stops asking while the excess is merely smaller, not gone:
+// on the target path it converged to rtts 12~19ms over a 4ms floor, i.e. 3~4.75x, and the 4x gate then left
+// it idle although a queue it could still have halved was there. 3x asks the question one step closer to
+// the floor. being curious here stays safe because the answer must still pass the same two guards (the round
+// trip must fall, the confirmed rate must hold) and a failed question doubles the gap -- so the cost is
+// bounded by one half window per back off, never by a permanently smaller pipe.
+#define FFRDP_PROBE_QUEUE_RATIO   3
 #define FFRDP_PROBE_WASTE_PM      5   // retransmits per thousand first transmissions, over the last second
-#define FFRDP_PROBE_MIN_RTT_MS    50  // ... on a path slow enough for the delay to be worth attacking. what a
-                                      // probe can win is bounded by the round trip itself, so a path that is
-                                      // already quick is left alone -- which is also what keeps clean links
-                                      // out of the experiment entirely.
-#define FFRDP_PROBE_MIN_WIN       8   // ... at least this many of them, so one out of a handful of frames
-                                      //     in a short window cannot look like a wasted path
-#define FFRDP_PROBE_MIN_OUT       8   // ... and has a pipe worth halving
+#define FFRDP_PROBE_MIN_OUT       8   // ... at least this many frames on the wire, so there is a pipe worth
+                                      //     halving. two older gates -- "rttm >= 50ms" and "enough retransmits
+                                      //     in the window" -- were replaced by the queue test and are gone.
 #define FFRDP_PROBE_GAP_MS        10000
 #define FFRDP_PROBE_GAP_MAX_MS    60000
 #define FFRDP_PROBE_HEALTHY_PCT   1   // below this much waste the kept window is given back a little
@@ -897,7 +897,8 @@ void ffrdp_update(void *ctxt)
                 // weaker trigger -- on this path it is down to a few per mille once the floor is up -- so it
                 // stays only as a second way in for paths whose floor is already low.
                 if (FFRDP_PROBE_ENABLE && out >= FFRDP_PROBE_MIN_OUT &&
-                    ((ffrdp->rtt_min && ffrdp->rtts != (uint32_t)-1 && ffrdp->rtts > 4 * ffrdp->rtt_min) ||
+                    ((ffrdp->rtt_min && ffrdp->rtts != (uint32_t)-1 &&
+                      ffrdp->rtts > FFRDP_PROBE_QUEUE_RATIO * ffrdp->rtt_min) ||
                      waste >= FFRDP_PROBE_WASTE_PM)) {
                     uint32_t rtt = (ffrdp->rtts == (uint32_t)-1 || ffrdp->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : ffrdp->rtts;
                     ffrdp->probe_state   = 1;
@@ -969,8 +970,8 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("rttm: %u, rtts: %u, rttd: %u, rto: %u\n", ffrdp->rttm, ffrdp->rtts, ffrdp->rttd, ffrdp->rto);
     // which binary is this? the compile stamp makes a stale executable impossible to mistake for a fresh
     // one: if this time is older than the build you just ran, you are running something else.
-    printf("build               : probe %d, inflight default %u, compiled %s %s\n",
-           FFRDP_PROBE_ENABLE, (uint32_t)FFRDP_INFLIGHT_MAX, __DATE__, __TIME__);
+    printf("build               : probe %d, queue ratio %u, inflight default %u, compiled %s %s\n",
+           FFRDP_PROBE_ENABLE, (uint32_t)FFRDP_PROBE_QUEUE_RATIO, (uint32_t)FFRDP_INFLIGHT_MAX, __DATE__, __TIME__);
     // rttm is the LATEST sample (its name is misleading); rtt_min is the lowest of this interval, rtts the
     // smoothed typical latency, rttd the jitter. rto is a timer, not a delay: never read it as latency.
     printf("rtt_min, rtts, rttd : %u, %u, %u (min / typical / jitter, ms)\n",
@@ -996,17 +997,21 @@ void ffrdp_dump(void *ctxt, int clearhistory)
         printf("in-flight limit     : %u frames (default %u; the probe lowers it when it proves a win)\n",
                ffrdp->inflight_max ? ffrdp->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX,
                (uint32_t)FFRDP_INFLIGHT_MAX);
-        // what the probe's trigger sees at the moment it is asked: need is retransmits, first is first
-        // transmissions, both since the evidence window last closed, and out is what is on the wire.
-        printf("probe trigger       : waste %u per mille, rttm %u, out %u (needs %u pm, %u ms, %u frames)\n",
-               ffrdp->probe_waste, ffrdp->rttm, out,
-               FFRDP_PROBE_WASTE_PM, FFRDP_PROBE_MIN_RTT_MS, FFRDP_PROBE_MIN_OUT);
-        // the queue test, which is what actually earns a probe: typical round trip against the path's own
-        // floor. >=4x means a queue is being held, and that is the number to watch fall when the probe wins.
-        printf("queue test          : rtts %u vs rtt_min %u -> %ux (probe needs >4x, or waste >= %u pm)\n",
+        // what the probe's trigger sees at the moment it is asked: waste is retransmits per mille over the
+        // last second, out is what is on the wire, and the queue test is the typical round trip against the
+        // path's own floor -- that is the gate which actually earns a probe (the old "rttm >= 50ms" line
+        // printed here had stopped being a gate when the queue test replaced it).
+        printf("probe trigger       : waste %u pm, rtts/rtt_min %u/%u, out %u (needs %u pm, >%ux, %u frames)\n",
+               ffrdp->probe_waste, ffrdp->rtts, ffrdp->rtt_min, out,
+               FFRDP_PROBE_WASTE_PM, FFRDP_PROBE_QUEUE_RATIO, FFRDP_PROBE_MIN_OUT);
+        // 1x is the floor itself, and that is the number to watch fall when the probe wins. rtts is
+        // smoothed across intervals while rtt_min is the lowest of this one, so rtts can legitimately read
+        // below the floor; printing that as 0x would read like a fault, so anything at or under it shows 1x.
+        printf("queue test          : rtts %u vs rtt_min %u -> %ux (probe needs >%ux, or waste >= %u pm)\n",
                ffrdp->rtts, ffrdp->rtt_min,
-               ffrdp->rtt_min && ffrdp->rtts != (uint32_t)-1 ? ffrdp->rtts / ffrdp->rtt_min : 0,
-               FFRDP_PROBE_WASTE_PM);
+               (ffrdp->rtt_min && ffrdp->rtts != (uint32_t)-1 && ffrdp->rtts > ffrdp->rtt_min)
+                   ? ffrdp->rtts / ffrdp->rtt_min : 1,
+               FFRDP_PROBE_QUEUE_RATIO, FFRDP_PROBE_WASTE_PM);
         printf("probe rtt ref/best  : %u, %u\n",
                ffrdp->probe_rtt_ref, ffrdp->probe_best == 0xFFFFFFFF ? 0 : ffrdp->probe_best);
         printf("confirmed rate      : %u frames/s\n", ffrdp->rate_now);
