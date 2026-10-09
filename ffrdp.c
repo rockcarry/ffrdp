@@ -45,7 +45,7 @@ static uint32_t get_tick_count()
 #define FFRDP_MAX_CWND_SIZE  64
 #define FFRDP_RTO_FLOOR_MAX  1000 // ms: a longer repair delay than this is never worth paying
 #define FFRDP_RTO_WIN        128  // retransmits per evidence window, so the loop reacts in about a second
-#define FFRDP_WASTE_MIN      32   // retransmits a window must contain before it is allowed to decide anything
+#define FFRDP_WASTE_MIN      16   // retransmits a window must contain before it is allowed to decide anything
 #define FFRDP_WASTE_HI       80   // % of our retransmits the peer already had => the rto is sitting too short
 #define FFRDP_WASTE_LO       40   // % below which the repairs are real and the floor is given back
 #define FFRDP_RECVBUF_SIZE  (128 * (FFRDP_MAX_MSS + 0))
@@ -609,7 +609,11 @@ void ffrdp_update(void *ctxt)
                 got_timeout = 1;
             } else {
                 p->flags &= ~(FLAG_FAST_RESEND|FLAG_TIMEOUT_RESEND);
+                // count fast retransmits in the same evidence window as the timeout ones: they are
+                // retransmits like any other, and on a link with reordering they are where most of the
+                // waste sits (the peer confirms almost all of them as duplicates).
                 ffrdp->counter_resend_fast++;
+                ffrdp->win_need++;
             }
             p->tick_timeout+= ffrdp->rto;
         }
@@ -715,7 +719,7 @@ void ffrdp_update(void *ctxt)
                                     // a floor far above the link's own round trip buys less than it costs: keep
                                     // the repair delay bounded relative to the baseline as well
                                     {   uint32_t rtt = (ffrdp->rtts == (uint32_t)-1 || ffrdp->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : ffrdp->rtts;
-                                        uint32_t cap = MAX(4 * rtt, 200u);
+                                        uint32_t cap = MAX(3 * rtt, 100u);
                                         if (ffrdp->rto_floor > cap) ffrdp->rto_floor = cap;
                                     }
                                 } else if (waste < FFRDP_WASTE_LO) {
