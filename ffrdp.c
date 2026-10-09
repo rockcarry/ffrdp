@@ -111,6 +111,7 @@ typedef struct {
     uint32_t rto_floor;           // persistent lower bound on the rto, moved only by the peer's duplicate reports
     uint32_t win_need, win_dup;   // retransmits attempted in this evidence window, and how many the peer called pointless
     uint32_t tick_win;            // when the current evidence window was opened
+    uint32_t hole_wait;           // ms a frame must be outstanding before a reported hole is believed
     uint32_t tick_recv_ack;
     uint32_t tick_send_query;
     uint32_t tick_ffrdp_dump;
@@ -716,6 +717,14 @@ void ffrdp_update(void *ctxt)
                             ffrdp->tick_win = get_tick_count();
                             if (ffrdp->win_need >= FFRDP_WASTE_MIN) {
                                 uint32_t waste = ffrdp->win_need ? ffrdp->win_dup * 100 / ffrdp->win_need : 0;
+                                // the same evidence decides how much to trust a hole the peer reports: when it
+                                // calls most of our repairs pointless, those holes are mostly frames that were
+                                // overtaken on the way, so the fast path should wait; when the repairs are
+                                // real, it must not wait at all.
+                                {   uint32_t rtt = (ffrdp->rtts == (uint32_t)-1 || ffrdp->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : ffrdp->rtts;
+                                    ffrdp->hole_wait = (waste >= FFRDP_WASTE_HI) ? MIN(3 * rtt, 300u)
+                                                     : (waste <  FFRDP_WASTE_LO) ? 0 : rtt;
+                                }
                                 if (waste >= FFRDP_WASTE_HI) {
                                     if (ffrdp->rto_floor < ffrdp->rto) ffrdp->rto_floor = ffrdp->rto;
                                     ffrdp->rto_floor = MIN(ffrdp->rto_floor * 5 / 4, (uint32_t)FFRDP_RTO_FLOOR_MAX);
@@ -744,8 +753,16 @@ void ffrdp_update(void *ctxt)
                 }
                 t = p; p = p->next; list_remove(&ffrdp->send_list_head, &ffrdp->send_list_tail, t); continue;
             } else if (seq_distance(maxack, GET_FRAME_SEQ(p)) > 0) {
-                ffrdp_congestion_control(ffrdp, CEVENT_FAST_RESEND);
-                p->flags |= FLAG_FAST_RESEND;
+                // the peer reported something above this frame, so it is either lost or merely late.
+                // how long to wait before believing it is not a guess: it comes from the peer's own
+                // duplicate reports (hole_wait, set once per evidence window). on a link where the peer
+                // keeps confirming our retransmits as duplicates, holes are usually just frames that were
+                // overtaken on the way, so wait; where the retransmits are really repairing something,
+                // hole_wait is zero and this reacts exactly as before.
+                if ((int32_t)get_tick_count() - (int32_t)p->tick_send >= (int32_t)ffrdp->hole_wait) {
+                    ffrdp_congestion_control(ffrdp, CEVENT_FAST_RESEND);
+                    p->flags |= FLAG_FAST_RESEND;
+                }
             }
             p = p->next;
         }
