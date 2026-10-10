@@ -1115,7 +1115,9 @@ REF=/path/to/ffrdp.c TESTS=e2e bash tools/sim/run.sh
 
 ### 10.3 待办（小项）
 
-- **`test.c` 的两处小不一致** ✗：启动横幅仍印 `ffrdp test program - v1.0.0`，
-  用法行印的是 `usage: ffrdp_test ...` 而二进制名是 `test_ffrdp` ——
-  下次动 `test.c` 时顺手改成 `v1.1.0` 与正确名字 ✓（`build.sh` 生成的 `libffrdp.pc` 里已是 `Version: 1.1.0` ✓）。
 - **下一轮上机**：24 位乱序掩码 → `ACK2`（64 位），或 pacing（见 `ffrdp-protocol.md` 10.7）✓。
+
+> 原先记在下面这一条的小项**已完成，按规则从待办里删掉** ✓：`test.c` 启动横幅的版本号
+> 与用法行的二进制名 —— 现已改为 `v1.1.0`（常量 `TEST_VERSION`）与按 `argv[0]` 打印的程序名
+>（接续行按名字长度对齐 ✓，改名 / 软链 / 绝对路径 / 走 `PATH` 都对得上 ✓），
+> 用法行也列出了全部四个选项与默认值 ✓。
