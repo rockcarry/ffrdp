@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include <pthread.h>
 #include "ffrdp.h"
 
@@ -12,6 +13,7 @@
 #define get_tick_count GetTickCount
 #define strtok_r strtok_s
 #else
+#include <sys/select.h>
 static uint32_t get_tick_count()
 {
     struct timespec ts;
@@ -24,8 +26,20 @@ static uint32_t get_tick_count()
 #define TEST_DUMP_INTERVAL_MS   10000   // 每隔这么久打印一次诊断
 #define TEST_PEER_SILENCE_MS     2000   // 这么久没收到对端数据就认为它失联（见 peer_is_lost）
 #define TEST_SPEED_INTERVAL_MS   1000   // 发送限速：每这么久补一次令牌（见 peer_thread）
+#define TEST_STREAM_MAX        (256 * 1024) // 接收侧累积缓冲：ffrdp_recv 是字节流，消息要自己拼回来
 
-static int  g_exit = 0;
+// 每条消息的格式（全部小端）：
+//   [4B 总长 len][4B seq][payload...][4B crc32]      len = 整条消息字节数（含头尾）
+//   crc32 覆盖 len + seq + payload（不含 crc 自身）
+// ffrdp_recv 是"有序可靠字节流"（没有消息边界），所以必须自带定长头才能解析。
+// ffrdp_send 是原子的（要么整条接受、要么返回 -1），所以 seq 只在 ret == len 时才 +1。
+#define TEST_MSG_OVERHEAD        12
+
+static volatile sig_atomic_t g_exit = 0;
+
+// Ctrl+C / kill：信号处理里只做一件安全的事 —— 置标志。两个对等端线程会自己收尾
+// （打印 verify 汇总、ffrdp_free），main 在下面的 select 超时里看到它之后开始 join。
+static void on_stop_signal(int sig) { (void)sig; g_exit = 1; }
 static char server_bind_ip[32]   = "0.0.0.0";
 static char client_cnnt_ip[32]   = "127.0.0.1";
 static int  server_bind_port     = 8000;
@@ -43,19 +57,122 @@ typedef struct {
     int         is_server; // 传给 ffrdp_init：1 = 服务端，0 = 客户端
     char       *ip;        // 绑定 / 连接地址
     int        *port;      // 端口（指向命令行解析出来的全局变量）
-    int        *send_size; // 本端每次发送的最大字节数
-    int        *recv_size; // 本端接收缓冲大小（= 对端每次发送的上限）
+    int        *send_size; // 本端每条消息的最大字节数（含 framing 头尾）
     int        *send_speed;// 发送限速 KB/s（0 = 不限速），指向命令行解析出来的全局变量
 } TEST_PEER;
 
 static TEST_PEER g_peers[] = {
     { "server", "client", "client connected !"    , 1, server_bind_ip, &server_bind_port,
-      &server_max_send_size, &client_max_send_size, &send_speed },
+      &server_max_send_size, &send_speed },
     { "client", "server", "connect to server ok !", 0, client_cnnt_ip, &client_cnnt_port,
-      &client_max_send_size, &server_max_send_size, &send_speed },
+      &client_max_send_size, &send_speed },
 };
 #define TEST_PEER_SERVER  (&g_peers[0])
 #define TEST_PEER_CLIENT  (&g_peers[1])
+
+// ---------------------------------------------------------------- 校验相关的工具
+
+static uint32_t g_crc_table[256];
+
+static void crc32_init(void) // CRC-32 (IEEE 802.3)，查表，只在 main 里调用一次
+{
+    uint32_t i, j, c;
+    for (i = 0; i < 256; i++) {
+        for (c = i, j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        g_crc_table[i] = c;
+    }
+}
+
+static uint32_t crc32(const uint8_t *buf, int len)
+{
+    uint32_t c = 0xFFFFFFFFu;
+    int i;
+    for (i = 0; i < len; i++) c = g_crc_table[(c ^ buf[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+static uint32_t xs32(uint32_t *s) // 小而快的伪随机（rand() 在回环速率下会成为瓶颈）
+{
+    *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5;
+    return *s;
+}
+
+static void put32(uint8_t *p, uint32_t v) { p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24); }
+static uint32_t get32(const uint8_t *p)   { return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24); }
+
+// 生成 seq 号消息到 buf，返回整条长度（≤ buf_max）；失败返回 -1
+static int msg_build(uint8_t *buf, int buf_max, uint32_t seq, int max_payload, uint32_t *rnd)
+{
+    int paylen, total, i;
+    if (buf_max <= TEST_MSG_OVERHEAD || max_payload < 1) return -1;
+    if (max_payload > buf_max - TEST_MSG_OVERHEAD) max_payload = buf_max - TEST_MSG_OVERHEAD;
+    paylen = 1 + (int)(xs32(rnd) % (uint32_t)max_payload);
+    total  = TEST_MSG_OVERHEAD + paylen;
+    put32(buf + 0, (uint32_t)total);
+    put32(buf + 4, seq);
+    for (i = 0; i < paylen; i += 4) {
+        uint32_t r = xs32(rnd); int left = paylen - i;
+        if (left >= 4) { buf[8+i]=(uint8_t)r; buf[9+i]=(uint8_t)(r>>8); buf[10+i]=(uint8_t)(r>>16); buf[11+i]=(uint8_t)(r>>24); }
+        else memcpy(buf + 8 + i, &r, (size_t)left);
+    }
+    put32(buf + 8 + paylen, crc32(buf, 8 + paylen));
+    return total;
+}
+
+// 校验状态（每个线程一份）
+typedef struct {
+    uint32_t sent_msgs, sent_bytes;   // 已确认交给协议的消息数 / 字节数
+    uint32_t recv_msgs, recv_bytes;   // 已校验通过的消息数 / 字节数
+    uint32_t seq_base, seq_last;      // 对端 seq 的基准与最近一个
+    int      seq_have;
+    uint32_t seq_gap, seq_missing;    // 序号缺口次数 / 累计缺失条数
+    uint32_t crc_err, len_err, partial_err;
+    uint32_t log_seq, log_crc, log_len, log_part; // 每类错误的打印计数（限流用）
+} TEST_VERIFY;
+
+static void verify_log(const char *name, const char *peer, const char *what,
+                       uint32_t a, uint32_t b, uint32_t *slot)
+{
+    if (*slot < 3) {
+        printf("[%s] VERIFY %s: %s (a=%u b=%u)\n", name, peer, what, a, b);
+    } else if (*slot == 3) {
+        printf("[%s] VERIFY %s: %s ... > 3 次，后续同类不再逐条打印（见退出汇总）\n", name, peer, what);
+    }
+    (*slot)++;
+}
+
+// 从流里尽量多地解析出完整消息，返回消耗掉的字节数
+static int msg_parse(TEST_VERIFY *v, const char *name, const char *peer, const uint8_t *s, int n)
+{
+    int off = 0;
+    while (n - off >= TEST_MSG_OVERHEAD) {
+        uint32_t len = get32(s + off), seq = get32(s + off + 4);
+        if (len < TEST_MSG_OVERHEAD || len > TEST_STREAM_MAX) {
+            // 长度不合法 ⇒ 流已经失步，无法可靠恢复，报一次并停止解析（正常时不该出现）
+            verify_log(name, peer, "bad length, stream lost sync", len, (uint32_t)TEST_STREAM_MAX, &v->log_len);
+            v->len_err++;
+            break;
+        }
+        if ((uint32_t)(n - off) < len) break;      // 这一条还没收齐，等下一轮
+        if (crc32(s + off, (int)len - 4) != get32(s + off + len - 4)) {
+            // 长度可信 ⇒ 边界还是对齐的，跳过这一条继续（不放弃整条流）
+            verify_log(name, peer, "crc mismatch", seq, len, &v->log_crc);
+            v->crc_err++;
+            off += (int)len;
+            continue;
+        }
+        if (!v->seq_have) { v->seq_have = 1; v->seq_base = v->seq_last = seq; }
+        else if (seq != v->seq_last + 1) {
+            uint32_t missing = seq - v->seq_last - 1;   // 中间缺了几条（回绕安全）
+            v->seq_gap++; v->seq_missing += missing;
+            verify_log(name, peer, "seq gap", v->seq_last, seq, &v->log_seq);
+            v->seq_last = seq;
+        } else v->seq_last = seq;
+        v->recv_msgs++; v->recv_bytes += len;
+        off += (int)len;
+    }
+    return off;
+}
 
 // 对端是否已失联：协议自己这么判定，或者我们已经很久没收到它的任何数据。
 // 两侧用同一个判据（历史上只有客户端有"看多久没收到数据"这一半）。
@@ -65,21 +182,23 @@ static int peer_is_lost(void *ffrdp, uint32_t tick_recv)
     return (int32_t)get_tick_count() - (int32_t)tick_recv > TEST_PEER_SILENCE_MS;
 }
 
-// 服务端与客户端共用的主循环：不停地发随机长度的数据、收对端数据、定期打出诊断。
+// 服务端与客户端共用的主循环：不停地发随机长度的消息、收对端消息并逐条校验、定期打诊断。
 static void* peer_thread(void *param)
 {
     const TEST_PEER *peer = (const TEST_PEER*)param;
-    const int send_max = *peer->send_size;
-    const int recv_max = *peer->recv_size;
     const uint32_t quota = (uint32_t)*peer->send_speed * 1024; // 每秒允许发送的字节数，0 = 不限速
-    uint8_t *sendbuf = malloc(send_max);
-    uint8_t *recvbuf = malloc(recv_max);
+    int      send_max = *peer->send_size;
+    uint8_t *sendbuf = NULL, *stream = NULL;
     void    *ffrdp   = NULL;
-    uint32_t tick_dump, tick_recv = 0;
-    uint32_t tick_speed, tokens;
-    int      size, ret, connected = 0;
+    uint32_t tick_dump, tick_recv = 0, tick_speed, tokens, rnd = 0x12345678u, seq = 1;
+    int      ret, connected = 0, stream_len = 0, msg_len = 0, max_payload;
+    TEST_VERIFY v;
 
-    if (!sendbuf || !recvbuf) {
+    memset(&v, 0, sizeof(v));
+    if (send_max < TEST_MSG_OVERHEAD + 1) send_max = TEST_MSG_OVERHEAD + 1; // 至少装得下一条最小消息
+    sendbuf = malloc((size_t)send_max);
+    stream  = malloc(TEST_STREAM_MAX);
+    if (!sendbuf || !stream) {
         printf("%s failed to allocate send or recv buffer !\n", peer->name);
         goto done;
     }
@@ -94,10 +213,9 @@ static void* peer_thread(void *param)
         }
 
         // 发送限速（令牌桶）：每 TEST_SPEED_INTERVAL_MS 把令牌补满一个周期的额度，
-        // 桶的上限就是这一个周期的量（不跨周期累积 ⇒ 不会攒出突发）；
-        // 额度不够一包时把这一包裁到剩余额度，而不是整包跳过 —— 否则当随机包长普遍大于
-        // 周期额度时会长期发不出去（额度攒着、尺寸又总对不上）；
-        // 只有真的入队成功了才扣令牌（被背压退回的那些不算已发送）。
+        // 桶的上限就是这一个周期的量（不跨周期累积 ⇒ 不会攒出突发）。
+        // 有了消息 framing 之后不能再"把一包裁到剩余额度"（那会把一条消息截断），
+        // 所以改成"按剩余额度**选**这一条消息的大小"：额度不够装最小一条就先不发。
         if (quota) {
             if ((int32_t)get_tick_count() - (int32_t)tick_speed >= TEST_SPEED_INTERVAL_MS) {
                 tick_speed += TEST_SPEED_INTERVAL_MS;
@@ -105,28 +223,55 @@ static void* peer_thread(void *param)
             }
         }
 
-        size = 1 + rand() % send_max;
-        if (quota == 0) {
-            // 不限速：照旧（发送失败只可能是应用侧队列满，属正常背压，不打印）
-            (void)ffrdp_send(ffrdp, (char*)sendbuf, size);
-        } else if (tokens) {
-            if ((uint32_t)size > tokens) size = (int)tokens; // 裁到本周期还剩的额度
-            if (ffrdp_send(ffrdp, (char*)sendbuf, size) == size) tokens -= (uint32_t)size;
-        }
-        // tokens 为 0：本周期额度用完 ⇒ 这一轮只收不发，协议照常 update
-
-        ret = ffrdp_recv(ffrdp, (char*)recvbuf, recv_max);
-        if (ret > 0) {
-            if (connected == 0) {
-                connected = 1;
-                printf("%s\n", peer->msg_up);
+        if (msg_len == 0) {   // 上一条已经发出去了，生成下一条（失败重试时必须原样重发，不能重新生成）
+            int room = 1;
+            max_payload = send_max - TEST_MSG_OVERHEAD;
+            if (quota) {
+                if (tokens <= TEST_MSG_OVERHEAD) room = 0; // 本周期额度装不下最小一条 ⇒ 这轮不发
+                else if (tokens - TEST_MSG_OVERHEAD < (uint32_t)max_payload) max_payload = (int)(tokens - TEST_MSG_OVERHEAD);
             }
-            tick_recv = get_tick_count();
-            if ((int32_t)get_tick_count() - (int32_t)tick_dump > TEST_DUMP_INTERVAL_MS) {
-                pthread_mutex_lock(&g_mutex);
-                ffrdp_dump(ffrdp, 0);
-                pthread_mutex_unlock(&g_mutex);
-                tick_dump = get_tick_count();
+            if (room) msg_len = msg_build(sendbuf, send_max, seq, max_payload, &rnd);
+            if (msg_len < 0) msg_len = 0;   // 不该发生；当作"这轮不发"，下一轮重来（绝不能留成负数）
+        }
+
+        if (msg_len > 0) {
+            ret = ffrdp_send(ffrdp, (char*)sendbuf, msg_len);
+            if (ret == msg_len) {                       // 整条被接受
+                v.sent_msgs++; v.sent_bytes += (uint32_t)msg_len;
+                if (quota) tokens -= (uint32_t)msg_len;
+                seq++; msg_len = 0;
+            } else if (ret > 0) {                       // 0 < ret < len：send 是原子的，这不该发生
+                verify_log(peer->name, peer->peer, "partial send (ffrdp_send is atomic, this cannot happen)",
+                           (uint32_t)ret, (uint32_t)msg_len, &v.log_part);
+                v.partial_err++;
+                msg_len = 0;                            // 没法安全重发，丢掉这一条（并留下告警）
+            }
+            // ret == -1：队列满（正常背压）⇒ 什么都不动，下一轮原样重试这一条
+        }
+        // tokens 不够装下最小一条消息时 msg_len 会是 0 ⇒ 这一轮只收不发，协议照常 update
+
+        if (stream_len < TEST_STREAM_MAX) {
+            ret = ffrdp_recv(ffrdp, (char*)stream + stream_len, TEST_STREAM_MAX - stream_len);
+            if (ret > 0) {
+                stream_len += ret;
+                if (connected == 0) {
+                    connected = 1;
+                    printf("%s\n", peer->msg_up);
+                }
+                tick_recv = get_tick_count();
+                if ((int32_t)get_tick_count() - (int32_t)tick_dump > TEST_DUMP_INTERVAL_MS) {
+                    pthread_mutex_lock(&g_mutex);
+                    ffrdp_dump(ffrdp, 0);
+                    pthread_mutex_unlock(&g_mutex);
+                    tick_dump = get_tick_count();
+                }
+            }
+        }
+        if (stream_len > 0) {   // 每轮都试着解析（不足一条时这个循环体不会进入）
+            int used = msg_parse(&v, peer->name, peer->peer, stream, stream_len);
+            if (used > 0) {
+                memmove(stream, stream + used, (size_t)(stream_len - used));
+                stream_len -= used;
             }
         }
 
@@ -135,12 +280,21 @@ static void* peer_thread(void *param)
             printf("%s lost !\n", peer->peer);
             ffrdp_free(ffrdp); ffrdp = NULL;
             connected = 0;
+            stream_len = 0; v.seq_have = 0;   // 重新建连 ⇒ 对端从新的流开始，基准要重新取
         }
     }
 
 done:
+    printf("[%s] verify: sent %u msgs / %u B, recv %u msgs / %u B | seq_gap %u (missing %u), crc_err %u, len_err %u, partial_err %u\n",
+           peer->name, v.sent_msgs, v.sent_bytes, v.recv_msgs, v.recv_bytes,
+           v.seq_gap, v.seq_missing, v.crc_err, v.len_err, v.partial_err);
+    if (v.crc_err || v.len_err || v.partial_err || v.seq_gap) {
+        printf("[%s] verify: *** 校验未通过 *** ✗\n", peer->name);
+    } else if (v.recv_msgs) {
+        printf("[%s] verify: OK —— 收到的 %u 条消息 seq 连续、crc 全部正确 ✓\n", peer->name, v.recv_msgs);
+    }
     free(sendbuf);
-    free(recvbuf);
+    free(stream);
     ffrdp_free(ffrdp);
     return NULL;
 }
@@ -160,13 +314,15 @@ int main(int argc, char *argv[])
         printf("\n");
         printf("  --server[=ip:port]            run as server    (default 0.0.0.0:8000)\n");
         printf("  --client[=ip:port]            run as client    (default 127.0.0.1:8000)\n");
-        printf("  --server_max_send_size=N      server max bytes per send (default 16384)\n");
-        printf("  --client_max_send_size=N      client max bytes per send (default 16384)\n");
+        printf("  --server_max_send_size=N      server max bytes per message (default 16384)\n");
+        printf("  --client_max_send_size=N      client max bytes per message (default 16384)\n");
         printf("  --send_speed=N                limit this process to N KB/s (default 0 = unlimited)\n");
         printf("\n");
+        printf("  every message is [len][seq][payload][crc32] and is checked at the receiver:\n");
+        printf("  seq continuity + crc + no partial send; a summary is printed at exit.\n");
         printf("  the two roles may be given together (self test on one host) - the send rate\n");
-        printf("  limit then applies to both; type 'quit' or 'exit' to stop; a diagnostic dump\n");
-        printf("  is printed every 10 s.\n");
+        printf("  limit then applies to both; type 'quit'/'exit' or press Ctrl+C to stop (both\n");
+        printf("  ways print the verify summary); a diagnostic dump is printed every 10 s.\n");
         printf("\n");
         return 0;
     }
@@ -209,17 +365,32 @@ int main(int argc, char *argv[])
         printf("client_max_send_size: %d\n", client_max_send_size);
     }
 
+    crc32_init();
     pthread_mutex_init(&g_mutex, NULL);
     if (server_en) pthread_create(&hserver, NULL, peer_thread, (void*)TEST_PEER_SERVER);
     if (client_en) pthread_create(&hclient, NULL, peer_thread, (void*)TEST_PEER_CLIENT);
 
+    signal(SIGINT,  on_stop_signal);
+    signal(SIGTERM, on_stop_signal);
     while (!g_exit) {
+#ifdef WIN32
         char cmd[256];
         scanf("%256s", cmd);
-        if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) {
-            g_exit = 1;
+        if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) g_exit = 1;
+#else
+        // 带超时地等 stdin：Ctrl+C 之后能立刻退出这个循环去 join 线程，
+        // 而不是死等在 scanf 上（默认会重启的阻塞调用）导致线程来不及收尾。
+        fd_set rs; struct timeval tv;
+        FD_ZERO(&rs); FD_SET(0, &rs);
+        tv.tv_sec = 0; tv.tv_usec = 100 * 1000;
+        if (select(1, &rs, NULL, NULL, &tv) > 0) {
+            char cmd[256];
+            if (scanf("%256s", cmd) != 1) break;  // stdin 结束（Ctrl+D / 管道关闭）也退出
+            if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) g_exit = 1;
         }
+#endif
     }
+    printf("stopping ...\n");
 
     if (hserver) pthread_join(hserver, NULL);
     if (hclient) pthread_join(hclient, NULL);

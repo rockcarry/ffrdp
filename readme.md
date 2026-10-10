@@ -87,20 +87,42 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
 |---|---|---|
 | `--server[=ip:port]` | 作为服务端，并在该地址绑定 | `0.0.0.0:8000` |
 | `--client[=ip:port]` | 作为客户端，并连接该地址 | `127.0.0.1:8000` |
-| `--server_max_send_size=N` | 服务端每次发送的最大字节数 | 16384 |
-| `--client_max_send_size=N` | 客户端每次发送的最大字节数 | 16384 |
+| `--server_max_send_size=N` | 服务端**每条消息**的最大字节数（含 framing 头尾 12B）| 16384 |
+| `--client_max_send_size=N` | 客户端**每条消息**的最大字节数（含 framing 头尾 12B）| 16384 |
 | `--send_speed=N` | **发送限速**：把本进程的发送速率限制在 N KB/s | `0`（不限速）|
+
+### 消息校验（每次运行都会做）
+
+`ffrdp_recv()` 是**有序可靠字节流**（没有消息边界），所以测试程序自己给每条消息加了 framing：
+
+```
+[4B 总长 len][4B seq][payload...][4B crc32]      crc32 覆盖 len + seq + payload
+```
+
+接收端把字节流拼回消息并逐条校验：**seq 连续性**（有没有丢/乱 ✓）、**crc32**（内容有没有被破坏 ✓）、
+**长度合法性**（流有没有失步 ✓）；发送端只在 `ffrdp_send()` 返回整条长度时才 `seq++` ✓
+（`ffrdp_send()` 是**原子**的：要么整条被接受、要么返回 `-1` 什么都不接受 ✓）。
+
+出错会打印 `VERIFY ...` 日志（同类错误最多逐条打 3 次，其余只计数 ✓），退出时打印汇总：
+
+```
+[client] verify: sent 285 msgs / 1638311 B, recv 285 msgs / 1638311 B | seq_gap 0 (missing 0), crc_err 0, len_err 0, partial_err 0
+[client] verify: OK —— 收到的 285 条消息 seq 连续、crc 全部正确 ✓
+```
 
 说明：
 
 - `--server` 与 `--client` **可以同时给**（同进程自测）；此时 `--send_speed` 对两端都生效；
 - **`--send_speed` 用来像 iperf3 那样控制发送速率**：`--send_speed=100` 时，
-  每秒交给 `ffrdp_send()` 的数据量就约 100KB（实测 100.00~100.75KB/s ✓；
-  20KB/s、500KB/s 同样贴合 ✓，不限速时可达数百 MB/s（本机回环）✓）。
-  实现是令牌桶：每 1 秒补满 1 秒的额度，额度不够一包时把这一包裁到剩余额度；
-  不想限速就传 `0` 或不传 ✓；
+  每秒交给 `ffrdp_send()` 的数据量就约 100KB（实测 **100.37KB/s** ✓；
+  1KB/s、20KB/s、500KB/s 同样贴合 ✓）。
+  实现是令牌桶：每 1 秒补满 1 秒的额度，并按剩余额度**选**这一条消息的大小
+  （消息是原子的，不能裁剪 ✓）；不想限速就传 `0` 或不传 ✓；
+- **不限速时的速率由测试程序自己决定**：本机回环约 **90~100MB/s** ✓
+  （framing + crc32 + 伪随机填充的 CPU 开销 ✓），远高于真实链路 ✓；
 - 不带任何参数时只打印用法，然后退出；
-- 运行中输入 `quit` 或 `exit` 退出；
+- 运行中输入 `quit` / `exit`，或直接 **Ctrl+C** 退出 ✓ —— 两种方式都会**先打印上面的 `verify:` 汇总**再退出 ✓
+  （`SIGINT`/`SIGTERM` 都会被捕获 ⇒ 线程收尾、`ffrdp_free` 干净退出 ✓）；
 - 内部固定 `ffrdp_init(ip, port, NULL, NULL, server, 1280, 0)`
   ⇒ **MSS 1280 字节、FEC 冗余度 0（关闭）**，需要别的组合请改 `test.c`。
 
@@ -129,8 +151,8 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
 ```c
 void* ffrdp_init  (char *ip, int port, char *txkey, char *rxkey, int server, int smss, int sfec);
 void  ffrdp_free  (void *ctxt);
-int   ffrdp_send  (void *ctxt, char *buf, int len);   // 入队（受发送队列上限约束）
-int   ffrdp_recv  (void *ctxt, char *buf, int len);   // 取应用层数据
+int   ffrdp_send  (void *ctxt, char *buf, int len);   // 原子：返回 len = 整条接受；-1 = 什么都没接受（队列满）
+int   ffrdp_recv  (void *ctxt, char *buf, int len);   // 取应用层数据（有序可靠**字节流**，无消息边界）
 int   ffrdp_isdead(void *ctxt);                       // 对端是否已失联
 void  ffrdp_update(void *ctxt);                       // 必须被周期性调用（收发/计时/重传都在里面）
 void  ffrdp_flush (void *ctxt);                       // 把未填满的帧立刻发出（不要攒着）

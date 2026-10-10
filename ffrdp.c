@@ -498,16 +498,36 @@ void ffrdp_free(void *ctxt)
 int ffrdp_send(void *ctxt, char *buf, int len)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
-    int           n = len, size;
+    FFRDP_FRAME_NODE *spare = NULL, *node;
+    int           n = len, size, need, room;
     if (  !ffrdp || ((ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0)
         || ((len + ffrdp->smss - 1) / ffrdp->smss + ffrdp->wait_snd > FFRDP_MAX_WAITSND)) {
         if (ffrdp) ffrdp->counter_send_failed++;
         return -1;
     }
+    // Allocate every frame this call will need before writing a single byte: if one of the
+    // allocations fails the whole call is abandoned (return -1, nothing accepted). Doing it the
+    // other way round ("allocate while copying") lets the caller end up with 0 < ret < len, and it
+    // cannot safely retry that message then: the part already taken would show up twice in the
+    // stream. With this order ffrdp_send is atomic from the caller's point of view -- it either
+    // accepts the entire message (returns len) or accepts nothing at all (returns -1).
+    room = ffrdp->cur_new_node ? (int)(ffrdp->smss - ffrdp->cur_new_size) : 0;
+    need = (len > room) ? ((len - room) + (int)ffrdp->smss - 1) / (int)ffrdp->smss : 0;
+    while (need-- > 0) {
+        node = frame_node_new(ffrdp->fec_txredundancy, ffrdp->smss);
+        if (!node) {
+            while (spare) { node = spare; spare = spare->next; free(node); }
+            ffrdp->counter_send_failed++;
+            return -1;
+        }
+        node->next = spare; spare = node;
+    }
     while (n > 0) {
-        if (!ffrdp->cur_new_node) ffrdp->cur_new_node = frame_node_new(ffrdp->fec_txredundancy, ffrdp->smss);
-        if (!ffrdp->cur_new_node) break;
-        else SET_FRAME_SEQ(ffrdp->cur_new_node, ffrdp->send_seq);
+        if (!ffrdp->cur_new_node) { // the pre-allocated chain is exactly enough, never runs dry
+            ffrdp->cur_new_node = spare; spare = spare->next;
+            ffrdp->cur_new_node->next = NULL;
+        }
+        SET_FRAME_SEQ(ffrdp->cur_new_node, ffrdp->send_seq);
         size = MIN(n, (int)(ffrdp->smss - ffrdp->cur_new_size));
         memcpy(ffrdp->cur_new_node->data + 4 + ffrdp->cur_new_size, buf, size);
         ffrdp->cur_new_size += size; buf += size; n -= size;
@@ -521,7 +541,8 @@ int ffrdp_send(void *ctxt, char *buf, int len)
             ffrdp->cur_new_size = 0;
         } else ffrdp->cur_new_tick = get_tick_count();
     }
-    return len - n;
+    while (spare) { node = spare; spare = spare->next; free(node); } // cannot happen, but never leak
+    return len - n; // with the pre-allocation above this is always len: the call is atomic
 }
 
 int ffrdp_recv(void *ctxt, char *buf, int len)
