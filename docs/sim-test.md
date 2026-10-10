@@ -141,6 +141,7 @@ c0 recv=  4.75MB resend= 0.61% (rto   24 fast    0) cwnd=64 ssth=32 wait=255 fai
 c1 recv=  1.88MB resend= 3.44% maxrto=0 leaked=0
        c0 ack_recv=… mack=… hole=… timeout_evt=… rto_backoff=… | peer recv_ooo=… recv_far=… | dup=… ack_dup=…
        c0 spur=… rto_floor_raises=…
+       c1 ooo dist 1..24=… 25..64=… 65..128=… >128=… | mack bits sent(c1)=… recv(c0)=…
        air loss c0->c1=0.00% (…/…)  c1->c0=0.00% (…/…)
        c0 inflight=…
 ```
@@ -159,7 +160,8 @@ c1 recv=  1.88MB resend= 3.44% maxrto=0 leaked=0
 | ③ | `c1 recv resend maxrto leaked` | **c1 → c0 方向**（对称）；`maxrto` = 撞到 RTO 上限的次数；`leaked` = 未归还的分配数，**必须为 0** ✓ |
 | ④ | `rto_floor=… (the peer called N …)` | 本端当前 RTO 下限 ms，括号里是**对端报告"我们有多少次重传是白费的"** ✓ |
 | ⑤ | `ack_recv mack hole timeout_evt rto_backoff` | c0 侧 ACK 统计：收到多少 ACK / 其中带位图的 / 报出"洞"的 / 超时事件 / RTO 退让次数 |
-| ⑥ | `peer recv_ooo recv_far` | 对端看到的**乱序**与"远乱序"（超出 24 位掩码、报不回去的那一类 ✓）|
+| ⑥ | `peer recv_ooo recv_far` | 对端看到的**乱序**与"远乱序"（超出 24 位掩码、报不回去的那一类 ✓）。注意 `recv_far` 的边界是 `dist > 23`，比掩码本身**严一帧**（`dist 24` 其实装得下 ✓）|
+| ⑥b | `c1 ooo dist 1..24 / 25..64 / 65..128 / >128` + `mack bits sent / recv` | **距洞多远**（四档之和 = `recv_ooo` ✓）与 **mack 位数**（`sent` 与 `recv` 的差 = 报告丢在路上 ✓）。档位决定"加宽掩码值不值、加多宽"，位数看"报告有没有送到" ✓（旧源码只有前两档，汇总行会短一点 ✓）|
 | ⑦ | `dup ack_dup` | 对端**实际收到**的重复帧数 / 它**报回来**的数量 ✓ |
 | ⑧ | `spur rto_floor_raises` | 伪超时次数 / 下限抬升次数（可选）|
 | ⑨ | `air loss c0->c1=… c1->c0=…` | **真实空口丢包率**（发送帧数 − 收到帧数）⇒ 用来核对"场景的丢包率是否如实生效" ✓ |

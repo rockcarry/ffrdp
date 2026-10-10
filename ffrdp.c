@@ -192,6 +192,31 @@ typedef struct {
     uint32_t counter_ack_hole   ; // ack frames reporting a gap below the highest acked frame
     uint32_t counter_recv_ooo   ; // data frames that arrived out of order: there is a hole below them
     uint32_t counter_recv_far   ; // ... and they are more than 23 ahead of the hole, so the 24 bit ack mask cannot carry them
+    // how far ahead of the hole the out of order arrivals were, in the three bands that decide how wide
+    // an ack mask would have to be: 1..24 is what today's 24 bit mask carries (bit dist-1, so dist 24 is
+    // its last bit), 25..64 is what a 64 bit one would add, and beyond 64 not even that could speak.
+    // Nothing acts on these: they exist so that the cost of widening the mask (both ends must be
+    // upgraded) is only paid after the distribution says it would buy anything. Note that these bands
+    // are one frame wider than counter_recv_far above, which counts dist > 23 -- dist 24 does fit in
+    // the mask, so the old counter is a frame stricter than the thing it is describing.
+    uint32_t counter_ooo_d1_24  ; // ... and the distance was 1..24 frames: the mask of today reaches these
+    uint32_t counter_ooo_d25_64 ; // ... 25..64 frames: a 64 bit mask would reach these, this one cannot
+    uint32_t counter_ooo_dgt64  ; // ... more than 64 frames: out of reach for a single extension word
+    // ... and how far past 64 the tail actually goes. On a real link 8% of the out of order arrivals
+    // sat beyond 64, while nothing did in the simulator (whose window is only 64 wide), so the width
+    // of the extension has to be decided by this, not by the argument that the in-flight gate would
+    // bound the distance -- it does not: a frame that the peer reports in its mask leaves our send
+    // list while the hole stays open, so the sender keeps running ahead of the hole without limit.
+    uint32_t counter_ooo_d65_128; // ... 65..128 frames: a second extension word would reach these
+    uint32_t counter_ooo_dgt128 ; // ... more than 128 frames: out of reach of two words
+    // the mask itself counted in bits instead of frames. counter_recv_ooo says how many out of order
+    // frames arrived; bits_sent says how many of them we actually told the peer about, and a frame keeps
+    // its bit in every later ack until the hole below it fills, so bits_sent >= ooo is the healthy
+    // reading. Comparing bits_sent (the receiver's count) with bits_recv (the sender's) is the only way
+    // to tell a report that was never made from one that was made and never arrived -- neither end can
+    // see that on its own.
+    uint32_t counter_mack_bits_sent; // mack bits we put on the wire
+    uint32_t counter_mack_bits_recv; // mack bits the peer sent us
     uint32_t rtt_min            ; // lowest round trip seen this interval: the path's floor, the number to judge latency by
     uint32_t inflight_used      ; // frames actually on the wire (recounted every pass): what step29 limits
 
@@ -591,6 +616,12 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, struct sockaddr_in *
         dist = seq_distance(GET_FRAME_SEQ(p), ffrdp->recv_seq);
         if (dist <= 24) recv_mack |= 1 << (dist - 1); // dist is obviously > 0
     }
+    // how many frames this ack is telling the peer about, counted in bits so that it can be compared
+    // with counter_mack_bits_recv on the other side: the difference between the two is the part of the
+    // reporting that the path ate. a frame can contribute a bit to several acks in a row, so this is
+    // not a frame count -- it answers "is the reporting happening at all", which is the question that
+    // counter_ack_mack (acks carrying any bit) is too coarse to answer.
+    for (i = 0; i < 24; i++) if (recv_mack & (1 << i)) ffrdp->counter_mack_bits_sent++;
     recv_wnd = (sizeof(ffrdp->recv_buff) - ffrdp->recv_size) / ffrdp->rmss;
     recv_wnd = MIN(recv_wnd, 255);
     *(uint32_t*)(data + 0) = (FFRDP_FRAME_TYPE_ACK << 0) | (ffrdp->recv_seq << 8);
@@ -741,7 +772,21 @@ void ffrdp_update(void *ctxt)
                 // out of order arrival = this frame is ahead of a hole. If this counter grows while the
                 // peer's acks carry no mack bit, then the hole is never being reported, and the sender
                 // has no choice but to wait for timeouts.
-                if (dist > 0) { ffrdp->counter_recv_ooo++; if (dist > 23) ffrdp->counter_recv_far++; }
+                if (dist > 0) {
+                    ffrdp->counter_recv_ooo++;
+                    if (dist > 23) ffrdp->counter_recv_far++;
+                    // how far ahead of the hole this one was. the distance only ever shrinks by the hole
+                    // being filled, and by then this frame is below una and gets acked cumulatively
+                    // instead, so a frame further than the mask's last bit is never reported at all --
+                    // which is why the band it falls in decides whether a wider mask would buy anything.
+                    if      (dist <= 24) ffrdp->counter_ooo_d1_24++;
+                    else if (dist <= 64) ffrdp->counter_ooo_d25_64++;
+                    else {   // > 64: the tail one extension word cannot carry, split by how far it goes
+                        ffrdp->counter_ooo_dgt64++;
+                        if (dist <= 128) ffrdp->counter_ooo_d65_128++;
+                        else             ffrdp->counter_ooo_dgt128++;
+                    }
+                }
                 // below the range we have already taken in: the peer sent this again although we had it,
                 // which is exactly the waste we want to count and report back.
                 if (dist < 0) { ffrdp->counter_recv_dup++; ffrdp->dup_seen++; }
@@ -759,6 +804,9 @@ void ffrdp_update(void *ctxt)
             ffrdp->ack_una = (uint32_t)una;
             if (mack) { // the peer reported frames that arrived after a hole
                 ffrdp->counter_ack_mack++;
+                // counted in bits, to be compared with counter_mack_bits_sent on the other side: a
+                // report that never arrived and a report that was never made look identical from here.
+                for (j = 0; j < 24; j++) if (mack & (1 << j)) ffrdp->counter_mack_bits_recv++;
                 for (i = 23; i >= 0 && !(mack & (1 << i)); i--);
                 for (j = 0; j < i && (mack & (1 << j)); j++);
                 if (j < i) ffrdp->counter_ack_hole++; // a gap below the highest acked frame
@@ -1088,6 +1136,24 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("counter_ack_hole    : %u\n"  , ffrdp->counter_ack_hole    );
     printf("counter_recv_ooo    : %u\n"  , ffrdp->counter_recv_ooo    );
     printf("counter_recv_far    : %u\n"  , ffrdp->counter_recv_far    );
+    // where out of order arrivals sat relative to the hole, and how much of that we told the peer
+    // about. the three bands add up to counter_recv_ooo; the reach ratio answers the only question
+    // that matters before widening the mask: how much of the out of order traffic is even addressable.
+    printf("counter_ooo_d1_24   : %u\n"  , ffrdp->counter_ooo_d1_24   );
+    printf("counter_ooo_d25_64  : %u\n"  , ffrdp->counter_ooo_d25_64  );
+    printf("counter_ooo_dgt64   : %u\n"  , ffrdp->counter_ooo_dgt64   );
+    printf("counter_ooo_d65_128 : %u\n"  , ffrdp->counter_ooo_d65_128 );
+    printf("counter_ooo_dgt128  : %u\n"  , ffrdp->counter_ooo_dgt128  );
+    {   uint32_t ooo = ffrdp->counter_recv_ooo;
+        uint32_t r64  = ffrdp->counter_ooo_d1_24 + ffrdp->counter_ooo_d25_64;
+        uint32_t r128 = r64 + ffrdp->counter_ooo_d65_128;
+        if (ooo) { printf("counter_ooo_64reach : %.1f%% (%u / %u)\n" , 100.0 * r64  / ooo, r64 , ooo);
+                   printf("counter_ooo_128reach: %.1f%% (%u / %u)\n" , 100.0 * r128 / ooo, r128, ooo); }
+        else     { printf("counter_ooo_64reach : n/a\n");
+                   printf("counter_ooo_128reach: n/a\n"); }
+    }
+    printf("counter_mack_bits_sent: %u\n" , ffrdp->counter_mack_bits_sent);
+    printf("counter_mack_bits_recv: %u\n" , ffrdp->counter_mack_bits_recv);
     printf("counter_rto_backoff : %u\n"  , ffrdp->counter_rto_backoff );
     printf("counter_timeout_evt : %u\n"  , ffrdp->counter_timeout_evt );
     printf("counter_ack_una_dup : %u\n"  , ffrdp->counter_ack_una_dup );

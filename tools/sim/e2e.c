@@ -29,7 +29,7 @@ int main(int argc, char *argv[])
     int    spikep= argc > 11 ? atoi(argv[11]) : 0; // %,    share of packets hit by a delay spike
     int    spikem= argc > 12 ? atoi(argv[12]) : 0; // ms,   extra delay of a spike
     static unsigned char sbuf[64 * 1024], rbuf[64 * 1024];
-    struct { unsigned rto, fast, cwnd, ssth, wait, fail, rttd, maxrto, first, ack, mack, hole, tev, rbk, inflight, tx, rx, ooo, far, dup, adup, spur, rfl, flr; } s0, s1;
+    struct { unsigned rto, fast, cwnd, ssth, wait, fail, rttd, maxrto, first, ack, mack, hole, tev, rbk, inflight, tx, rx, ooo, far, dup, adup, spur, rfl, flr, d1, d25, dgt, d65, d128, mbs, mbr; } s0, s1;
     FFRDPCONTEXT *c0, *c1;
     unsigned long r0 = 0, r1 = 0;
     int i, ret;
@@ -83,6 +83,14 @@ int main(int argc, char *argv[])
 #ifdef HAVE_INFLIGHT
     s0.inflight = c0->inflight;
 #endif
+#ifdef OOO_HIST
+    // read these before the contexts are returned: the summary below prints after they are gone
+    s0.d1 = c1->counter_ooo_d1_24; s0.d25 = c1->counter_ooo_d25_64; s0.dgt = c1->counter_ooo_dgt64;
+#ifdef OOO_HIST2
+    s0.d65 = c1->counter_ooo_d65_128; s0.d128 = c1->counter_ooo_dgt128;
+#endif
+    s0.mbs = c1->counter_mack_bits_sent; s0.mbr = c0->counter_mack_bits_recv; // c1's reports, what c0 got
+#endif
     ffrdp_free(c0); ffrdp_free(c1); // everything must be returned, so the residual is a leak
     printf("loss=%.3f burst=%d delay=%d jit=%d cap=%.0fKB/s q=%dKB pol=%.0fKB/s/%dKB spike=%d%%/%dms | "
            "c0 recv=%6.2fMB resend=%5.2f%% (rto %4u fast %4u) cwnd=%2u ssth=%2u wait=%3u fail=%4u rttd=%u | "
@@ -96,6 +104,18 @@ int main(int argc, char *argv[])
     printf("       c0 ack_recv=%u mack=%u hole=%u timeout_evt=%u rto_backoff=%u | peer recv_ooo=%u recv_far=%u | dup=%u ack_dup=%u\n",
            s0.ack, s0.mack, s0.hole, s0.tev, s0.rbk, s0.ooo, s0.far, s0.dup, s0.adup);
     printf("       c0 spur=%u rto_floor_raises=%u\n", s0.spur, s0.rfl);
+#endif
+#ifdef OOO_HIST
+    // c1 is the receiver of what c0 sent: its histogram says how far the out of order arrivals were
+    // from the hole, and the two bit counts say whether the reports made it across (they only differ
+    // when an ack carrying bits was lost).
+#ifdef OOO_HIST2
+    printf("       c1 ooo dist 1..24=%u 25..64=%u 65..128=%u >128=%u | mack bits sent(c1)=%u recv(c0)=%u\n",
+           s0.d1, s0.d25, s0.d65, s0.d128, s0.mbs, s0.mbr);
+#else
+    printf("       c1 ooo dist 1..24=%u 25..64=%u | mack bits sent(c1)=%u recv(c0)=%u\n",
+           s0.d1, s0.d25, s0.mbs, s0.mbr);
+#endif
 #endif
     printf("       air loss c0->c1=%.2f%% (%u/%u)  c1->c0=%.2f%% (%u/%u)\n",
            100.0 * (s0.tx - s0.rx) / (s0.tx ? s0.tx : 1), s0.rx, s0.tx,

@@ -142,7 +142,8 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
 │   ├── sim-test.md         差分仿真工具（tools/sim）使用说明
 │   └── notes.md            开发与调试记录（按时间顺序，含每次上机的原始 log）
 └── tools/
-    └── sim/                差分仿真：虚拟时钟 + 假 socket，把两版代码放在同一条确定假链路上 A/B
+    ├── sim/                差分仿真：虚拟时钟 + 假 socket，把两版代码放在同一条确定假链路上 A/B
+    └── keylog.sh           从 test_ffrdp 的输出里只留关键行，并打印"最后一块汇总 + 逐块趋势"
 ```
 
 ### 对外 API（`ffrdp.h`）

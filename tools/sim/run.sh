@@ -29,6 +29,8 @@ for t in $TESTS; do
         grep -q counter_recv_dup ffrdp_$v.c && EXTRA="$EXTRA -DDUP_REPORT"
         grep -q counter_rto_spurious ffrdp_$v.c && EXTRA="$EXTRA -DSPUR"
         grep -q 'uint32_t rmss, smss, swnd, inflight' ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_INFLIGHT"
+        grep -q counter_ooo_d1_24 ffrdp_$v.c && EXTRA="$EXTRA -DOOO_HIST"
+        grep -q counter_ooo_d65_128 ffrdp_$v.c && EXTRA="$EXTRA -DOOO_HIST2"
         eval gcc $CFLAGS $EXTRA ${t}_$v.c simnet.o -o ${t}_$v
     done
 done
