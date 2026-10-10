@@ -57,7 +57,7 @@ case "$1" in
     build_package
     ;;
 clean|distclean)
-    rm -rf *.o *.a *.exe *.pc
+    rm -rf *.o *.a *.exe *.pc test_ffrdp out/
     ;;
 esac
 
