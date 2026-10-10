@@ -89,10 +89,16 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
 | `--client[=ip:port]` | 作为客户端，并连接该地址 | `127.0.0.1:8000` |
 | `--server_max_send_size=N` | 服务端每次发送的最大字节数 | 16384 |
 | `--client_max_send_size=N` | 客户端每次发送的最大字节数 | 16384 |
+| `--send_speed=N` | **发送限速**：把本进程的发送速率限制在 N KB/s | `0`（不限速）|
 
 说明：
 
-- `--server` 与 `--client` **可以同时给**（同进程自测，单向带宽各占一半）；
+- `--server` 与 `--client` **可以同时给**（同进程自测）；此时 `--send_speed` 对两端都生效；
+- **`--send_speed` 用来像 iperf3 那样控制发送速率**：`--send_speed=100` 时，
+  每秒交给 `ffrdp_send()` 的数据量就约 100KB（实测 100.00~100.75KB/s ✓；
+  20KB/s、500KB/s 同样贴合 ✓，不限速时可达数百 MB/s（本机回环）✓）。
+  实现是令牌桶：每 1 秒补满 1 秒的额度，额度不够一包时把这一包裁到剩余额度；
+  不想限速就传 `0` 或不传 ✓；
 - 不带任何参数时只打印用法，然后退出；
 - 运行中输入 `quit` 或 `exit` 退出；
 - 内部固定 `ffrdp_init(ip, port, NULL, NULL, server, 1280, 0)`
@@ -106,7 +112,7 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
 .
 ├── ffrdp.c                 协议实现（单文件：ARQ + FEC + 流控/并发控制 + 诊断）
 ├── ffrdp.h                 对外 API（init/free/send/recv/update/flush/isdead/dump）
-├── test.c                  测试程序（服务端/客户端两个线程 + 每 10 秒 dump）
+├── test.c                  测试程序（服务端/客户端共用一个参数化的对等端循环 + 每 10 秒 dump）
 ├── build.sh                构建脚本（静态库 + 测试程序 + pkg-config）
 ├── readme.md               本文件：概述、版本、编译、测试、目录
 ├── LICENSE

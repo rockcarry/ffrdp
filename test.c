@@ -23,6 +23,7 @@ static uint32_t get_tick_count()
 #define TEST_VERSION            "1.1.0" // 与 build.sh 生成的 libffrdp.pc 里的 Version 保持一致
 #define TEST_DUMP_INTERVAL_MS   10000   // 每隔这么久打印一次诊断
 #define TEST_PEER_SILENCE_MS     2000   // 这么久没收到对端数据就认为它失联（见 peer_is_lost）
+#define TEST_SPEED_INTERVAL_MS   1000   // 发送限速：每这么久补一次令牌（见 peer_thread）
 
 static int  g_exit = 0;
 static char server_bind_ip[32]   = "0.0.0.0";
@@ -31,6 +32,7 @@ static int  server_bind_port     = 8000;
 static int  client_cnnt_port     = 8000;
 static int  server_max_send_size = 16 * 1024;
 static int  client_max_send_size = 16 * 1024;
+static int  send_speed           = 0;   // 本进程的发送限速，单位 KB/s（1024 B）；0 = 不限速
 static pthread_mutex_t g_mutex;
 
 // 一个"对等端"的运行参数。两侧跑的是同一个循环，差别只在下面这几项。
@@ -43,13 +45,14 @@ typedef struct {
     int        *port;      // 端口（指向命令行解析出来的全局变量）
     int        *send_size; // 本端每次发送的最大字节数
     int        *recv_size; // 本端接收缓冲大小（= 对端每次发送的上限）
+    int        *send_speed;// 发送限速 KB/s（0 = 不限速），指向命令行解析出来的全局变量
 } TEST_PEER;
 
 static TEST_PEER g_peers[] = {
     { "server", "client", "client connected !"    , 1, server_bind_ip, &server_bind_port,
-      &server_max_send_size, &client_max_send_size },
+      &server_max_send_size, &client_max_send_size, &send_speed },
     { "client", "server", "connect to server ok !", 0, client_cnnt_ip, &client_cnnt_port,
-      &client_max_send_size, &server_max_send_size },
+      &client_max_send_size, &server_max_send_size, &send_speed },
 };
 #define TEST_PEER_SERVER  (&g_peers[0])
 #define TEST_PEER_CLIENT  (&g_peers[1])
@@ -68,10 +71,12 @@ static void* peer_thread(void *param)
     const TEST_PEER *peer = (const TEST_PEER*)param;
     const int send_max = *peer->send_size;
     const int recv_max = *peer->recv_size;
+    const uint32_t quota = (uint32_t)*peer->send_speed * 1024; // 每秒允许发送的字节数，0 = 不限速
     uint8_t *sendbuf = malloc(send_max);
     uint8_t *recvbuf = malloc(recv_max);
     void    *ffrdp   = NULL;
     uint32_t tick_dump, tick_recv = 0;
+    uint32_t tick_speed, tokens;
     int      size, ret, connected = 0;
 
     if (!sendbuf || !recvbuf) {
@@ -79,16 +84,36 @@ static void* peer_thread(void *param)
         goto done;
     }
 
-    tick_dump = get_tick_count();
+    tick_dump  = get_tick_count();
+    tick_speed = tick_dump;
+    tokens     = quota;   // 一开跑就有一个周期的额度，否则头 1 秒发不出去、平均速率会偏低
     while (!g_exit) {
         if (!ffrdp) {
             ffrdp = ffrdp_init(peer->ip, *peer->port, NULL, NULL, peer->is_server, 1280, 0);
             if (!ffrdp) { usleep(100 * 1000); continue; }
         }
 
+        // 发送限速（令牌桶）：每 TEST_SPEED_INTERVAL_MS 把令牌补满一个周期的额度，
+        // 桶的上限就是这一个周期的量（不跨周期累积 ⇒ 不会攒出突发）；
+        // 额度不够一包时把这一包裁到剩余额度，而不是整包跳过 —— 否则当随机包长普遍大于
+        // 周期额度时会长期发不出去（额度攒着、尺寸又总对不上）；
+        // 只有真的入队成功了才扣令牌（被背压退回的那些不算已发送）。
+        if (quota) {
+            if ((int32_t)get_tick_count() - (int32_t)tick_speed >= TEST_SPEED_INTERVAL_MS) {
+                tick_speed += TEST_SPEED_INTERVAL_MS;
+                tokens      = quota;
+            }
+        }
+
         size = 1 + rand() % send_max;
-        // 发送失败只可能是应用侧队列满（被背压），属正常现象，不打印
-        (void)ffrdp_send(ffrdp, (char*)sendbuf, size);
+        if (quota == 0) {
+            // 不限速：照旧（发送失败只可能是应用侧队列满，属正常背压，不打印）
+            (void)ffrdp_send(ffrdp, (char*)sendbuf, size);
+        } else if (tokens) {
+            if ((uint32_t)size > tokens) size = (int)tokens; // 裁到本周期还剩的额度
+            if (ffrdp_send(ffrdp, (char*)sendbuf, size) == size) tokens -= (uint32_t)size;
+        }
+        // tokens 为 0：本周期额度用完 ⇒ 这一轮只收不发，协议照常 update
 
         ret = ffrdp_recv(ffrdp, (char*)recvbuf, recv_max);
         if (ret > 0) {
@@ -130,16 +155,18 @@ int main(int argc, char *argv[])
         const char *prog = argv[0] ? argv[0] : "test_ffrdp"; // 按调用名打印：重命名、软链、绝对路径都对得上
         printf("ffrdp test program - v%s\n", TEST_VERSION);
         printf("usage: %s [--server[=ip:port]] [--client[=ip:port]]\n", prog);
-        printf("%*s[--server_max_send_size=N] [--client_max_send_size=N]\n",
+        printf("%*s[--server_max_send_size=N] [--client_max_send_size=N] [--send_speed=N]\n",
                (int)strlen(prog) + 7, ""); // 7 = strlen("usage: ")，让接续行与上面那个括号对齐
         printf("\n");
         printf("  --server[=ip:port]            run as server    (default 0.0.0.0:8000)\n");
         printf("  --client[=ip:port]            run as client    (default 127.0.0.1:8000)\n");
         printf("  --server_max_send_size=N      server max bytes per send (default 16384)\n");
         printf("  --client_max_send_size=N      client max bytes per send (default 16384)\n");
+        printf("  --send_speed=N                limit this process to N KB/s (default 0 = unlimited)\n");
         printf("\n");
-        printf("  the two roles may be given together (self test on one host);\n");
-        printf("  type 'quit' or 'exit' to stop; a diagnostic dump is printed every 10 s.\n");
+        printf("  the two roles may be given together (self test on one host) - the send rate\n");
+        printf("  limit then applies to both; type 'quit' or 'exit' to stop; a diagnostic dump\n");
+        printf("  is printed every 10 s.\n");
         printf("\n");
         return 0;
     }
@@ -163,11 +190,14 @@ int main(int argc, char *argv[])
             server_max_send_size = atoi(argv[i] + 23);
         } else if (strstr(argv[i], "--client_max_send_size=") == argv[i]) {
             client_max_send_size = atoi(argv[i] + 23);
+        } else if (strstr(argv[i], "--send_speed=") == argv[i]) {
+            send_speed = atoi(argv[i] + 13);
         }
     }
 
     strtok_r(server_bind_ip, ":", &str); if (str && *str) server_bind_port = atoi(str);
     strtok_r(client_cnnt_ip, ":", &str); if (str && *str) client_cnnt_port = atoi(str);
+    printf("send_speed          : %d KB/s%s\n", send_speed, send_speed ? "" : " (unlimited)");
     if (server_en) {
         printf("server bind ip      : %s\n", server_bind_ip      );
         printf("server bind port    : %d\n", server_bind_port    );
