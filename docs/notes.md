@@ -3,6 +3,10 @@
 本文档记录 ffrdp 传输层的调试过程、已确认的结论、以及实验档案，避免重复踩坑。
 每一条结论要么有仿真数据、要么有真机 log 支撑，来源都注明。
 
+> **文档分工**（2026-10 起）：协议规格与优化依据在 [`ffrdp-protocol.md`](ffrdp-protocol.md)；
+> 仿真工具用法在 [`sim-test.md`](sim-test.md)；概述/编译/测试在 [`../readme.md`](../readme.md)。
+> **本文是"过程记录"**：动机、试错、被否路线、每次上机的原始 log —— 有新的调试或工作记录就往这里加。
+
 ---
 
 ## 1. 设计目标（项目方给的原话）
@@ -729,7 +733,8 @@ iperf3 单流 TCP      2.78~3.27 Mbit/s (355~418KB/s) ← 和我们同档, 这�
 
 ### 5.18 step30：`queue test` 门槛 4× → 3×（**已实现 + 真机成功 ✓✓**）
 
-**动机**（`OPTIMIZATION.md` §7 第一条待办）：step29 收敛后 `rtts` 只剩 12~19ms，而 `rtt_min` 是 4ms
+**动机**（当时记在待办里的"4× 门槛偏松"；现已并入 `ffrdp-protocol.md` 10.3.5）：
+step29 收敛后 `rtts` 只剩 12~19ms，而 `rtt_min` 是 4ms
 ⇒ 比值 **3~4.75×** ✗ —— 也就是说 **4× 门槛让探测在"队列还没拆完"时就停工了** ✗。
 
 **做法**：门槛抽成常量 `FFRDP_PROBE_QUEUE_RATIO`（= **3**），`rtts > 3 × rtt_min` 即触发 ✓。
@@ -774,7 +779,8 @@ iperf3 单流 TCP      2.78~3.27 Mbit/s (355~418KB/s) ← 和我们同档, 这�
 
 ### 5.19 step31：长尾收敛 —— **否掉"按环境填值"** ✗，改成通用做法 ✓
 
-**动机**（`OPTIMIZATION.md` §7 第三条）：每次会话都要重走 64 → 32 → 16 → 8，代价是
+**动机**（当时记在待办里的"长尾收敛"；现已并入 `ffrdp-protocol.md` 10.3.5）：
+每次会话都要重走 64 → 32 → 16 → 8，代价是
 **头 ~20 秒在途量偏大** ✗ —— 60 秒的测试里是全程三分之一，短片传输里更是全部收益所在 ✓。
 
 **第一版（已否 ✗）**：加一个编译期常量 `FFRDP_INFLIGHT_PROVEN`，把实测出来的在途上限写进配置，
@@ -989,7 +995,7 @@ REF=/path/to/ffrdp.c TESTS=e2e bash tools/sim/run.sh
 
 **单测**：`t_rto.c`（超时/退避行为）、`t_ack.c`（ACK 计数接线）。
 
-**完整用法**（`TESTS`/`REF`、13 个参数、17 个内置场景、输出解读、使用纪律与局限）见 [`tools/sim/README.md`](tools/sim/README.md) ✓
+**完整用法**（`TESTS`/`REF`、12 个参数、17 个内置场景、输出解读、使用纪律与局限）见 [`sim-test.md`](sim-test.md) ✓
 
 ---
 
@@ -1067,10 +1073,49 @@ REF=/path/to/ffrdp.c TESTS=e2e bash tools/sim/run.sh
 
 ## 9. 当前工作区状态
 
-- **交付版本**：`verified-v4-queue-ratio`（在途闸门 + 延迟探测 + 门槛 3×，真机两方向都贴地板 ✓，见 5.18）✓；
-- **已验证节点用标签记**：`baseline-preopt`（部署基线 `c05ea45`）、`verified-v1-rto-floor`（v6）、
+- **交付版本**：`verified-v5-fast-walk`（在途闸门 + 延迟探测，门槛 3×，且"探测赢了就继续问" ⇒
+  几秒内收敛、无需任何配置值 ✓，见 5.19）✓；
+- **已验证节点用标签记**（每个标签的说明里带着当时的上机证据 ✓，且都指向已合并的提交 ✓）：
+  `baseline-preopt`（部署基线，内容与最早的 `c05ea45` 相同）、`verified-v1-rto-floor`（v6）、
   `verified-v2-hole-wait`（step26）、`verified-v3-inflight-gate`（step29）、
-  `verified-v4-queue-ratio`（step30，真机 ✓）——
-  需要某个实验的源码时，用相应提交或标签即可（`tools/steps/` 已不再保留）✓；
-- **两端同步**：基线是 `c05ea45`，`git diff c05ea45 HEAD -- ffrdp.c` 就是同步用的 patch ✓；自检看 dump 第一行 `build :`（含 `probe` / `queue ratio`），比记提交号可靠 ✓；
+  `verified-v4-queue-ratio`（step30）、`verified-v5-fast-walk`（step31）——
+  需要某个实验的源码时，用相应标签即可（`tools/steps/` 已不再保留 ✓）；
+- **两端同步**：远端是 Gerrit 上的 `master`，另一台机器 `git pull` 即可 ✓（不再走"复制 patch"✓）；
+  自检看 dump 第一行 `build :`（含 `probe` / `queue ratio`）以及 `ffrdp.c` 的 md5，比记提交号可靠 ✓；
+- **文档布局**（2026-10 整理）：`readme.md`（概述/编译/测试/目录）、`docs/ffrdp-protocol.md`（协议与优化）、
+  `docs/notes.md`（本文）、`docs/sim-test.md`（仿真用法）✓；
 - 上机测任何一步前，**先确认工作区是干净的**（曾经被 `git checkout` 清掉未提交的改动）。
+
+---
+
+## 10. 版本定义与文档整理（2026-10）
+
+### 10.1 两个协议版本的定义（项目方给定）
+
+| 版本 | 范围 | 帧格式 |
+|---|---|---|
+| **v1.0.0** | 提交 `55ead4a` **及之前** | 4 字节帧头、ACK 8 字节 |
+| **v1.1.0** | `55ead4a` **之后**（`58167b3`"修复 arq 若干缺陷"起）到现在 | **未变** ✓，仅 ACK 尾部多一个**可选**字节 `dups` |
+
+**核对结论（本轮做过代码级对比）**：`SET_FRAME_SEQ` / `GET_FRAME_SEQ` 宏、帧类型枚举取值、
+帧长度计算、FEC 异或与 `fec_seq` 处理、ACK 前 8 字节的构造、`ffrdp.h` 的 8 个 API ——
+在 `55ead4a` 与当前 `ffrdp.c` 之间**逐字相同** ✓；差异只在参数常量与新增逻辑 ✓。
+⇒ 两版可以互相对接：老对端不发的第 9 字节读到 0，新对端多发的那一字节老对端不校验（忽略）✓
+（完整推理见 `ffrdp-protocol.md` 第 8 节）。规格已按此分成两版写进该文档（第一部分 v1.0.0、第二部分 v1.1.0）。
+
+### 10.2 文档整理（本次）
+
+- `readme.txt` → `readme.md`：改成面向"第一次接触"的概述（协议特点 / 编译 / `test_ffrdp` 用法 / 目录结构）✓；
+- `OPTIMIZATION.md` → `docs/ffrdp-protocol.md`：前面补上 v1.0.0 的帧格式与基本协议，
+  原来的优化内容成为"第二部分 v1.1.0"（依据 / 证据 / 被否路线）✓；
+- `NOTES.md` → `docs/notes.md`（本文）✓；
+- `tools/sim/README.md` → `docs/sim-test.md` ✓；
+- 文档之间的互相引用全部改到新路径 ✓；`tools/steps/` 的临时快照与 patch 已删
+  （改用标签 + Gerrit 提交来追溯）✓。
+
+### 10.3 待办（小项）
+
+- **`test.c` 的两处小不一致** ✗：启动横幅仍印 `ffrdp test program - v1.0.0`，
+  用法行印的是 `usage: ffrdp_test ...` 而二进制名是 `test_ffrdp` ——
+  下次动 `test.c` 时顺手改成 `v1.1.0` 与正确名字 ✓（`build.sh` 生成的 `libffrdp.pc` 里已是 `Version: 1.1.0` ✓）。
+- **下一轮上机**：24 位乱序掩码 → `ACK2`（64 位），或 pacing（见 `ffrdp-protocol.md` 10.7）✓。
