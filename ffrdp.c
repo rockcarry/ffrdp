@@ -919,6 +919,14 @@ void ffrdp_update(void *ctxt)
                     ffrdp->probe_next = now + FFRDP_PROBE_GAP_MS;
                     ffrdp->counter_giveback++;
                 } else {
+                    // nothing to ask about yet: the queue test is not satisfied, so wait a full back off
+                    // before looking again. looking sooner was tried and rejected on the measured link: it
+                    // moved the first probe into the connection's ramp up, where both rate samples (before
+                    // and during) are still climbing, so the rate guard read a false "the rate fell" and
+                    // reverted -- even though the delay had plainly followed (probe rtt ref/best = 86/6).
+                    // the revert doubles the back off, so asking early cost twenty seconds instead of
+                    // saving ten. a rate guard needs a connection that has settled down before it means
+                    // anything.
                     ffrdp->probe_next = now + FFRDP_PROBE_GAP_MS;
                 }
             }
@@ -933,17 +941,23 @@ void ffrdp_update(void *ctxt)
                 if (rtt_down && rate_kept) {
                     ffrdp->cap_kept  = ffrdp->probe_cap;
                     ffrdp->probe_gap = FFRDP_PROBE_GAP_MS;
+                    // the experiment just proved there is more to win, so do not sit out a whole back off
+                    // before asking the next question: walk the rest of the descent now. it stays self
+                    // limiting -- the first empty answer doubles the gap again -- so a path nobody has
+                    // measured converges in a few seconds instead of a few tens of them, and no value has
+                    // to be picked for that path in advance.
+                    ffrdp->probe_next = now + ffrdp->probe_hold;
                     ffrdp->counter_probe_keep++;
                 } else {
                     // the delay did not follow, or it did but the confirming rate fell with it: either way
                     // the smaller window bought nothing, so go back to what was proven and wait longer.
                     if (rtt_down) ffrdp->counter_probe_narrow++;
-                    ffrdp->probe_gap = MIN(ffrdp->probe_gap * 2, (uint32_t)FFRDP_PROBE_GAP_MAX_MS);
+                    ffrdp->probe_gap  = MIN(ffrdp->probe_gap * 2, (uint32_t)FFRDP_PROBE_GAP_MAX_MS);
+                    ffrdp->probe_next = now + ffrdp->probe_gap;
                     ffrdp->counter_probe_revert++;
                 }
                 ffrdp->probe_state = 0;
                 ffrdp->cap         = ffrdp->cap_kept;
-                ffrdp->probe_next  = now + ffrdp->probe_gap;
             }
         }
     }
