@@ -245,7 +245,7 @@ RTT 抬头就收），而不是继续在"RTO 估计 / 按丢包 pacing"上打转
 |---|---|
 | `counter_send_1sttime` | 首次发送的帧数 |
 | `counter_resend_rto` / `_fast` | 超时重传 / 快重传次数 |
-| `counter_resend_ratio` | 重传占比（rto+fast）/ 首次 |
+| `counter_resend_ratio` | 重传占比（rto+fast）/ 首次；**打印时带上绝对数** `30.00% (6 / 20)` ⇒ 分母小的时候一眼看得见（见 10.4）|
 | `counter_txfull` / `rxfull` | 完整帧的发送/接收条数（做丢包率核算用） |
 | `counter_reach_maxrto` | rto 顶到 2000ms 上限的次数 |
 | `counter_ack_recv` **(新)** | 收到的 ACK 帧数 |
@@ -1121,3 +1121,67 @@ REF=/path/to/ffrdp.c TESTS=e2e bash tools/sim/run.sh
 > 与用法行的二进制名 —— 现已改为 `v1.1.0`（常量 `TEST_VERSION`）与按 `argv[0]` 打印的程序名
 >（接续行按名字长度对齐 ✓，改名 / 软链 / 绝对路径 / 走 `PATH` 都对得上 ✓），
 > 用法行也列出了全部四个选项与默认值 ✓。
+
+### 10.4 诊断字段修订：`counter_resend_waste` 的口径（2026-10-10）
+
+**起因**：`--send_speed=1`（客户端限速 1KB/s）那一轮，dump 打出
+
+```
+total_send, total_recv: 0.04MB, 37.91MB
+counter_resend_ratio: 7.50%
+counter_resend_waste: 300.00%      ← 看着像"白费率 300%"，其实不是 ✗
+rto_floor, waste%   : 0, 100.0%
+```
+
+**查出来的原因** ✗：`counter_resend_waste` 的实现是"重传次数 ÷ `counter_txfull`"，
+而 `counter_txfull` **只统计长度恰好等于 MSS 的数据帧**
+（`ffrdp.c`：`switch (frame->size - smss) { case 4: txfull; default: txshort; }`）。
+`--send_speed=1` 时令牌只有 1024 字节/周期 ⇒ 每包都被裁到 < 1280 ⇒ **全是 short 帧**
+（dump 里 `counter_txfull 0`、`counter_txshort 43` 正好印证）⇒ 分母为 0 被 `MAX(..., 1)` 兜成 1
+⇒ `3 / 1 = 300%` ✗。⇒ 它和"白不白费"毫无关系 ✗（只是名字叫 waste ✗）。
+
+**真正的白费率**在同一轮的 `rto_floor, waste%` 里 = `counter_ack_dup` ÷ 重传总数 = 3/3 = **100%** ✓：
+40 秒只发了 40 帧（1 帧/秒），而 `rto = rtts + 4·rttd = 19ms` 正好贴着这条路的往返
+（`rtt_min 7ms`、`rtts 11ms`），同时对端在以 ~970KB/s 跑 ⇒ 我们那**稀有的**一帧的 ACK 很容易晚过
+19ms ⇒ 伪超时 ⇒ 重传被对端认出"我早有了" ⇒ 100% ✓。与"**帧是迟到，不是丢了**"这条老结论一致 ✓，
+只是总量小到可忽略（3 次 / 40 秒 ✓）。
+
+顺带记一个**已知小缺口** ✗（本次不处理）：发送很稀时（1 帧/秒），证据窗口永远攒不满
+`FFRDP_WASTE_MIN = 16` 次重传 ⇒ `rto_floor` 不会被调节 ✓
+（dump 里 `rto_floor 0` / `probes 0` 印证 ✓）；代价极小 ✓，要处理得走"仿真 → 真机"流程 ✓。
+
+**同一个"分母太小"的毛病，`counter_resend_ratio` 上也有（而且方向相反：它是被刷高）**：
+
+限速 1KB/s 时它按 60% → 30% → 20% → 15% "一路变好" ✗，其实**分子没动**：
+
+| 时刻 | 分子（重传）| 分母（累计首发）| ratio | 说明 |
+|---|---|---|---|
+| 10s | **6** | 10 | 60.00% | 就是冷启动那 6 次 ✓ |
+| 20s | **6** | 20 | 30.00% | 分子已冻结（`rto` 被抬到 49~106ms 后不再超时 ✓）|
+| 30s | **6** | 30 | 20.00% | 分母每秒 +1 |
+| 40s | **6** | 40 | 15.00% | 与"链路变好"无关 ✗ |
+
+- 分母 `counter_send_1sttime` 是**累计**值 ✓（`test.c` 调 `ffrdp_dump(ctxt, 0)` ⇒ **不清零** ✓，
+  日志里 `send_1sttime = 10/20/30/40` 正好印证 ✓）；
+- 分子那 6 次全来自**冷启动** ✓（初始 `rto = FFRDP_MIN_RTO = 16ms`，而这条路首次采样是 57ms ✗）⇒
+  **分子冻结、分母增长** ⇒ 这个比例在这种发送量下**必然单调衰减** ✓；
+- 对照不限速：发送饱和 ⇒ 分子分母同尺度增长 ⇒ 比例反而是**可信的稳态值**（2~4% ✓，与目标链路
+  客户端方向的历史值 2.6~14.9% 同量级 ✓）。
+
+⇒ 所以现在这两行都把绝对数印出来 ✓：`counter_resend_ratio: 30.00% (6 / 20)`、
+`counter_resend_waste: 100.00% (6 / 6)` —— 分母小的时候一眼看得见 ✓。
+（另外 `counter_resend_ratio` **可以超过 100%**：同一帧被重传多次时分子会大于分母，
+实测样例 `(16 / 3) = 533.33%` ✓。）
+
+**改动**（`ffrdp.c`，只动诊断输出 ✓；仿真 21/21 场景逐字相同 ✓）：
+
+| 字段 | 原来 | 现在 |
+|---|---|---|
+| `counter_resend_waste` | 重传次数 ÷ **满帧数** ✗（分母塌了就印 300% ✗）| **对端确认的白费率** = `counter_ack_dup` ÷ 重传总数 ✓（累计口径 ⇒ 不会超 100% ✓）|
+| `counter_resend_ratio` | 只有百分比 ✗（分母小的时候没法判断 ✗）| 百分比 + **绝对数**：`30.00% (6 / 20)` ✓ |
+| `counter_resend_waste` | 同上 ✗ | 百分比 + **绝对数**：`100.00% (6 / 6)` ✓ |
+| `rto_floor, waste%` | 两个量打在一行 | 拆成 `rto_floor` 一行 ✓（白费率不再重复打 ✓）|
+| 三个比例分母为 0 | `MAX(..., 1)` 兜底 ⇒ 印假数字 ✗ | 打印 **`n/a`** ✓ |
+
+**读法提醒**：小发送量下 `ratio / waste / perMB` 的分母都很小，单个事件就能把比例放大 ✗
+⇒ 这种场景要看**绝对次数**（`counter_resend_rto` / `counter_resend_fast`）✓。

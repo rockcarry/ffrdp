@@ -1040,14 +1040,27 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("counter_send_query  : %u\n"  , ffrdp->counter_send_query  );
     printf("counter_resend_rto  : %u\n"  , ffrdp->counter_resend_rto  );
     printf("counter_resend_fast : %u\n"  , ffrdp->counter_resend_fast );
-    // counter_resend_ratio is per first transmission: how many retransmits each attempt to send a frame
-    // turned into. it is not normalised by delivery, so a sender that is stalling (few attempts, few
-    // retransmits, little delivered) shows a flattering number. the two below are normalised, and they
-    // are the ones to read: how much of what went on the wire was a retransmission, and how many
-    // retransmits were spent per megabyte actually delivered.
-    printf("counter_resend_ratio: %.2f%%\n", 100.0 * (ffrdp->counter_resend_rto + ffrdp->counter_resend_fast) / MAX(ffrdp->counter_send_1sttime, 1));
-    printf("counter_resend_waste: %.2f%%\n", 100.0 * (ffrdp->counter_resend_rto + ffrdp->counter_resend_fast) / MAX(ffrdp->counter_txfull, 1));
-    printf("counter_resend_perMB: %.1f\n"  , (ffrdp->counter_resend_rto + ffrdp->counter_resend_fast) * 1048576.0 / MAX(ffrdp->counter_send_bytes, 1));
+    // the three ratios below each need a denominator that can legitimately be zero (a sender that has
+    // not sent anything yet, a receiver-only direction, a sparse sender whose frames were all short).
+    // printing a number computed against a made-up denominator of 1 is worse than printing nothing:
+    // it reads like a real measurement. so: n/a when the denominator is zero.
+    //   ratio  —— 每次首发尝试里有多少变成了重传。不按交付归一，所以"饿着"的发送方会显得很好看；
+    //   waste  —— 对端说"这一帧我早就有了"的重传，占我们自己重传总数的比例。这是链路上唯一一个
+    //            本端计数污染不了的浪费判据（本端只知道自己重传了几次，不知道对端是否早就有）；
+    //   perMB  —— 每交付 1MB 花了多少次重传（按交付归一，比 ratio 可信）。
+    {   uint32_t resend = ffrdp->counter_resend_rto + ffrdp->counter_resend_fast;
+        // ratio 与 waste 后面都跟着 (分子 / 分母)：分母小的时候（极低频发送）一眼就能看出这个百分比
+        // 不能当稳态读。例如限速 1KB/s 时"重传 6 次、累计首发 20 次"会印 30.00%，而它其实只是 6/20；
+        // 同理 waste 的 (6 / 6) 说明"对端说我们 6 次重传全部白费"，而不是一个笼统的 100%。
+        if (ffrdp->counter_send_1sttime) printf("counter_resend_ratio: %.2f%% (%u / %u)\n",
+                                                100.0 * resend / ffrdp->counter_send_1sttime, resend, ffrdp->counter_send_1sttime);
+        else                             printf("counter_resend_ratio: n/a\n");
+        if (resend)                      printf("counter_resend_waste: %.2f%% (%u / %u)\n",
+                                                100.0 * ffrdp->counter_ack_dup / resend, ffrdp->counter_ack_dup, resend);
+        else                             printf("counter_resend_waste: n/a\n");
+        if (ffrdp->counter_send_bytes)   printf("counter_resend_perMB: %.1f\n"  , resend * 1048576.0 / ffrdp->counter_send_bytes);
+        else                             printf("counter_resend_perMB: n/a\n");
+    }
     printf("counter_reach_maxrto: %u\n"  , ffrdp->counter_reach_maxrto);
     printf("counter_ack_recv    : %u\n"  , ffrdp->counter_ack_recv    );
     printf("counter_ack_mack    : %u\n"  , ffrdp->counter_ack_mack    );
@@ -1062,8 +1075,7 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("counter_rto_stale   : %u\n"  , ffrdp->counter_rto_stale   );
     printf("counter_recv_dup    : %u\n"  , ffrdp->counter_recv_dup    );
     printf("counter_ack_dup     : %u\n"  , ffrdp->counter_ack_dup     );
-    printf("rto_floor, waste%%   : %u, %.1f%%\n", ffrdp->rto_floor,
-           100.0 * ffrdp->counter_ack_dup / MAX(ffrdp->counter_resend_rto + ffrdp->counter_resend_fast, 1));
+    printf("rto_floor           : %u\n"  , ffrdp->rto_floor); // 白费率见上面的 counter_resend_waste（同一个量，不再打两遍）
     printf("counter_rto_behind  : %u\n"  , ffrdp->counter_rto_behind  );
     printf("update period avgmax: %u, %u ms (%u calls, cost max %u ms)\n",
            ffrdp->counter_upd_gap / MAX(ffrdp->counter_upd_cnt - 1, 1), ffrdp->counter_upd_gap_max,

@@ -315,7 +315,8 @@ v1.1.0 在**协议逻辑**上有四处改动，全部作用于发送端的内部
 | `swnd` | 对端广告的接收窗口（**信用**，不是速率） |
 | `wait_snd` | 应用侧排队帧数（钉满 = 应用被背压） |
 | `counter_resend_perMB` | **每交付 1MB 的重传次数**（按交付归一，比 `ratio` 更可信） |
-| `rto_floor, waste%` | RTO 下限，以及对端确认"我的重传是白费的"比例 |
+| `rto_floor` | RTO 下限（本端计时器）|
+| `counter_resend_waste` | **对端**确认"我的重传里有多少是白费的"比例 ✓（链路上唯一不被本端计数污染的判据）|
 
 #### 10.2.2 结论（按发现顺序，含被推翻的假设）
 
@@ -508,10 +509,18 @@ build               : probe 1, queue ratio 3, inflight default 64, compiled Oct 
 | `probe rtt ref/best` | 探测前 vs 探测中的**最低**往返 ⇒ **"队列是不是我们的"的原始证据** ✓ |
 | `confirmed rate` | 对端确认速率（帧/秒）—— **吞吐守门人**（砍过头会让它掉 ✗）|
 
-**读计数的两个坑**：
+**读计数的三个坑**：
 
-- **`counter_resend_ratio` 会被"饿死链路"刷低** ✗ ⇒ 判断浪费一律看 **`counter_resend_perMB`**（按交付归一 ✓）；
-- `rto_floor, waste%` 里的 `waste%` 是**对端**说我们白费的比例 ✓ —— 本端计数回答不了这个问题 ✓。
+- **`counter_resend_ratio` 会被"饿死链路"刷低** ✗，也会被**极低频发送**刷高 ✗（它的分母是**累计首发次数**，
+  分母小的时候几次重传就能占很大比例）⇒ 所以现在**把绝对数一起印出来**：
+  `counter_resend_ratio: 30.00% (6 / 20)` ✓（= 重传 6 次 / 累计首发 20 次）；
+  判断浪费仍一律看 **`counter_resend_perMB`**（按交付归一 ✓）。
+  注意它**可以超过 100%**：同一帧被重传多次时，分子（重传次数）会大于分母（首发的帧数）✓；
+- `counter_resend_waste` 同样带绝对数 ✓（`100.00% (6 / 6)` ✓ = 对端说 6 次重传全部白费 ✓）；
+- `counter_resend_waste` 是**对端**说我们白费的比例 ✓ —— 本端计数回答不了这个问题 ✓
+  （它原来寄生在 `rto_floor, waste%` 那一行里，现已独立成行 ✓）。
+- 三个比例（`counter_resend_ratio` / `counter_resend_waste` / `counter_resend_perMB`）在**分母为 0**
+  时打印 `n/a` ✓，不再拿 `1` 兜底 —— 那会印出一个"像测量值"的假数字 ✗（见 [`notes.md`](notes.md) 10.4）。
 
 ### 10.4 被否掉的路线（同样重要）
 
