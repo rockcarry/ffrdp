@@ -55,10 +55,34 @@ static uint32_t get_tick_count()
                                   // 219ms queue. So the default is the harmless value, and the probe (see
                                   // FFRDP_PROBE_ENABLE) is what experiments its way down to the right one.
                                   // It is a source constant, not a build switch: change it here and rebuild.
+#define FFRDP_INFLIGHT_MIN   4    // the floor the brake never goes below, so the probe never asks for less.
+                                  // Named because the three places that used to write their own 4 or 8 drifted
+                                  // apart and that is what the sweep caught: the brake clamped to 4, the probe
+                                  // asked for 4, but its gate demanded 8 frames on the wire -- so once a
+                                  // proven ceiling had been given back up to 5 (see FFRDP_PROBE_HEALTHY_PCT),
+                                  // the probe could never ask about it again and the run sat at 5 for ever:
+                                  // measured inflight, cap = 5, 5, holding 4ms of queue more than the same
+                                  // path held at 4. One constant, three users, no drift.
+                                  // 4 is also where the descent ends by measurement, not by taste: the sweep
+                                  // tried caps 2 and 3, both were silently clamped to this floor, and both
+                                  // measured the same rtts 14ms over a 3..5ms floor. Nothing below 4 has ever
+                                  // been observed to help, so this is the smallest question worth asking.
 
 // the delay probe: take half the in-flight away for a moment and watch whether the round trip follows.
 #define FFRDP_PROBE_HOLD_MS       500 // held for 2 round trips plus this much, long enough to drain a queue
-#define FFRDP_PROBE_RTT_DROP_PCT  85  // the round trip must fall below this percentage of the pre-probe value
+#define FFRDP_PROBE_RTT_DROP_MS   2   // the typical round trip must fall by at least this many ms. Absolute, and
+                                      // that is the whole point of the change: the rule used to be relative --
+                                      // below 85% of the value in front of it -- and the value in front of it
+                                      // was ffrdp->rttm, the LATEST sample rather than the typical one, so the
+                                      // same experiment passed or failed depending on which single sample
+                                      // happened to precede it. On the measured path the winning step is rtts
+                                      // 18 -> 14ms, i.e. 4ms: 85% of 18 asks for 2.7ms and got it only when
+                                      // the sample in front was high enough. A relative rule also cannot see
+                                      // a queue that refuses to drain: 15% of a 5ms floor is far under the
+                                      // jitter. What the experiment can actually answer is "did taking half
+                                      // the frames away visibly lower the latency", which is a difference in
+                                      // milliseconds -- so it is compared as one. The rate guard below is what
+                                      // keeps an over-eager keep harmless, and the giveback undoes a stale one.
 #define FFRDP_PROBE_RATE_KEEP_PCT 85  // ... while the rate the peer confirms stays above this percentage
 #define FFRDP_PROBE_ENABLE        1   // on by default: it is a net win wherever a queue is being held, and
                                       // where there is none the rate guard reverts it and nothing is lost.
@@ -73,9 +97,12 @@ static uint32_t get_tick_count()
 // bounded by one half window per back off, never by a permanently smaller pipe.
 #define FFRDP_PROBE_QUEUE_RATIO   3
 #define FFRDP_PROBE_WASTE_PM      5   // retransmits per thousand first transmissions, over the last second
-#define FFRDP_PROBE_MIN_OUT       8   // ... at least this many frames on the wire, so there is a pipe worth
-                                      //     halving. two older gates -- "rttm >= 50ms" and "enough retransmits
-                                      //     in the window" -- were replaced by the queue test and are gone.
+                                      // (the gate that used to sit here, "at least 8 frames on the wire", is gone:
+                                      //  what earns an experiment is not a big pipe but a ceiling that can still
+                                      //  be lowered, so the test is now "the halved ceiling is strictly under the
+                                      //  one in force" against FFRDP_INFLIGHT_MIN's floor -- see below.)
+                                      // two older gates -- "rttm >= 50ms" and "enough retransmits in the window" --
+                                      // were replaced by the queue test and are gone.
 #define FFRDP_PROBE_GAP_MS        10000
 #define FFRDP_PROBE_GAP_MAX_MS    60000
 #define FFRDP_PROBE_HEALTHY_PCT   1   // below this much waste the kept window is given back a little
@@ -170,10 +197,17 @@ typedef struct {
 #endif
 
     uint32_t counter_udpsenderr;
+    // every sendto that did not take the frame, counted over the dump interval, whichever path it came
+    // from: a data frame, an ack, a query, an fec frame. counter_udpsenderr above cannot answer the
+    // question this exists for -- it is a CONSECUTIVE failure count, reset by the next success, so a
+    // socket that refuses one frame in ten (a send buffer too small for the burst) reads as zero at
+    // almost every sampling instant. The ack/query/fec paths do not check their sendto at all, so until
+    // this counter existed, an ack that could not be sent was invisible everywhere.
+    uint32_t counter_send_err;
     uint32_t counter_send_bytes;   // payload of the frames the peer acked: bytes DELIVERED, not bytes put on the wire
     uint32_t counter_recv_bytes;   // ... of the frames we acked
     uint32_t counter_send_1sttime; // first transmissions: the denominator of counter_resend_ratio
-    uint32_t counter_send_failed;
+    uint32_t counter_send_failed;  // ffrdp_send refused the call (app queue full, or an allocation failed)
     uint32_t counter_send_query;
     uint32_t counter_resend_fast;
     uint32_t counter_resend_rto;
@@ -387,14 +421,16 @@ static int ffrdp_send_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame, s
     case 4 : ffrdp->counter_txfull ++; break; // tx full  frame
     default: ffrdp->counter_txshort++; break; // tx short frame
     }
-    if (sendto(ffrdp->udp_fd, (void*)frame->data, frame->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)) != frame->size) { ffrdp->counter_udpsenderr++; return -1; }
+    if (sendto(ffrdp->udp_fd, (void*)frame->data, frame->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)) != frame->size) { ffrdp->counter_udpsenderr++; ffrdp->counter_send_err++; return -1; }
     else ffrdp->counter_udpsenderr = 0;
     if (frame->size == 4 + ffrdp->smss + 2) { // fec frame
         uint32_t *psrc = (uint32_t*)frame->data, *pdst = (uint32_t*)ffrdp->fec_txbuf, i;
         for (i = 0; i < (4 + ffrdp->smss) / sizeof(uint32_t); i++) *pdst++ ^= *psrc++; // make xor fec frame
         if (ffrdp->fec_txseq % ffrdp->fec_txredundancy == ffrdp->fec_txredundancy - 1) {
             *(uint16_t*)(ffrdp->fec_txbuf + 4 + ffrdp->smss) = ffrdp->fec_txseq++; ffrdp->fec_txbuf[0] = ffrdp->fec_txredundancy;
-            sendto(ffrdp->udp_fd, (void*)ffrdp->fec_txbuf, frame->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)); // send fec frame
+            // count it like any other send: a redundancy frame the socket refused is a repair that will
+            // not happen, and it used to leave no trace anywhere.
+            if (sendto(ffrdp->udp_fd, (void*)ffrdp->fec_txbuf, frame->size, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)) != frame->size) ffrdp->counter_send_err++; // send fec frame
             memset(ffrdp->fec_txbuf, 0, sizeof(ffrdp->fec_txbuf)); // clear tx_fecbuf
             ffrdp->counter_fec_tx++;
         }
@@ -637,7 +673,10 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, struct sockaddr_in *
     if (ffrdp->dup_seen) { data[8] = (uint8_t)MIN(ffrdp->dup_seen, 255); alen = (int32_t)sizeof(data); }
     else                 { alen = 8; }
     ffrdp->dup_seen = 0;
-    sendto(ffrdp->udp_fd, (void*)data, alen, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)); // send ack frame
+    // this sendto used to be unchecked, which made an ack the socket refused indistinguishable from an ack
+    // the network ate -- and the peer pays for both with a timeout. counting it is the whole change: the
+    // ack is still attempted, and nothing here acts on the result.
+    if (sendto(ffrdp->udp_fd, (void*)data, alen, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)) != alen) ffrdp->counter_send_err++; // send ack frame
 }
 
 enum { CEVENT_ACK_OK, CEVENT_ACK_TIMEOUT, CEVENT_FAST_RESEND, CEVENT_SEND_FAILED };
@@ -703,7 +742,7 @@ void ffrdp_update(void *ctxt)
             // frames are first sent in sequence order, so everything already sent sits in front of this
             // one and breaking here skips nothing that needed attention. retransmits are untouched: this
             // only stops adding new frames to a wire that already holds FFRDP_INFLIGHT_MAX of them.
-            if (ffrdp->inflight_used >= MAX(ffrdp->inflight_max ? ffrdp->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX, 4u)) break;
+            if (ffrdp->inflight_used >= MAX(ffrdp->inflight_max ? ffrdp->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX, (uint32_t)FFRDP_INFLIGHT_MIN)) break;
             if (ffrdp->swnd > 0) {
                 if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) { ffrdp_congestion_control(ffrdp, CEVENT_SEND_FAILED); break; }
                 p->tick_1sts = p->tick_send = get_tick_count();
@@ -711,7 +750,7 @@ void ffrdp_update(void *ctxt)
                 p->flags       |= FLAG_FIRST_SEND;
                 ffrdp->swnd--; ffrdp->counter_send_1sttime++; ffrdp->win_first++; ffrdp->inflight_used++;
             } else if (ffrdp->tick_send_query == 0 || (int32_t)get_tick_count() - (int32_t)ffrdp->tick_send_query > FFRDP_QUERY_CYCLE) { // query remote receive window size
-                data[0] = FFRDP_FRAME_TYPE_QUERY; sendto(ffrdp->udp_fd, (void*)data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in));
+                data[0] = FFRDP_FRAME_TYPE_QUERY; if (sendto(ffrdp->udp_fd, (void*)data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)) != 1) ffrdp->counter_send_err++;
                 ffrdp->tick_send_query = get_tick_count(); ffrdp->counter_send_query++;
                 break;
             }
@@ -955,7 +994,7 @@ void ffrdp_update(void *ctxt)
         if (ffrdp->probe_state == 0) {
             uint32_t waste = ffrdp->probe_waste;
             if ((int32_t)now - (int32_t)ffrdp->probe_next >= 0) {
-                uint32_t out = 0;
+                uint32_t out = 0, cap_want, holding, idle;
                 // count only frames that are really on the wire: the list also holds frames the
                 // application has queued but that have not been sent yet, and halving those would not
                 // halve what is in flight at all.
@@ -965,24 +1004,55 @@ void ffrdp_update(void *ctxt)
                 // and it is the delay a ping sees while the transfer runs. a retransmit count is a much
                 // weaker trigger -- on this path it is down to a few per mille once the floor is up -- so it
                 // stays only as a second way in for paths whose floor is already low.
-                if (FFRDP_PROBE_ENABLE && out >= FFRDP_PROBE_MIN_OUT &&
-                    ((ffrdp->rtt_min && ffrdp->rtts != (uint32_t)-1 &&
-                      ffrdp->rtts > FFRDP_PROBE_QUEUE_RATIO * ffrdp->rtt_min) ||
-                     waste >= FFRDP_PROBE_WASTE_PM)) {
+                // the size gate used to be "at least 8 frames on the wire", read as "a pipe worth halving",
+                // and it acted as a one way ratchet: with the ceiling already down at 4 or 5 there are never
+                // 8 frames to see, so the probe could not ask again -- while the giveback below, whose job
+                // is to notice a path that got faster, lifts a proven 4 to 5 and leaves it there. measured
+                // state on the target path: inflight, cap = 5, 5, holding 4ms of queue over what the very
+                // same path held at 4. what is worth asking is not a big pipe but a ceiling that can still
+                // come down, so the gate is the halved ceiling being strictly under the one in force, and
+                // the floor of FFRDP_INFLIGHT_MIN is where the descent legitimately ends.
+                cap_want = MAX(out / 2, (uint32_t)FFRDP_INFLIGHT_MIN);
+                // "is the path holding a queue" is asked twice below, but with two DIFFERENT yardsticks --
+                // and that is what the measured sweep of 2026-10-10 taught: the ratio is a good gate for
+                // starting an experiment and a bad one for ending it. On the target path rtts/rtt_min sat
+                // at 3x in 18 of 29 dumps, at 4x in 8 and under 3x in 2, so a giveback gated on it opens
+                // and closes from one check to the next; seven givebacks slipped through in 300 seconds,
+                // each lifting a proven 4 back to 5 (once to 6), and each one pushing the next probe a whole
+                // FFRDP_PROBE_GAP_MS away. The window therefore spent the run at 5 and measured rtts 17ms,
+                // where the very same path pinned at 4 measured 11ms. So the trigger keeps the ratio (3x is
+                // where a queue becomes worth a question) and the giveback needs the queue to be genuinely
+                // gone, judged in milliseconds -- the same scale as the keep test it exists to undo.
+                holding = (ffrdp->rtt_min && ffrdp->rtts != (uint32_t)-1 &&
+                           ffrdp->rtts > FFRDP_PROBE_QUEUE_RATIO * ffrdp->rtt_min) ? 1u : 0u;
+                idle    = (ffrdp->rtt_min && ffrdp->rtts != (uint32_t)-1 &&
+                           ffrdp->rtts < ffrdp->rtt_min + FFRDP_PROBE_RTT_DROP_MS) ? 1u : 0u;
+                if (FFRDP_PROBE_ENABLE && out > FFRDP_INFLIGHT_MIN && cap_want < ffrdp->inflight_max &&
+                    (holding || waste >= FFRDP_PROBE_WASTE_PM)) {
                     uint32_t rtt = (ffrdp->rtts == (uint32_t)-1 || ffrdp->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : ffrdp->rtts;
                     ffrdp->probe_state   = 1;
                     ffrdp->probe_tick    = now;
                     ffrdp->probe_hold    = 2 * rtt + FFRDP_PROBE_HOLD_MS;
-                    ffrdp->probe_cap     = MAX(out / 2, 4);
-                    ffrdp->probe_rtt_ref = ffrdp->rttm;
+                    ffrdp->probe_cap     = cap_want;
+                    // the reference is the TYPICAL round trip, and the experiment tracks that same
+                    // estimate, so the two numbers being subtracted come from one filter -- which is what
+                    // makes a two millisecond difference readable at all. rttm is only a fallback, for a
+                    // connection too young to have a typical yet.
+                    ffrdp->probe_rtt_ref = ffrdp->rtts != (uint32_t)-1 ? ffrdp->rtts : ffrdp->rttm;
                     ffrdp->probe_rate_ref= ffrdp->rate_now;
                     ffrdp->probe_best    = 0xFFFFFFFF;
                     ffrdp->probe_del_ref = ffrdp->counter_delivered;
                     ffrdp->cap           = ffrdp->probe_cap;
                     ffrdp->counter_probe++;
-                } else if (waste < FFRDP_PROBE_HEALTHY_PCT && ffrdp->cap_kept) {
-                    // nothing is being wasted any more: give a little of the window back, so a path that
-                    // has become faster is not held down for ever by a limit proven on an older path.
+                } else if (waste < FFRDP_PROBE_HEALTHY_PCT && ffrdp->cap_kept && idle) {
+                    // nothing is being wasted any more, and the queue is genuinely gone (idle, the absolute
+                    // test above -- not the ratio, which sits right at its own threshold on this path): give
+                    // a little of the window back, so a path that has become faster is not held down for
+                    // ever by a limit proven on an older path. the idle half is not decoration: a giveback
+                    // schedules the next look a whole FFRDP_PROBE_GAP_MS away, so giving back while a queue
+                    // is still there parks a proven 4 at 5 for ten seconds at a time and hands back the win
+                    // the probe just measured -- measured: seven times in 300s, which is why the run sat at
+                    // 5. a path that got faster is a path whose queue has drained, and that is this test.
                     ffrdp->cap_kept   = MIN(ffrdp->cap_kept + MAX(ffrdp->cap_kept / 4, 1), (uint32_t)FFRDP_INFLIGHT_MAX);
                     ffrdp->cap        = ffrdp->cap_kept;
                     ffrdp->probe_next = now + FFRDP_PROBE_GAP_MS;
@@ -1000,12 +1070,22 @@ void ffrdp_update(void *ctxt)
                 }
             }
         } else {
-            if (ffrdp->rttm && ffrdp->rttm != (uint32_t)-1 && ffrdp->rttm < ffrdp->probe_best) ffrdp->probe_best = ffrdp->rttm;
+            // track the same estimate the reference came from (an eight sample average, so it settles in
+            // roughly a tenth of the hold): comparing rttm's noisiest sample with rtts' typical value was
+            // the other half of why this experiment answered at random.
+            if (ffrdp->rtts != (uint32_t)-1 && ffrdp->rtts < ffrdp->probe_best) ffrdp->probe_best = ffrdp->rtts;
             if ((int32_t)now - (int32_t)ffrdp->probe_tick >= (int32_t)ffrdp->probe_hold) {
                 uint32_t span      = MAX(now - ffrdp->probe_tick, 1);
                 uint32_t rate_held = (ffrdp->counter_delivered - ffrdp->probe_del_ref) * 1000 / span;
-                uint32_t rtt_down  = ffrdp->probe_best != 0xFFFFFFFF && ffrdp->probe_rtt_ref &&
-                                     ffrdp->probe_best * 100 < ffrdp->probe_rtt_ref * FFRDP_PROBE_RTT_DROP_PCT;
+                // the delay followed if the typical round trip now sits at least FFRDP_PROBE_RTT_DROP_MS
+                // under where it stood -- an absolute difference, because that is the size of the thing
+                // being measured. a missing reference means a connection with no typical yet, and then
+                // nothing has been proven: never keep a smaller window on a missing measurement. the order
+                // of the two tests matters: probe_best is the 0xFFFFFFFF "no sample" sentinel until the
+                // first update, and it must be rejected before it is subtracted.
+                uint32_t rtt_down  = ffrdp->probe_best != 0xFFFFFFFF &&
+                                     ffrdp->probe_rtt_ref > ffrdp->probe_best &&
+                                     ffrdp->probe_rtt_ref - ffrdp->probe_best >= FFRDP_PROBE_RTT_DROP_MS;
                 uint32_t rate_kept = rate_held * 100 >= ffrdp->probe_rate_ref * FFRDP_PROBE_RATE_KEEP_PCT;
                 if (rtt_down && rate_kept) {
                     ffrdp->cap_kept  = ffrdp->probe_cap;
@@ -1083,10 +1163,12 @@ void ffrdp_dump(void *ctxt, int clearhistory)
         // what the probe's trigger sees at the moment it is asked: waste is retransmits per mille over the
         // last second, out is what is on the wire, and the queue test is the typical round trip against the
         // path's own floor -- that is the gate which actually earns a probe (the old "rttm >= 50ms" line
-        // printed here had stopped being a gate when the queue test replaced it).
-        printf("probe trigger       : waste %u pm, rtts/rtt_min %u/%u, out %u (needs %u pm, >%ux, %u frames)\n",
+        // printed here had stopped being a gate when the queue test replaced it). the size gate is "the
+        // halved ceiling is still under the one in force and above the floor", so it is read as two numbers:
+        // out/2 is what a probe would ask for, and it must land under the limit on the next line.
+        printf("probe trigger       : waste %u pm, rtts/rtt_min %u/%u, out %u (needs %u pm, >%ux, out > %u and out/2 under the limit above)\n",
                ffrdp->probe_waste, ffrdp->rtts, ffrdp->rtt_min, out,
-               FFRDP_PROBE_WASTE_PM, FFRDP_PROBE_QUEUE_RATIO, FFRDP_PROBE_MIN_OUT);
+               FFRDP_PROBE_WASTE_PM, FFRDP_PROBE_QUEUE_RATIO, (uint32_t)FFRDP_INFLIGHT_MIN);
         // 1x is the floor itself, and that is the number to watch fall when the probe wins. rtts is
         // smoothed across intervals while rtt_min is the lowest of this one, so rtts can legitimately read
         // below the floor; printing that as 0x would read like a fault, so anything at or under it shows 1x.
@@ -1095,8 +1177,12 @@ void ffrdp_dump(void *ctxt, int clearhistory)
                (ffrdp->rtt_min && ffrdp->rtts != (uint32_t)-1 && ffrdp->rtts > ffrdp->rtt_min)
                    ? ffrdp->rtts / ffrdp->rtt_min : 1,
                FFRDP_PROBE_QUEUE_RATIO, FFRDP_PROBE_WASTE_PM);
-        printf("probe rtt ref/best  : %u, %u\n",
-               ffrdp->probe_rtt_ref, ffrdp->probe_best == 0xFFFFFFFF ? 0 : ffrdp->probe_best);
+        // both are the same estimate -- the typical round trip before the probe and its lowest value during
+        // it -- so the difference is directly the proof the probe is looking for: a fall of at least
+        // FFRDP_PROBE_RTT_DROP_MS keeps the smaller window (if the confirmed rate also held).
+        printf("probe rtt ref/best  : %u, %u (typical before, lowest during; a keep needs a fall of >= %u ms)\n",
+               ffrdp->probe_rtt_ref, ffrdp->probe_best == 0xFFFFFFFF ? 0 : ffrdp->probe_best,
+               (uint32_t)FFRDP_PROBE_RTT_DROP_MS);
         printf("confirmed rate      : %u frames/s\n", ffrdp->rate_now);
     }
     printf("fec_txredundancy    : %d\n"  , ffrdp->fec_txredundancy    );
@@ -1106,6 +1192,11 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("fec_rxmask          : %08x\n", ffrdp->fec_rxmask          );
     printf("counter_send_1sttime: %u\n"  , ffrdp->counter_send_1sttime);
     printf("counter_send_failed : %u\n"  , ffrdp->counter_send_failed );
+    // the other half of "could not send": ffrdp_send counts refusals by the library (queue full), this
+    // counts refusals by the kernel (sendto did not take the datagram), over this dump interval. if this
+    // is not zero, the send buffer is too small for how we burst -- and the frames affected were retried,
+    // so the cost is invisible except here.
+    printf("counter_send_err    : %u\n"  , ffrdp->counter_send_err    );
     printf("counter_send_query  : %u\n"  , ffrdp->counter_send_query  );
     printf("counter_resend_rto  : %u\n"  , ffrdp->counter_resend_rto  );
     printf("counter_resend_fast : %u\n"  , ffrdp->counter_resend_fast );
