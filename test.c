@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <signal.h>
 #include <pthread.h>
 #include "ffrdp.h"
 
@@ -13,7 +12,6 @@
 #define get_tick_count GetTickCount
 #define strtok_r strtok_s
 #else
-#include <sys/select.h>
 static uint32_t get_tick_count()
 {
     struct timespec ts;
@@ -35,11 +33,10 @@ static uint32_t get_tick_count()
 // ffrdp_send 是原子的（要么整条接受、要么返回 -1），所以 seq 只在 ret == len 时才 +1。
 #define TEST_MSG_OVERHEAD        12
 
-static volatile sig_atomic_t g_exit = 0;
-
-// Ctrl+C / kill：信号处理里只做一件安全的事 —— 置标志。两个对等端线程会自己收尾
-// （打印 verify 汇总、ffrdp_free），main 在下面的 select 超时里看到它之后开始 join。
-static void on_stop_signal(int sig) { (void)sig; g_exit = 1; }
+// 退出只有一条路：输入 quit / exit（或 stdin 结束）。两个对等端线程看到它之后收尾，
+// 打印 verify 汇总并 ffrdp_free。Ctrl+C 不做任何特殊处理 —— 进程会直接结束（看不到汇总），
+// 这是接受的代价：测试程序不值得为信号路径维护额外逻辑（见 docs/notes.md 5.21）。
+static volatile int g_exit = 0;
 static char server_bind_ip[32]   = "0.0.0.0";
 static char client_cnnt_ip[32]   = "127.0.0.1";
 static int  server_bind_port     = 8000;
@@ -321,8 +318,9 @@ int main(int argc, char *argv[])
         printf("  every message is [len][seq][payload][crc32] and is checked at the receiver:\n");
         printf("  seq continuity + crc + no partial send; a summary is printed at exit.\n");
         printf("  the two roles may be given together (self test on one host) - the send rate\n");
-        printf("  limit then applies to both; type 'quit'/'exit' or press Ctrl+C to stop (both\n");
-        printf("  ways print the verify summary); a diagnostic dump is printed every 10 s.\n");
+        printf("  limit then applies to both; type 'quit' or 'exit' to stop: only that way prints\n");
+        printf("  the verify summary (Ctrl+C ends the process without it); a diagnostic dump is\n");
+        printf("  printed every 10 s.\n");
         printf("\n");
         return 0;
     }
@@ -370,27 +368,12 @@ int main(int argc, char *argv[])
     if (server_en) pthread_create(&hserver, NULL, peer_thread, (void*)TEST_PEER_SERVER);
     if (client_en) pthread_create(&hclient, NULL, peer_thread, (void*)TEST_PEER_CLIENT);
 
-    signal(SIGINT,  on_stop_signal);
-    signal(SIGTERM, on_stop_signal);
+    // 退出只认 quit / exit，或 stdin 结束（Ctrl+D、管道关闭）—— 后者在脚本里跑很有用。
     while (!g_exit) {
-#ifdef WIN32
         char cmd[256];
-        scanf("%256s", cmd);
+        if (scanf("%256s", cmd) != 1) break;
         if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) g_exit = 1;
-#else
-        // 带超时地等 stdin：Ctrl+C 之后能立刻退出这个循环去 join 线程，
-        // 而不是死等在 scanf 上（默认会重启的阻塞调用）导致线程来不及收尾。
-        fd_set rs; struct timeval tv;
-        FD_ZERO(&rs); FD_SET(0, &rs);
-        tv.tv_sec = 0; tv.tv_usec = 100 * 1000;
-        if (select(1, &rs, NULL, NULL, &tv) > 0) {
-            char cmd[256];
-            if (scanf("%256s", cmd) != 1) break;  // stdin 结束（Ctrl+D / 管道关闭）也退出
-            if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) g_exit = 1;
-        }
-#endif
     }
-    printf("stopping ...\n");
 
     if (hserver) pthread_join(hserver, NULL);
     if (hclient) pthread_join(hclient, NULL);

@@ -121,8 +121,7 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
 - **不限速时的速率由测试程序自己决定**：本机回环约 **90~100MB/s** ✓
   （framing + crc32 + 伪随机填充的 CPU 开销 ✓），远高于真实链路 ✓；
 - 不带任何参数时只打印用法，然后退出；
-- 运行中输入 `quit` / `exit`，或直接 **Ctrl+C** 退出 ✓ —— 两种方式都会**先打印上面的 `verify:` 汇总**再退出 ✓
-  （`SIGINT`/`SIGTERM` 都会被捕获 ⇒ 线程收尾、`ffrdp_free` 干净退出 ✓）；
+- **退出请用 `quit` / `exit`** ✓ —— 只有这种方式会**先打印上面的 `verify:` 汇总**再退出 ✓；
 - 内部固定 `ffrdp_init(ip, port, NULL, NULL, server, 1280, 0)`
   ⇒ **MSS 1280 字节、FEC 冗余度 0（关闭）**，需要别的组合请改 `test.c`。
 
