@@ -50,6 +50,12 @@ typedef struct {
     // queued a frame, so that the frame goes out immediately instead of at the deadline set earlier.
     int  (*timer)(void *fl, uint32_t deadline_ms);
     void (*exit)(void *fl);
+    // Turn a peer's text form ("1.2.3.4:5678", the backend's own syntax) into an addr that send() accepts,
+    // so a layer that was configured with a peer can speak first. An addr taken out of a receive message
+    // can simply be echoed back, but a peer that has not spoken yet has to be named some other way, and
+    // the layout of the value is private to the backend -- only send() and this call ever look inside it.
+    // Returns 0 on success, -1 if the text is not a peer the backend can address.
+    int  (*addr_parse)(void *fl, const char *text, uint64_t *addr);
 } FFRDP_LOWLEVEL;
 
 // params:

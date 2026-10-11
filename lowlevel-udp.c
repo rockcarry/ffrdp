@@ -22,6 +22,7 @@ typedef struct {
     int  (*send)(void *fl, uint64_t addr, uint8_t *buf, int len);
     int  (*timer)(void *fl, uint32_t deadline_ms);
     void (*exit)(void *fl);
+    int  (*addr_parse)(void *fl, const char *text, uint64_t *addr);
 
     #define FLAG_BIND_ADDR (1 << 0)
     uint32_t           flags;
@@ -117,6 +118,34 @@ static int ffrdp_udp_lowlevel_timer(void *fl, uint32_t deadline_ms)
     udp->deadline = deadline_ms;
     pthread_mutex_unlock(&udp->lock);
     ffrdp_udp_notify(udp);
+    return 0;
+}
+
+// "1.2.3.4:5678" -> addr, going through the same encoder the receive path uses, so that a peer named up
+// front is addressed exactly like one that has spoken. A peer needs a real port, so 0 is refused here.
+static int ffrdp_udp_lowlevel_addr_parse(void *fl, const char *text, uint64_t *addr)
+{
+    struct sockaddr_in sin;
+    const char        *colon;
+    char               ip[64];
+    size_t             iplen;
+    int                port;
+
+    if (!fl || !text || !addr) return -1;
+    colon = strrchr(text, ':');
+    iplen = colon ? (size_t)(colon - text) : 0;
+    if (!colon || iplen == 0 || iplen >= sizeof(ip)) return -1;
+    memcpy(ip, text, iplen);
+    ip[iplen] = '\0';
+    port = atoi(colon + 1);
+    if (port <= 0 || port > 65535) return -1;
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family      = AF_INET;
+    sin.sin_addr.s_addr = inet_addr(ip);
+    if (sin.sin_addr.s_addr == INADDR_NONE) return -1;
+    sin.sin_port        = htons((uint16_t)port);
+    *addr = ffrdp_udp_addr_pack(&sin);
     return 0;
 }
 
@@ -288,6 +317,7 @@ FFRDP_LOWLEVEL* ffrdp_udp_lowlevel_init(void *params, FFRDP_LOWLEVEL_CB callback
     udp->send         = ffrdp_udp_lowlevel_send;
     udp->timer        = ffrdp_udp_lowlevel_timer;
     udp->exit         = ffrdp_udp_lowlevel_exit;
+    udp->addr_parse   = ffrdp_udp_lowlevel_addr_parse;
     udp->sockfd       = -1;   // 0 is a valid descriptor, so "no socket yet" cannot be spelled with a zero
     udp->notify[0]    = -1;
     udp->notify[1]    = -1;
