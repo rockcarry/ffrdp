@@ -125,6 +125,22 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
 - 内部固定 `ffrdp_init(ip, port, NULL, NULL, server, 1280, 0)`
   ⇒ **MSS 1280 字节、FEC 冗余度 0（关闭）**，需要别的组合请改 `test.c`。
 
+### lowlevel 一致性测试（`tools/test-lowlevel-udp.sh`）
+
+v2.0.0 起协议层与 socket 解耦，底座是 `lowlevel.h` 定义的传输端点（发 + 收 + 定时器，
+自带工作线程）。这一层有自己的契约测试，只走 127.0.0.1、端口按 pid 取，不需要网络与配置：
+
+```bash
+bash tools/test-lowlevel-udp.sh            # 普通构建（-Wall -Wextra -Werror），约 12 秒
+ASAN=1 bash tools/test-lowlevel-udp.sh     # 打开地址消毒器（含泄漏检测），约 8 秒
+```
+
+九节，223 项断言：参数解析 ✓、收包消息与来源地址 ✓、回发（含回调内 `send` 与主线程 `send`）✓、
+载荷边界（含 1500 截断）✓、节流与突发负载 ✓、双端点与并发 ✓、生命周期（70 次 init/exit 的
+fd/线程零泄漏 ✓、无期限时 `exit` 及时返回 ✓）、定时器（期限精度 / 已过即立刻 / 覆盖式 /
+回调内重设 / 跨线程催发 / `RECV` 与 `TIMER` 不交错 / 回调不嵌套）✓。
+设计取舍与实测数字见 [`docs/notes.md`](docs/notes.md) 第 13 节。
+
 ---
 
 ## 五、目录结构
@@ -133,6 +149,10 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
 .
 ├── ffrdp.c                 协议实现（单文件：ARQ + FEC + 流控/并发控制 + 诊断）
 ├── ffrdp.h                 对外 API（init/free/send/recv/update/flush/isdead/dump）
+├── lowlevel.h              v2.0.0 分层：lowlevel 接口（tx + rx + timer，自带工作线程）
+├── lowlevel-udp.c          lowlevel 的 UDP 实现（绑定 + 收发 + timer + 唤醒管道）
+├── socket.c / socket.h     socket 薄封装（初始化、选项、超时、非阻塞）
+├── utils.c / utils.h       时间戳、线程 setname/getname、模块线程状态机
 ├── test.c                  测试程序（服务端/客户端共用一个参数化的对等端循环 + 每 10 秒 dump）
 ├── build.sh                构建脚本（静态库 + 测试程序 + pkg-config）
 ├── readme.md               本文件：概述、版本、编译、测试、目录
@@ -145,6 +165,8 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
     ├── sim/                差分仿真：虚拟时钟 + 假 socket，把两版代码放在同一条确定假链路上 A/B
     ├── ffrdp-fuzz.c        端口侧敌意输入：以不讲协议的对端身份打监听端口，判进程是否存活
     ├── inflight-sweep.sh   在途上限扫描：钉住上限并关掉探测，量出在途 ->（延迟, 速率）
+    ├── test-lowlevel-udp.sh  lowlevel 一致性测试的构建与运行（普通 / ASAN=1）
+    ├── test-lowlevel-udp.c   它的测试主体：参数、收发包与地址、载荷边界、负载、多端点、生命周期、timer
     └── keylog.sh           从 test_ffrdp 的输出里只留关键行，并打印"最后一块汇总 + 逐块趋势"
 ```
 
