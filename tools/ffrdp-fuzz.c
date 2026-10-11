@@ -202,7 +202,19 @@ int main(int argc, char *argv[])
     cases = CORPUS_CASES + random_n;
     printf("fuzz: %d fragments -> %s:%d%s\n", cases, host, port,
            spawned ? "  (server started here, liveness = waitpid)" : "  (server already running, liveness = does it still answer)");
-    if (spawned && start_child() != 0) { fprintf(stderr, "could not start the server\n"); return 2; }
+    if (spawned) {
+        int code = 0;
+        if (start_child() != 0) { fprintf(stderr, "could not start the server\n"); return 2; }
+        // A server that never came up is not a server this tool killed. Without this check a wrong path,
+        // a wrong working directory or a port already in use reads as "every single fragment crashed it",
+        // which is the loudest possible false alarm (measured: 698 out of 698, all with an exit code, none
+        // with a signal -- the command simply did not exist where it was run from).
+        if (!server_alive(NULL, &code)) {
+            fprintf(stderr, "the server did not start (exit code %d): check the command and the directory "
+                            "it is run from\n", code);
+            return 2;
+        }
+    }
 
     for (i = 0; i < cases; i++) {
         int len = build_fragment(i, buf);
@@ -216,7 +228,13 @@ int main(int argc, char *argv[])
                 printf("  DIED after #%d (len %d |", i, len);
                 print_hex(buf, len);
                 printf(" ) : %s\n", sig ? strsignal(sig) : "exit code != 0");
-                if (spawned) { if (start_child() != 0) { fprintf(stderr, "restart failed\n"); return 2; } }
+                if (spawned) {
+                    int rc2 = 0;
+                    if (start_child() != 0 || !server_alive(NULL, &rc2)) {
+                        fprintf(stderr, "the server could not be restarted (exit code %d); stopping\n", rc2);
+                        return 2;
+                    }
+                }
                 else break;                     // nothing to restart: the answer is already reported
             }
         }
