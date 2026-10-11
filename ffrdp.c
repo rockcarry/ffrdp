@@ -157,6 +157,13 @@ typedef struct tagFFRDP_FRAME_NODE {
 
 typedef struct {
     uint8_t  recv_buff[FFRDP_RECVBUF_SIZE];
+    // 应用交给协议的数据（4 字节长度前缀 + 数据），协议在 tick 里取出并成帧。
+    // 为什么要过这一道：成帧要碰的全是协议状态（cur_new_node / send_seq / 加密密钥），让应用线程直接
+    // 去写它，就等于把协议的一半搬到应用线程上。放在这里之后，协议侧只被一个执行者碰；下一步协议搬
+    // 到 lowlevel 的工作线程上时，这个队列就是两条线程之间唯一的界面（那时只需要给它加一把锁）。
+    uint8_t *app_tx_buff;         // 运行时按 smss 分配，容量见 app_tx_cap
+    uint32_t app_tx_cap;
+    uint32_t app_tx_size;
     int32_t  recv_size, recv_head, recv_tail;
     #define FLAG_SERVER    (1 << 0)
     #define FLAG_CONNECTED (1 << 1)
@@ -518,6 +525,9 @@ void* ffrdp_init(char *ip, int port, char *txkey, char *rxkey, int server, int s
     ffrdp->tick_ffrdp_dump  = get_tick_count();
     ffrdp->tick_ffrdp_init  = ffrdp->tick_ffrdp_dump;
     ffrdp->tick_rto_backoff = ffrdp->tick_ffrdp_dump - ffrdp->rto; // allow the first timeout to backoff
+    // 应用队列：容量与旧版"最多 FFRDP_MAX_WAITSND 帧在途"同一量级，按 smss 算
+    ffrdp->app_tx_cap = (uint32_t)FFRDP_MAX_WAITSND * (ffrdp->smss + 4);
+    if (!(ffrdp->app_tx_buff = calloc(1, ffrdp->app_tx_cap))) goto failed;
 
     ffrdp->server_addr.sin_family      = AF_INET;
     ffrdp->server_addr.sin_port        = htons(port);
@@ -561,6 +571,7 @@ void* ffrdp_init(char *ip, int port, char *txkey, char *rxkey, int server, int s
 
 failed:
     if (ffrdp->udp_fd > 0) closesocket(ffrdp->udp_fd);
+    if (ffrdp->app_tx_buff) free(ffrdp->app_tx_buff);
     free(ffrdp);
     return NULL;
 }
@@ -570,6 +581,7 @@ void ffrdp_free(void *ctxt)
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ctxt) return;
     if (ffrdp->udp_fd > 0) closesocket(ffrdp->udp_fd);
+    if (ffrdp->app_tx_buff) free(ffrdp->app_tx_buff);
     if (ffrdp->cur_new_node) free(ffrdp->cur_new_node);
     list_free(&ffrdp->send_list_head, &ffrdp->send_list_tail);
     list_free(&ffrdp->recv_list_head, &ffrdp->recv_list_tail);
@@ -580,36 +592,56 @@ void ffrdp_free(void *ctxt)
 #endif
 }
 
-static int ffrdp_send_try(FFRDPCONTEXT *ffrdp, char *buf, int len);
 void       ffrdp_update(void *ctxt);   // 内部函数：ffrdp.h 不再声明它（应用不再周期性调用）
+static int ffrdp_frame_message(FFRDPCONTEXT *ffrdp, char *buf, int len);
+static void ffrdp_drain_tx(FFRDPCONTEXT *ffrdp);
 
-// 发送对外只有一个入口。语义没有变：**要么整条接受、要么一个字节都不接受**；区别只是调用方现在可以说
-// "最多等多久" —— 等待期间协议照常跑（ack 回来、队列腾出空间），这就是 socket 那种阻塞写。
+// 发送对外只有一个入口，语义没有变：**要么整条接受、要么一个字节都不接受**。
+// 它只把消息（4 字节长度 + 数据）放进应用队列，成帧留给协议在 tick 里做 —— 这样所有协议状态
+// （cur_new_node / send_seq / 加密密钥）都只被协议侧碰，为下一步把协议搬到 lowlevel 线程做好准备。
+// timeout_ms：0 = 放不下就直接失败；>0 = 最多等这么久（等待期间跑协议，它会把队列腾出来）；<0 = 等到能放。
 int ffrdp_send(void *ctxt, char *buf, int len, int timeout_ms)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     uint32_t      t0;
-    if (!ffrdp) return -1;
+    if (!ffrdp || !buf || len <= 0) return -1;
+    if ((ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0) {
+        ffrdp->counter_send_failed++;
+        return -1;                                   // 对端还没连上：与以前一样直接拒绝
+    }
+    // 受理判据与旧版逐字相同：帧数上限（在途 + 这一条要占的帧）算在这里，不在出队时算。
+    // 差别只在"判完之后的动作"：旧版就地成帧，现在放进队列、由协议在 tick 里成帧。
+    // （这一步还是单线程，wait_snd 可以直接读；下一步协议搬到 lowlevel 线程上时，这个读要在锁里。）
+    if ((len + ffrdp->smss - 1) / ffrdp->smss + ffrdp->wait_snd > FFRDP_MAX_WAITSND) {
+        ffrdp->counter_send_failed++;
+        return -1;
+    }
     t0 = get_tick_count();
     for (;;) {
-        if (ffrdp_send_try(ffrdp, buf, len) == len) return len;
-        if (timeout_ms == 0) return -1;
-        if (timeout_ms > 0 && (int32_t)(get_tick_count() - t0) >= timeout_ms) return -1;
-        // 一个字节都没被接受，而调用方要求等：跑一轮协议（它自己会在传输上 nap 一小会儿）再试。
-        // 这一轮里 ack 会到达、send_list 会腾出空间，所以"等一下再发"是真的能发出去了。
+        if (ffrdp->app_tx_buff && (uint32_t)len + 4 + ffrdp->app_tx_size <= ffrdp->app_tx_cap) {
+            uint32_t l = (uint32_t)len;
+            memcpy(ffrdp->app_tx_buff + ffrdp->app_tx_size, &l, 4);
+            memcpy(ffrdp->app_tx_buff + ffrdp->app_tx_size + 4, buf, (size_t)len);
+            ffrdp->app_tx_size += 4 + (uint32_t)len;
+            return len;                              // 整条进去了：原子
+        }
+        if (timeout_ms == 0) { ffrdp->counter_send_failed++; return -1; }
+        if (timeout_ms > 0 && (int32_t)(get_tick_count() - t0) >= timeout_ms) {
+            ffrdp->counter_send_failed++;
+            return -1;
+        }
+        // 放不下而调用方要求等：跑一轮协议（它会把队列里的数据成帧发出去），下一轮再看。
         ffrdp_update(ffrdp);
     }
 }
 
-static int ffrdp_send_try(FFRDPCONTEXT *ffrdp, char *buf, int len)
+// 把一条消息成帧（原 ffrdp_send 的主体，一字未改）：要么整条被接受，要么一个字节都不接受。
+// 帧数上限（FFRDP_MAX_WAITSND）不在这里判 —— 那由 ffrdp_drain_tx 决定要不要继续取，见那里。
+static int ffrdp_frame_message(FFRDPCONTEXT *ffrdp, char *buf, int len)
 {
     FFRDP_FRAME_NODE *spare = NULL, *node;
     int           n = len, size, need, room;
-    if (  !ffrdp || ((ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0)
-        || ((len + ffrdp->smss - 1) / ffrdp->smss + ffrdp->wait_snd > FFRDP_MAX_WAITSND)) {
-        if (ffrdp) ffrdp->counter_send_failed++;
-        return -1;
-    }
+    if (!ffrdp || !buf || len <= 0) return -1;
     // Allocate every frame this call will need before writing a single byte: if one of the
     // allocations fails the whole call is abandoned (return -1, nothing accepted). Doing it the
     // other way round ("allocate while copying") lets the caller end up with 0 < ret < len, and it
@@ -762,6 +794,28 @@ static void ffrdp_congestion_control(FFRDPCONTEXT *ffrdp, int event)
     }
 }
 
+// 把应用队列里的消息取出来成帧。帧数上限在这里判（判据与旧版 ffrdp_send 里那条完全相同）：到上限
+// 就停下，数据留在队列里 —— 不是拒绝，也不是丢，只是这一轮不取，下一轮还会来。
+// 注意这里**不**动 counter_send_failed：那个计数器表示"应用被拒过"，含义不能变（dump 与仿真都看它）。
+static void ffrdp_drain_tx(FFRDPCONTEXT *ffrdp)
+{
+    while (ffrdp->app_tx_size >= 4) {
+        uint32_t len;
+        memcpy(&len, ffrdp->app_tx_buff, 4);
+        if (len == 0 || ffrdp->app_tx_size < 4 + len) {   // 不该发生；真发生了就清空队列，别把它卡死
+            ffrdp->app_tx_size = 0;
+            return;
+        }
+        if (ffrdp_frame_message(ffrdp, (char*)ffrdp->app_tx_buff + 4, (int)len) != (int)len) {
+            return;                                       // 分配失败：消息留在队列里，下一轮再试
+        }
+        ffrdp->app_tx_size -= 4 + len;
+        if (ffrdp->app_tx_size) {
+            memmove(ffrdp->app_tx_buff, ffrdp->app_tx_buff + 4 + len, ffrdp->app_tx_size);
+        }
+    }
+}
+
 void ffrdp_update(void *ctxt)
 {
     FFRDPCONTEXT       *ffrdp   = (FFRDPCONTEXT*)ctxt;
@@ -772,6 +826,8 @@ void ffrdp_update(void *ctxt)
     uint8_t   data[8];
 
     if (!ctxt) return;
+    // 先取应用排进来的消息并成帧：它们在上一轮 ffrdp_send 时只是被放进了队列。
+    ffrdp_drain_tx(ffrdp);
     // how fast the application drives us: a starved update loop delays acks and retransmits
     // exactly like a congested network does, and the two need to be told apart.
     ffrdp->counter_upd_cnt++;
