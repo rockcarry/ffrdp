@@ -18,6 +18,18 @@
 #error "ffrdp-udp lowlevel: needs a socket based wakeup on Windows, see the comment above"
 #endif
 
+// 一圈最多收几帧再交给定时那一段。见 worker loop 里的说明。它同时是两个东西的旋钮：一圈的固定开销
+// （select + 算期限 + 交给定时那一段）被几帧摊掉，以及上层多久能回一个 ack —— ack 报的是 recv_seq +
+// 位图，一批一个就够，可这一批攒多大直接决定对端多久看到窗口动。
+//
+// 实测（本机回环，10s 每方向，同一个二进制只改这个数；参照：改架构之前 40.7 MB/s、C2 刚落地时 13.7）：
+//     2  ->  42.7 MB/s       3  ->  28.8 MB/s       4  ->  24.1 MB/s
+//     6  ->  19.1 MB/s      64  ->  10.3 MB/s
+// 单调下降，而且是三倍的差距 —— 所以这里的主因是 **ack 节奏**，不是每圈的固定开销（否则越大越好）。
+// 取 2：反馈永远不该成为瓶颈，而 ack 数仍比"一帧一个"少一半。链路 RTT 是真的（不像回环）时攒大一些
+// 更省 ack，但那要另一个旋钮（按 RTT 或按时间自适应），不是现在这一步的事。
+#define FFRDP_LOWLEVEL_RX_BATCH_MAX 2
+
 typedef struct {
     int  (*send)(void *fl, uint64_t addr, uint8_t *buf, int len);
     int  (*timer)(void *fl, uint32_t deadline_ms);
@@ -205,22 +217,30 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
         // Woken in order to stop: leave without handing anything else to the layer.
         if (module_thread_check_exit(&udp->mthread)) break;
         if (ret > 0 && FD_ISSET(udp->sockfd, &rfds)) {
-            uint8_t buf[FFRDP_LOWLEVEL_FRAME_MAX];
-            struct  sockaddr_in from;
-            socklen_t fromlen = sizeof(from);
-            ret = recvfrom(udp->sockfd, buf, sizeof(buf), 0, (struct sockaddr*)&from, &fromlen);
-            if (ret <= 0) continue;   // zero length datagram, or a socket error: nothing to hand over
-            if (udp->callback) {
-                // The message carries where the frame came from, so a reply goes straight back out through
-                // send() with the very same addr -- that is the only reason this layer reports an address
-                // at all. buf points at the buffer above: it is a stack buffer reused by the next lap, so
-                // it is valid for exactly the duration of this call and the callback has to copy what it
-                // wants to keep.
-                FFRDP_LOWLEVEL_MSG msg;
-                msg.addr = ffrdp_udp_addr_pack(&from);
-                msg.buf  = buf;
-                msg.len  = ret;
-                udp->callback(udp->cbctx, FFRDP_LOWLEVEL_TYPE_RECV, &msg, sizeof(msg));
+            // 一圈把当前就绪的包都收下来（有上限），再交给定时那一段。为什么要收完一圈：上层是"一段
+            // 一个 ack"——它报的是 recv_seq + 位图，第二个 ack 覆盖的帧第一个已经报过了，什么都不多带；
+            // 而一圈只收一帧就等于一帧一个 ack，实测（差分仿真）是攒批行为的 6.7 倍。上限是给定了的：
+            // 一个不停把 socket 灌满的发送方不该把下面的定时工作（重传、探测、速率采样）饿住。
+            int frames = 0;
+            while (frames < FFRDP_LOWLEVEL_RX_BATCH_MAX && !module_thread_check_exit(&udp->mthread)) {
+                uint8_t buf[FFRDP_LOWLEVEL_FRAME_MAX];
+                struct  sockaddr_in from;
+                socklen_t fromlen = sizeof(from);
+                ret = recvfrom(udp->sockfd, buf, sizeof(buf), 0, (struct sockaddr*)&from, &fromlen);
+                if (ret <= 0) break;   // zero length datagram, an empty socket, or a socket error
+                frames++;
+                if (udp->callback) {
+                    // The message carries where the frame came from, so a reply goes straight back out through
+                    // send() with the very same addr -- that is the only reason this layer reports an address
+                    // at all. buf points at the buffer above: it is a stack buffer reused by the next lap, so
+                    // it is valid for exactly the duration of this call and the callback has to copy what it
+                    // wants to keep.
+                    FFRDP_LOWLEVEL_MSG msg;
+                    msg.addr = ffrdp_udp_addr_pack(&from);
+                    msg.buf  = buf;
+                    msg.len  = ret;
+                    udp->callback(udp->cbctx, FFRDP_LOWLEVEL_TYPE_RECV, &msg, sizeof(msg));
+                }
             }
         }
         // Received work first, then the clock, so the two are never handed over interleaved. A tick armed

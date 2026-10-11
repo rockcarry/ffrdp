@@ -32,6 +32,10 @@ typedef struct {
 //  - FFRDP_LOWLEVEL_TYPE_RECV: buf is a FFRDP_LOWLEVEL_MSG and len is sizeof(FFRDP_LOWLEVEL_MSG). The
 //    message's buf points at the lowlevel's own buffer and is valid only for the duration of this call, so
 //    copy what has to be kept. Handing msg->addr back to send() is how a reply is addressed.
+//    One call per frame, but one lap of the transport's own thread may deliver several of them back to back
+//    before the next TIMER: a backend that drains what is ready (the UDP one does, up to a bound) lets the
+//    layer above answer a whole burst with a single reply instead of one per frame. A timer armed from
+//    inside a receive callback is delivered in that same lap, and that is what makes the batching work.
 //  - FFRDP_LOWLEVEL_TYPE_TIMER: buf is NULL and len is 0. Work that came due is done here, and the
 //    callback is expected to call timer() again before returning, to say when it wants the next one.
 //  - send() and timer() may be called from inside the callback. exit() may not: it joins this thread, so

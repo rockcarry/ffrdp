@@ -167,6 +167,7 @@ typedef struct {
     #define FLAG_FLUSH     (1 << 2)
     #define FLAG_TX_AES256 (1 << 3)
     #define FLAG_RX_AES256 (1 << 4)
+    #define FLAG_ACK_DUE   (1 << 5) // 收到过需要应答的帧、还没回；由 tick 在这一段结束时统一回一个
     uint32_t flags;
     // ---- 上层边界 ----
     // 协议与应用线程只在下面这些东西上见面：一个发送字节队列（应用写、协议读）、一个接收字节队列
@@ -959,7 +960,10 @@ static void ffrdp_apply_acks(FFRDPCONTEXT *ffrdp, FFRDP_RX_BATCH *b)
     FFRDP_FRAME_NODE *p, *t;
     int32_t dist, maxack, i;
 
-    if (b->got_data || b->got_query) ffrdp_recvdata_and_sendack(ffrdp); // send ack frame
+    // 不在这里回 ack，只记一笔。lowlevel 的一圈会把当前就绪的包都送上来（有上限），所以"这一轮收到的帧"
+    // 就是一个批次；ack 报的是 recv_seq + 位图，第二个 ack 覆盖的帧第一个已经报过了，什么都不多带。
+    // 真正发出去的地方是 ffrdp_tick —— 与搬走之前"一次 update 一个 ack"同形。
+    if (b->got_data || b->got_query) ffrdp->flags |= FLAG_ACK_DUE;
     if (ffrdp->send_list_head && seq_distance(b->send_una, GET_FRAME_SEQ(ffrdp->send_list_head)) >= 0) { // handle frame ack
         for (p = ffrdp->send_list_head; p;) {
             dist = seq_distance(GET_FRAME_SEQ(p), b->send_una);
@@ -1061,12 +1065,14 @@ static void ffrdp_apply_acks(FFRDPCONTEXT *ffrdp, FFRDP_RX_BATCH *b)
 // 协议要 lowlevel 什么时候叫它：把所有"下一次要做的事"折算成一个最早时刻。0 = 没有期限，睡到有包为止。
 // 四处期限的来源与上面 tick 的四段一一对应：在途帧的 ack 超时、攒了一半的那一帧该发了、速率采样、
 // 以及探测的下一次动作（再加查询对端窗口的周期）。
-static void ffrdp_arm_timer(FFRDPCONTEXT *ffrdp)
+// "下一件该做的活"最早什么时候到（**不含**欠着对端一个 ack 这件事，那一条由 ffrdp_arm_timer 单独并进来）。
+// 0 = 眼下没有别的事。返回 now 的意思是"现在就有活"（有队可发、有帧可首发）。这个判断与 ffrdp_tick 的几段
+// 一一对应，所以它同时也是"要不要跑整段"的判据 —— 只有 ack 欠着的时候，跑整段是白花的钱。
+static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp)
 {
     const FFRDP_FRAME_NODE *q;
     uint32_t now = get_tick_count(), due = 0, x;
     int      pending_first = 0;                            // 发送表里有还没首发出去的帧
-    if (!ffrdp->lowlevel) return;
     for (q = ffrdp->send_list_head; q; q = q->next) {
         if (!(q->flags & FLAG_FIRST_SEND)) { pending_first = 1; continue; }   // tick_timeout 是绝对时刻
         if (!due || (int32_t)(q->tick_timeout - due) < 0) due = q->tick_timeout;
@@ -1086,6 +1092,16 @@ static void ffrdp_arm_timer(FFRDPCONTEXT *ffrdp)
         if (ffrdp->swnd > 0 && ffrdp->inflight_used < limit) due = now;
     }
     if (due && (int32_t)(due - now) < 0) due = now;       // 已经过期 ⇒ 立刻（这也是"快一点"的做法）
+    return due;
+}
+
+// 协议要 lowlevel 什么时候叫它：上面那些期限，再加上"欠着对端一个 ack"（那件事这一刻就该做）。
+static void ffrdp_arm_timer(FFRDPCONTEXT *ffrdp)
+{
+    uint32_t due;
+    if (!ffrdp->lowlevel) return;
+    due = ffrdp_next_due(ffrdp);
+    if (ffrdp->flags & FLAG_ACK_DUE) due = get_tick_count();
     ffrdp->lowlevel->timer(ffrdp->lowlevel, due);
 }
 
@@ -1124,7 +1140,13 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
             }
         }
     } else if (type == FFRDP_LOWLEVEL_TYPE_TIMER) {
-        ffrdp_tick(ffrdp);
+        // 别的到期工作都没有、只是欠着对端一个 ack 时，就别跑整段了。整段的开销是给"发送/超时/探测/速率"
+        // 付的，收到一批帧就付一次，实测把回环吞吐压掉了两成（tick 次数 15592 -> 24915 / 12s）。
+        uint32_t d = ffrdp_next_due(ffrdp);
+        if ((ffrdp->flags & FLAG_ACK_DUE) && (!d || (int32_t)(d - get_tick_count()) > 0)) {
+            ffrdp->flags &= ~FLAG_ACK_DUE;
+            ffrdp_recvdata_and_sendack(ffrdp);
+        } else ffrdp_tick(ffrdp);
     }
     ffrdp->app_wait_snd = ffrdp->wait_snd;   // 发布给应用看的镜像（受理判据用）
     ffrdp_arm_timer(ffrdp);
@@ -1218,9 +1240,10 @@ static void ffrdp_tick(FFRDPCONTEXT *ffrdp)
     }
     if (got_timeout) ffrdp->counter_timeout_evt++;
 
-    // 这里原来是"等 socket 可读 + 把所有待收的包一次收完 + 处理收到的 ack"。收包搬走了：lowlevel 每
-    // 收到一帧就回调一次，一帧的解析在 ffrdp_on_frame、ack 的应用在 ffrdp_apply_acks 里。这带来一
-    // 处有意改变的时序：应答的粒度从"一批一 ack"变成"一帧一 ack"（见 notes 16 的说明）。
+    // 这里原来是"等 socket 可读 + 把所有待收的包一次收完 + 处理收到的 ack"。收包搬走了：lowlevel 一圈把
+    // 当前就绪的包都回调上来（一帧一次），帧的解析在 ffrdp_on_frame、ack 的应用在 ffrdp_apply_acks 里；
+    // 而应答本身由下面这一句在这一段结束时统一发出去 —— 位置与旧版一致（发送段之后、速率/探测之前）。
+    if (ffrdp->flags & FLAG_ACK_DUE) { ffrdp->flags &= ~FLAG_ACK_DUE; ffrdp_recvdata_and_sendack(ffrdp); }
 
     {   // delay probe: take half the in-flight away for a moment and see whether the round trip follows.
         // if it does and the confirmed rate does not, the delay was our own queue, so the smaller window
