@@ -816,115 +816,28 @@ static void ffrdp_drain_tx(FFRDPCONTEXT *ffrdp)
     }
 }
 
-void ffrdp_update(void *ctxt)
+// 一批帧里跨帧累积的东西。旧写法在 recvfrom 循环外累积它；现在由调用方持有：
+// 循环整批调用时是"一批一份"，RECV 回调里是"一帧一份" —— 语义相同，只是一次处理几帧的差别。
+typedef struct {
+    int32_t recv_una;   // 本批内预期的接收序号（洞被填上时往前走）
+    int32_t send_una;   // 本批内确认到的最小未确认发送序号
+    int32_t send_mack;  // 本批内对方向上报告的接收位图（按 seq 右移合并）
+    int     got_data;   // 本批收到过数据帧 ⇒ 要回 ack
+    int     got_query;  // 本批收到过查询帧 ⇒ 要回 ack
+} FFRDP_RX_BATCH;
+
+// 一帧：解析、记账。node 由调用方分配好（data/size 已就绪），这样"复用同一个节点"的旧写法保持
+// 不变。返回 1 = 已移交给乱序队列（调用方不要再碰它）；返回 0 = 调用方可以复用或释放它。
+static int ffrdp_on_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *node, int len, FFRDP_RX_BATCH *b)
 {
-    FFRDPCONTEXT       *ffrdp   = (FFRDPCONTEXT*)ctxt;
-    FFRDP_FRAME_NODE   *node    = NULL, *p = NULL, *t = NULL;
-    struct sockaddr_in *dstaddr = NULL, srcaddr;
-    socklen_t addrlen = sizeof(srcaddr);
-    int32_t   una, mack, ret, got_data = 0, got_query = 0, got_timeout = 0, send_una, send_mack = 0, recv_una, dist, maxack, i, j;
-    uint8_t   data[8];
-
-    if (!ctxt) return;
-    // 先取应用排进来的消息并成帧：它们在上一轮 ffrdp_send 时只是被放进了队列。
-    ffrdp_drain_tx(ffrdp);
-    // how fast the application drives us: a starved update loop delays acks and retransmits
-    // exactly like a congested network does, and the two need to be told apart.
-    ffrdp->counter_upd_cnt++;
-    if (ffrdp->tick_last_upd) {
-        uint32_t gap = get_tick_count() - ffrdp->tick_last_upd;
-        ffrdp->counter_upd_gap += gap;
-        if (gap > ffrdp->counter_upd_gap_max) ffrdp->counter_upd_gap_max = gap;
-    }
-    ffrdp->tick_last_upd = get_tick_count();
-    dstaddr  = ffrdp->flags & FLAG_SERVER ? &ffrdp->client_addr : &ffrdp->server_addr;
-    send_una = ffrdp->send_list_head ? GET_FRAME_SEQ(ffrdp->send_list_head) : 0;
-    recv_una = ffrdp->recv_seq;
-
-    if (ffrdp->cur_new_node && ((int32_t)get_tick_count() - (int32_t)ffrdp->cur_new_tick > FFRDP_FLUSH_TIMEOUT || ffrdp->flags & FLAG_FLUSH)) {
-        ffrdp->cur_new_node->data[0] = FFRDP_FRAME_TYPE_SHORT;
-        ffrdp->cur_new_node->size    = 4 + ffrdp->cur_new_size;
-        list_enqueue(&ffrdp->send_list_head, &ffrdp->send_list_tail, ffrdp->cur_new_node);
-        ffrdp->send_seq++; ffrdp->wait_snd++;
-        ffrdp->cur_new_node = NULL;
-        ffrdp->cur_new_size = 0;
-    }
-
-    {   // count what is really on the wire, fresh every pass, so no counter can drift or leak
-        FFRDP_FRAME_NODE *q;
-        for (ffrdp->inflight_used = 0, q = ffrdp->send_list_head; q; q = q->next) if (q->flags & FLAG_FIRST_SEND) ffrdp->inflight_used++;
-    }
-    for (i = 0, p = ffrdp->send_list_head; i < (int32_t)ffrdp->cwnd && p; i++, p = p->next) {
-        if (!(p->flags & FLAG_FIRST_SEND)) { // first send
-            // frames are first sent in sequence order, so everything already sent sits in front of this
-            // one and breaking here skips nothing that needed attention. retransmits are untouched: this
-            // only stops adding new frames to a wire that already holds FFRDP_INFLIGHT_MAX of them.
-            if (ffrdp->inflight_used >= MAX(ffrdp->inflight_max ? ffrdp->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX, (uint32_t)FFRDP_INFLIGHT_MIN)) break;
-            if (ffrdp->swnd > 0) {
-                if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) { ffrdp_congestion_control(ffrdp, CEVENT_SEND_FAILED); break; }
-                p->tick_1sts = p->tick_send = get_tick_count();
-                p->tick_timeout = p->tick_send + ffrdp->rto;
-                p->flags       |= FLAG_FIRST_SEND;
-                ffrdp->swnd--; ffrdp->counter_send_1sttime++; ffrdp->win_first++; ffrdp->inflight_used++;
-            } else if (ffrdp->tick_send_query == 0 || (int32_t)get_tick_count() - (int32_t)ffrdp->tick_send_query > FFRDP_QUERY_CYCLE) { // query remote receive window size
-                data[0] = FFRDP_FRAME_TYPE_QUERY; if (sendto(ffrdp->udp_fd, (void*)data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)) != 1) ffrdp->counter_send_err++;
-                ffrdp->tick_send_query = get_tick_count(); ffrdp->counter_send_query++;
-                break;
-            }
-        } else if ((p->flags & FLAG_FIRST_SEND) && ((int32_t)get_tick_count() - (int32_t)p->tick_timeout > 0 || (p->flags & FLAG_FAST_RESEND))) { // resend
-            ffrdp_congestion_control(ffrdp, CEVENT_ACK_TIMEOUT);
-            if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) break;
-            if (!(p->flags & FLAG_FAST_RESEND)) {
-                if (p == ffrdp->send_list_head) ffrdp->counter_rto_head++; else ffrdp->counter_rto_chain++;
-                // was this frame already reported as received (una passed it) when the timer fired?
-                // stale: we were told, but had not removed it -> the retransmit is pure waste.
-                if (seq_distance(GET_FRAME_SEQ(p), (uint32_t)ffrdp->ack_una) < 0) ffrdp->counter_rto_stale++;
-                else ffrdp->counter_rto_behind++;
-                if (ffrdp->rto == FFRDP_MAX_RTO) {
-                    p->tick_send = get_tick_count();
-                    p->flags    &=~FLAG_TIMEOUT_RESEND;
-                } else p->flags |= FLAG_TIMEOUT_RESEND;
-                if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_rto_backoff >= (int32_t)ffrdp->rto) { // rto backs off once per round, not once per frame
-                    ffrdp->tick_rto_backoff = get_tick_count();
-                    if (ffrdp->rto == FFRDP_MAX_RTO) ffrdp->counter_reach_maxrto++;
-                    ffrdp->rto += ffrdp->rto / 2;
-                    ffrdp->rto  = MIN(ffrdp->rto, FFRDP_MAX_RTO);
-                    ffrdp->counter_rto_backoff++;
-                }
-                ffrdp->counter_resend_rto++;
-                ffrdp->win_need++;
-                got_timeout = 1;
-            } else {
-                p->flags &= ~(FLAG_FAST_RESEND|FLAG_TIMEOUT_RESEND);
-                // count fast retransmits in the same evidence window as the timeout ones: they are
-                // retransmits like any other, and on a link with reordering they are where most of the
-                // waste sits (the peer confirms almost all of them as duplicates).
-                ffrdp->counter_resend_fast++;
-                ffrdp->win_need++;
-            }
-            p->tick_timeout+= ffrdp->rto;
-        }
-    }
-    if (got_timeout) ffrdp->counter_timeout_evt++;
-
-    if (ffrdp_sleep(ffrdp, FFRDP_SELECT_SLEEP) != 0) return;
-    for (node = NULL;;) { // receive data
-        if (!node && !(node = frame_node_new(FFRDP_FRAME_TYPE_FEC2, FFRDP_MAX_MSS))) break;
-        if ((ret = recvfrom(ffrdp->udp_fd, (void*)node->data, node->size, 0, (struct sockaddr*)&srcaddr, &addrlen)) <= 0) break;
-        if ((ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0) {
-            if (ffrdp->flags & FLAG_CONNECTED) {
-                if (memcmp(&srcaddr, &ffrdp->client_addr, sizeof(srcaddr)) != 0) continue;
-            } else {
-                ffrdp->flags |= FLAG_CONNECTED;
-                memcpy(&ffrdp->client_addr, &srcaddr, sizeof(ffrdp->client_addr));
-            }
-        }
+    int32_t una, mack, dist, i, j;
+    int     taken = 0;
 
         if (node->data[0] <= FFRDP_FRAME_TYPE_FEC32) { // data frame
-            node->size = ret; // frame size is the return size of recvfrom
+            node->size = len; // frame size is what the transport handed over
             if (ffrdp_recv_data_frame(ffrdp, node) == 0) {
-                dist = seq_distance(GET_FRAME_SEQ(node), recv_una);
-                if (dist == 0) { recv_una++; }
+                dist = seq_distance(GET_FRAME_SEQ(node), b->recv_una);
+                if (dist == 0) { b->recv_una++; }
                 // out of order arrival = this frame is ahead of a hole. If this counter grows while the
                 // peer's acks carry no mack bit, then the hole is never being reported, and the sender
                 // has no choice but to wait for timeouts.
@@ -950,8 +863,8 @@ void ffrdp_update(void *ctxt)
                 // that, so this is a lie or a duplicate. storing it would let anyone who can reach the
                 // port spend our memory at one frame per datagram, for ever (see FFRDP_RECV_QUEUE_MAX).
                 if (dist >= (int32_t)FFRDP_RECV_QUEUE_MAX) { ffrdp->counter_recv_drop++; }
-                else if (dist >= 0) { list_enqueue(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, node); node = NULL; }
-                got_data = 1;
+                else if (dist >= 0) { list_enqueue(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, node); taken = 1; }
+                b->got_data = 1;
             }
         } else if (node->data[0] == FFRDP_FRAME_TYPE_ACK) { // ack frame
             una  = *(uint32_t*)(node->data + 0) >> 8;
@@ -959,7 +872,7 @@ void ffrdp_update(void *ctxt)
             ffrdp->counter_ack_recv++;
             // the peer's count of our retransmits that it had already accepted. this is the one piece of
             // evidence our own counters cannot fake, so it is what the rto floor is driven by.
-            if (ret >= 9 && node->data[8]) { ffrdp->counter_ack_dup += node->data[8]; ffrdp->win_dup += node->data[8]; }
+            if (len >= 9 && node->data[8]) { ffrdp->counter_ack_dup += node->data[8]; ffrdp->win_dup += node->data[8]; }
             if (ffrdp->counter_ack_recv > 1 && (uint32_t)una == ffrdp->ack_una) ffrdp->counter_ack_una_dup++; // the peer did not move
             ffrdp->ack_una = (uint32_t)una;
             if (mack) { // the peer reported frames that arrived after a hole
@@ -971,10 +884,10 @@ void ffrdp_update(void *ctxt)
                 for (j = 0; j < i && (mack & (1 << j)); j++);
                 if (j < i) ffrdp->counter_ack_hole++; // a gap below the highest acked frame
             }
-            dist = seq_distance(una, send_una);
+            dist = seq_distance(una, b->send_una);
             if (dist >= 0) {
-                send_una    = una;
-                send_mack   = (send_mack >> dist) | mack;
+                b->send_una    = una;
+                b->send_mack   = (b->send_mack >> dist) | mack;
                 // the peer's window is a buffer size, not a rate: on the measured link it allowed 148
                 // frames where the path carried five, and the rest sat in its buffer as a standing queue
                 // of about 200ms. cap is what a probe has proven, and what is being tested right now.
@@ -982,20 +895,27 @@ void ffrdp_update(void *ctxt)
                 if (ffrdp->cap && ffrdp->swnd > ffrdp->cap) ffrdp->swnd = ffrdp->cap;
                 ffrdp->tick_recv_ack = get_tick_count();
             }
-        } else if (node->data[0] == FFRDP_FRAME_TYPE_QUERY) got_query = 1;
-    }
-    if (node) free(node);
+        } else if (node->data[0] == FFRDP_FRAME_TYPE_QUERY) b->got_query = 1;
+    return taken;
+}
 
-    if (got_data || got_query) ffrdp_recvdata_and_sendack(ffrdp, dstaddr); // send ack frame
-    if (ffrdp->send_list_head && seq_distance(send_una, GET_FRAME_SEQ(ffrdp->send_list_head)) >= 0) { // handle frame ack
+// 处理完一段接收之后要做的：把收到的 ack 应用到发送表 —— 释放已确认的帧、更新 rtt/rto 下限、
+// 触发快速重传，并在收到数据帧时回一个 ack。旧写法是"整批一次"，RECV 回调里是"一帧一次"。
+static void ffrdp_apply_acks(FFRDPCONTEXT *ffrdp, FFRDP_RX_BATCH *b, struct sockaddr_in *dstaddr)
+{
+    FFRDP_FRAME_NODE *p, *t;
+    int32_t dist, maxack, i;
+
+    if (b->got_data || b->got_query) ffrdp_recvdata_and_sendack(ffrdp, dstaddr); // send ack frame
+    if (ffrdp->send_list_head && seq_distance(b->send_una, GET_FRAME_SEQ(ffrdp->send_list_head)) >= 0) { // handle frame ack
         for (p = ffrdp->send_list_head; p;) {
-            dist = seq_distance(GET_FRAME_SEQ(p), send_una);
-            for (i=23; i>=0 && !(send_mack&(1<<i)); i--);
-            if (i < 0) maxack = (send_una - 1) & 0xFFFFFF;
-            else maxack = (send_una + i + 1) & 0xFFFFFF;
+            dist = seq_distance(GET_FRAME_SEQ(p), b->send_una);
+            for (i=23; i>=0 && !(b->send_mack&(1<<i)); i--);
+            if (i < 0) maxack = (b->send_una - 1) & 0xFFFFFF;
+            else maxack = (b->send_una + i + 1) & 0xFFFFFF;
 
             if (dist > 24 || !(p->flags & FLAG_FIRST_SEND)) break;
-            else if (dist < 0 || (dist > 0 && (send_mack & (1 << (dist-1))))) { // this frame got ack
+            else if (dist < 0 || (dist > 0 && (b->send_mack & (1 << (dist-1))))) { // this frame got ack
                 ffrdp->counter_send_bytes += frame_payload_size(p); ffrdp->wait_snd--;
                 ffrdp_congestion_control(ffrdp, CEVENT_ACK_OK);
                 if (!(p->flags & FLAG_TIMEOUT_RESEND)) {
@@ -1082,6 +1002,120 @@ void ffrdp_update(void *ctxt)
             p = p->next;
         }
     }
+}
+
+void ffrdp_update(void *ctxt)
+{
+    FFRDPCONTEXT       *ffrdp   = (FFRDPCONTEXT*)ctxt;
+    FFRDP_FRAME_NODE   *node    = NULL, *p = NULL;
+    struct sockaddr_in *dstaddr = NULL, srcaddr;
+    socklen_t addrlen = sizeof(srcaddr);
+    int32_t   ret, got_timeout = 0, i;
+    FFRDP_RX_BATCH b;
+    uint8_t   data[8];
+
+    if (!ctxt) return;
+    // 先取应用排进来的消息并成帧：它们在上一轮 ffrdp_send 时只是被放进了队列。
+    ffrdp_drain_tx(ffrdp);
+    // how fast the application drives us: a starved update loop delays acks and retransmits
+    // exactly like a congested network does, and the two need to be told apart.
+    ffrdp->counter_upd_cnt++;
+    if (ffrdp->tick_last_upd) {
+        uint32_t gap = get_tick_count() - ffrdp->tick_last_upd;
+        ffrdp->counter_upd_gap += gap;
+        if (gap > ffrdp->counter_upd_gap_max) ffrdp->counter_upd_gap_max = gap;
+    }
+    ffrdp->tick_last_upd = get_tick_count();
+    dstaddr  = ffrdp->flags & FLAG_SERVER ? &ffrdp->client_addr : &ffrdp->server_addr;
+    b.send_una  = ffrdp->send_list_head ? GET_FRAME_SEQ(ffrdp->send_list_head) : 0;
+    b.recv_una  = ffrdp->recv_seq;
+    b.send_mack = 0; b.got_data = 0; b.got_query = 0;
+
+    if (ffrdp->cur_new_node && ((int32_t)get_tick_count() - (int32_t)ffrdp->cur_new_tick > FFRDP_FLUSH_TIMEOUT || ffrdp->flags & FLAG_FLUSH)) {
+        ffrdp->cur_new_node->data[0] = FFRDP_FRAME_TYPE_SHORT;
+        ffrdp->cur_new_node->size    = 4 + ffrdp->cur_new_size;
+        list_enqueue(&ffrdp->send_list_head, &ffrdp->send_list_tail, ffrdp->cur_new_node);
+        ffrdp->send_seq++; ffrdp->wait_snd++;
+        ffrdp->cur_new_node = NULL;
+        ffrdp->cur_new_size = 0;
+    }
+
+    {   // count what is really on the wire, fresh every pass, so no counter can drift or leak
+        FFRDP_FRAME_NODE *q;
+        for (ffrdp->inflight_used = 0, q = ffrdp->send_list_head; q; q = q->next) if (q->flags & FLAG_FIRST_SEND) ffrdp->inflight_used++;
+    }
+    for (i = 0, p = ffrdp->send_list_head; i < (int32_t)ffrdp->cwnd && p; i++, p = p->next) {
+        if (!(p->flags & FLAG_FIRST_SEND)) { // first send
+            // frames are first sent in sequence order, so everything already sent sits in front of this
+            // one and breaking here skips nothing that needed attention. retransmits are untouched: this
+            // only stops adding new frames to a wire that already holds FFRDP_INFLIGHT_MAX of them.
+            if (ffrdp->inflight_used >= MAX(ffrdp->inflight_max ? ffrdp->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX, (uint32_t)FFRDP_INFLIGHT_MIN)) break;
+            if (ffrdp->swnd > 0) {
+                if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) { ffrdp_congestion_control(ffrdp, CEVENT_SEND_FAILED); break; }
+                p->tick_1sts = p->tick_send = get_tick_count();
+                p->tick_timeout = p->tick_send + ffrdp->rto;
+                p->flags       |= FLAG_FIRST_SEND;
+                ffrdp->swnd--; ffrdp->counter_send_1sttime++; ffrdp->win_first++; ffrdp->inflight_used++;
+            } else if (ffrdp->tick_send_query == 0 || (int32_t)get_tick_count() - (int32_t)ffrdp->tick_send_query > FFRDP_QUERY_CYCLE) { // query remote receive window size
+                data[0] = FFRDP_FRAME_TYPE_QUERY; if (sendto(ffrdp->udp_fd, (void*)data, 1, 0, (struct sockaddr*)dstaddr, sizeof(struct sockaddr_in)) != 1) ffrdp->counter_send_err++;
+                ffrdp->tick_send_query = get_tick_count(); ffrdp->counter_send_query++;
+                break;
+            }
+        } else if ((p->flags & FLAG_FIRST_SEND) && ((int32_t)get_tick_count() - (int32_t)p->tick_timeout > 0 || (p->flags & FLAG_FAST_RESEND))) { // resend
+            ffrdp_congestion_control(ffrdp, CEVENT_ACK_TIMEOUT);
+            if (ffrdp_send_data_frame(ffrdp, p, dstaddr) != 0) break;
+            if (!(p->flags & FLAG_FAST_RESEND)) {
+                if (p == ffrdp->send_list_head) ffrdp->counter_rto_head++; else ffrdp->counter_rto_chain++;
+                // was this frame already reported as received (una passed it) when the timer fired?
+                // stale: we were told, but had not removed it -> the retransmit is pure waste.
+                if (seq_distance(GET_FRAME_SEQ(p), (uint32_t)ffrdp->ack_una) < 0) ffrdp->counter_rto_stale++;
+                else ffrdp->counter_rto_behind++;
+                if (ffrdp->rto == FFRDP_MAX_RTO) {
+                    p->tick_send = get_tick_count();
+                    p->flags    &=~FLAG_TIMEOUT_RESEND;
+                } else p->flags |= FLAG_TIMEOUT_RESEND;
+                if ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_rto_backoff >= (int32_t)ffrdp->rto) { // rto backs off once per round, not once per frame
+                    ffrdp->tick_rto_backoff = get_tick_count();
+                    if (ffrdp->rto == FFRDP_MAX_RTO) ffrdp->counter_reach_maxrto++;
+                    ffrdp->rto += ffrdp->rto / 2;
+                    ffrdp->rto  = MIN(ffrdp->rto, FFRDP_MAX_RTO);
+                    ffrdp->counter_rto_backoff++;
+                }
+                ffrdp->counter_resend_rto++;
+                ffrdp->win_need++;
+                got_timeout = 1;
+            } else {
+                p->flags &= ~(FLAG_FAST_RESEND|FLAG_TIMEOUT_RESEND);
+                // count fast retransmits in the same evidence window as the timeout ones: they are
+                // retransmits like any other, and on a link with reordering they are where most of the
+                // waste sits (the peer confirms almost all of them as duplicates).
+                ffrdp->counter_resend_fast++;
+                ffrdp->win_need++;
+            }
+            p->tick_timeout+= ffrdp->rto;
+        }
+    }
+    if (got_timeout) ffrdp->counter_timeout_evt++;
+
+    if (ffrdp_sleep(ffrdp, FFRDP_SELECT_SLEEP) != 0) return;
+    for (node = NULL;;) { // receive data
+        if (!node && !(node = frame_node_new(FFRDP_FRAME_TYPE_FEC2, FFRDP_MAX_MSS))) break;
+        if ((ret = recvfrom(ffrdp->udp_fd, (void*)node->data, node->size, 0, (struct sockaddr*)&srcaddr, &addrlen)) <= 0) break;
+        if ((ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0) {
+            if (ffrdp->flags & FLAG_CONNECTED) {
+                if (memcmp(&srcaddr, &ffrdp->client_addr, sizeof(srcaddr)) != 0) continue;
+            } else {
+                ffrdp->flags |= FLAG_CONNECTED;
+                memcpy(&ffrdp->client_addr, &srcaddr, sizeof(ffrdp->client_addr));
+            }
+        }
+
+        // 1 = 这一帧被乱序队列接管了；0 = 这个节点仍归循环所有，可以复用
+        if (ffrdp_on_frame(ffrdp, node, ret, &b)) node = NULL;
+    }
+    if (node) free(node);
+
+    ffrdp_apply_acks(ffrdp, &b, dstaddr);
     {   // delay probe: take half the in-flight away for a moment and see whether the round trip follows.
         // if it does and the confirmed rate does not, the delay was our own queue, so the smaller window
         // is kept and the experiment repeats later; if the delay does not follow, it belongs to the path
