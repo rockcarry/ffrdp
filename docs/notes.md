@@ -1833,3 +1833,67 @@ socket）✓、`TYPE_TX_READY` ✓ —— 都不做 ✓。~~`addr_parse`~~ **后
 lowlevel 上时，客户端必须先发第一帧 ✓ ⇒ "对端还没开口，上层怎么给它一个 addr" 这个需求到了 ✓。其中**多通道**是唯一值得提前想一想的 ✗：现在
 "一个 handle = 一个 socket + 一个线程"，多 peer 就是多线程 ✓（客户端/几路没问题 ✓；若将来做
 VPN 服务器/路由器，接口形状要留出 cookie 化的通道 ✓）。
+
+## 14. 收发加等待时间（timeout_ms）；一次被实测否掉的顺序（2026-10-11）
+
+v2.0.0 要让应用不再需要"主循环里调 ffrdp_update"，第一步是给收发加上等待语义，并让**等待的那一方**
+承担"跑协议"的责任。接口变成：
+
+```c
+int ffrdp_send(void *ctxt, char *buf, int len, int timeout_ms);
+int ffrdp_recv(void *ctxt, char *buf, int len, int timeout_ms);
+```
+
+`timeout_ms` = 0 时**逐字保留旧行为**（不等待、`recv` 有数据就返回、`send` 原子），所以既有调用方
+加一个 `, 0` 就是完全等价；>0 = 最多等这么多毫秒（期间协议照常跑）；<0 = 等到有 / 能接受为止。
+
+### 14.1 被否掉的一步：先删 ffrdp_update，再换驱动者
+
+原计划分两步：先删掉公共的 `ffrdp_update`、让收发顺带驱动协议，再把 tick 交给 lowlevel 的工作线程。
+**实测第一步就不成立** ✓✗：
+
+| 本机回环 `test_ffrdp --server --client`（15 秒）| 服务端发出 | 吞吐 | confirmed rate |
+|---|---|---|---|
+| HEAD（旧接口，主循环每轮 update）| 873 MB | **55.5 MB/s** | 50636 帧/s |
+| 删掉 update、由 recv 顺带驱动 | 183 MB | **11.6 MB/s** ✗ | 9299 帧/s ✗ |
+
+根因是结构性的 ✓：`recv` 只在"应用自己的接收环空着"时才让协议转一圈 ⇒ **应用一积压，协议就被
+饿住** ✗ ⇒ ack/重传变慢 ⇒ 吞吐掉 5 倍。`counter_send_failed` 全程为 0 ✓（应用从没被拒 ✓），
+说明这不是背压，而是**驱动者缺位** ✓。
+
+⇒ 结论 ✓：**"应用不再 tick" 与 "由 lowlevel 线程 tick" 是同一件事** ✓ —— 删掉 `ffrdp_update`
+的前提是先把驱动者交给别人 ✓。所以 `ffrdp_update` 这一步**保留** ✓（`ffrdp.h` 里写明它是过渡态 ✓），
+等下一步把 tick 移交给 lowlevel 的 `RECV` / `TIMER` 回调时一起删 ✓（那一步还要同时把 `tools/sim`
+的接缝从"假 socket"改成"假 lowlevel" ✓）。
+
+### 14.2 等待语义本身也要看阶段
+
+同一次实验里还量到：在"协议仍挂在应用线程上"这一步，`ffrdp_recv` 传 >0 会把应用自己的循环节拍
+压到 10ms 一档 ✓ —— 回环吞吐 35.5 → 13.0 MB/s ✓（两次运行内部自比 ✓，都是同一个优化级别 ✓）。
+所以 `test.c` 这一步两个调用都传 0 ✓；应用侧的等待留到协议有自己的线程之后再用 ✓。
+
+### 14.3 顺带：一次自己的测量错误（记下来免得再犯）
+
+第一次比较吞吐时得到"55 → 41 MB/s"的结论 ✗ —— 那是把用 `-O2` 编的基线，和用 `build.sh`（**-O0**）
+编的当前版放在一起比 ✓✗。同一优化级别（-O2）交错测量、各两次：
+
+| 组合（都 -O2）| 服务端发出吞吐 |
+|---|---|
+| HEAD 库 + HEAD 应用 | 44.2 / 49.9 MB/s |
+| 工作区库 + 旧风格应用 | 50.8 / 48.3 MB/s |
+| 工作区库 + 新应用 | 57.2 / 48.5 MB/s |
+
+⇒ **没有吞吐回归** ✓。教训：对比吞吐之前先对齐编译选项 ✓，否则量到的是编译器不是代码 ✓。
+
+### 14.4 工具侧的连带改动（tools/sim）
+
+这一步开始，`ffrdp.h` 与 HEAD 的 `ffrdp.h` 不再兼容（arities 不同）⇒ 仿真必须**把头文件也按版本
+生成** ✓（`ffrdp_base.h` / `ffrdp_new.h` ✓），否则 base 侧是 conflicting-types 编译错误 ✓；
+测试里加 `TEST_SEND` / `TEST_RECV` 包装（两侧都表示"不等待" ✓），`run.sh` 自动探测新签名并定义
+`FFRDP_API_HAS_TIMEOUT` ✓。
+
+### 14.5 验证
+
+* 差分仿真 **20 个块**（17 个 e2e 场景 + t_rto + t_ack + t_fuzz）HEAD 侧与工作区侧**逐字相同** ✓（0 差异 ✓）；
+* 本机回环端到端：两端 `verify: OK` ✓，`seq_gap 0 / crc_err 0 / len_err 0 / partial_err 0` ✓；
+* `tools/test-lowlevel-udp.sh` 241 项全过 ✓；`-Wall -Werror` 零告警 ✓。

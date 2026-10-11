@@ -7,6 +7,18 @@
 #include "simdefs.h"
 #include "../../ffrdp.c"
 
+// The harness builds this test twice: once against HEAD's ffrdp.c, once against the working tree's. HEAD
+// has no timeout argument on send/recv and the working tree does, so the test calls these wrappers -- both
+// sides compile, and both sides mean "do not wait", which is exactly what HEAD does. run.sh defines
+// FFRDP_API_HAS_TIMEOUT for the side that has it.
+#ifdef FFRDP_API_HAS_TIMEOUT
+#define TEST_SEND(c, b, l) ffrdp_send(c, b, l, 0)
+#define TEST_RECV(c, b, l) ffrdp_recv(c, b, l, 0)
+#else
+#define TEST_SEND(c, b, l) ffrdp_send(c, b, l)
+#define TEST_RECV(c, b, l) ffrdp_recv(c, b, l)
+#endif
+
 static unsigned hash(unsigned k, unsigned salt)
 {
     unsigned h = k * 2654435761u + salt * 40503u + 12345u;
@@ -47,10 +59,10 @@ int main(int argc, char *argv[])
     for (i = 0; i < steps; i++) {
         sim_setstep(i);
         // same shape as test.c: a random chunk of 1..sndsz bytes every iteration
-        sim_begin(0); ffrdp_send(c0, (char*)sbuf, 1 + (int)(hash(i, 11) % (unsigned)sndsz)); ffrdp_update(c0);
-        sim_begin(1); ffrdp_send(c1, (char*)sbuf, 1 + (int)(hash(i, 12) % (unsigned)sndsz)); ffrdp_update(c1);
-        sim_begin(1); while ((ret = ffrdp_recv(c1, (char*)rbuf, sizeof(rbuf))) > 0) r1 += ret;
-        sim_begin(0); while ((ret = ffrdp_recv(c0, (char*)rbuf, sizeof(rbuf))) > 0) r0 += ret;
+        sim_begin(0); TEST_SEND(c0, (char*)sbuf, 1 + (int)(hash(i, 11) % (unsigned)sndsz)); ffrdp_update(c0);
+        sim_begin(1); TEST_SEND(c1, (char*)sbuf, 1 + (int)(hash(i, 12) % (unsigned)sndsz)); ffrdp_update(c1);
+        sim_begin(1); while ((ret = TEST_RECV(c1, (char*)rbuf, sizeof(rbuf))) > 0) r1 += ret;
+        sim_begin(0); while ((ret = TEST_RECV(c0, (char*)rbuf, sizeof(rbuf))) > 0) r0 += ret;
     }
     s0.rto = c0->counter_resend_rto; s0.fast = c0->counter_resend_fast; s0.first = c0->counter_send_1sttime;
     s0.cwnd = c0->cwnd; s0.ssth = c0->ssthresh; s0.wait = c0->wait_snd; s0.fail = c0->counter_send_failed; s0.rttd = c0->rttd;

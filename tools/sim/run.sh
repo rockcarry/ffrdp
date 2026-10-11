@@ -15,6 +15,15 @@ vtick < ../../ffrdp.c > ffrdp_new.c
 grep -q sim_tick ffrdp_base.c || { echo "FATAL: failed to virtualise the clock"; exit 1; }
 grep -q sim_tick ffrdp_new.c  || { echo "FATAL: failed to virtualise the clock"; exit 1; }
 
+# The header is versioned too, and each side is pointed at its own copy. It only matters while an interface
+# change is in flight -- ffrdp_send/recv gained a timeout argument, so HEAD's implementation and the working
+# tree's no longer agree on what the header declares, and compiling both against one header is a
+# conflicting-types error rather than a difference worth reporting.
+git -C ../.. show HEAD:ffrdp.h > ffrdp_base.h
+cp ../../ffrdp.h ffrdp_new.h
+sed -i 's|#include "ffrdp.h"|#include "ffrdp_base.h"|' ffrdp_base.c
+sed -i 's|#include "ffrdp.h"|#include "ffrdp_new.h"|'  ffrdp_new.c
+
 # ASAN=1 turns on the address sanitizer. A read one byte past a buffer usually does not crash, so
 # without this the fuzz test can only see the fragments that kill the process outright.
 #
@@ -61,7 +70,7 @@ gcc -O1 -w -c simnet.c -o simnet.o
 TESTS="${TESTS:-t_rto t_ack t_fuzz e2e}"
 for t in $TESTS; do
     for v in base new; do
-        sed "s|#include \"../../ffrdp.c\"|#include \"ffrdp_$v.c\"|" $t.c > ${t}_$v.c
+        sed "s|#include \"../../ffrdp.c\"|#include \"ffrdp_$v.c\"|; s|#include \"../../ffrdp.h\"|#include \"ffrdp_$v.h\"|" $t.c > ${t}_$v.c
         EXTRA=""; grep -q counter_ack_recv ffrdp_$v.c && EXTRA="$EXTRA -DNEW_COUNTERS"
         grep -q counter_recv_ooo ffrdp_$v.c && EXTRA="$EXTRA -DRECV_OOO"
         grep -q counter_recv_dup ffrdp_$v.c && EXTRA="$EXTRA -DDUP_REPORT"
@@ -69,6 +78,10 @@ for t in $TESTS; do
         grep -q 'uint32_t rmss, smss, swnd, inflight' ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_INFLIGHT"
         grep -q counter_ooo_d1_24 ffrdp_$v.c && EXTRA="$EXTRA -DOOO_HIST"
         grep -q counter_ooo_d65_128 ffrdp_$v.c && EXTRA="$EXTRA -DOOO_HIST2"
+        # ffrdp_send/recv gained a timeout argument at some point, and the tests are compiled against both
+        # sides, so tell them which shape they are looking at (the tests' TEST_SEND/TEST_RECV wrappers
+        # mean "do not wait" on both, which is what HEAD does).
+        grep -q 'int timeout_ms)' ffrdp_$v.c && EXTRA="$EXTRA -DFFRDP_API_HAS_TIMEOUT"
         eval gcc $CFLAGS $ASANFLAGS $EXTRA ${t}_$v.c simnet.o -o ${t}_$v
     done
 done

@@ -9,6 +9,18 @@
 #include "simdefs.h"
 #include "../../ffrdp.c"
 
+// The harness builds this test twice: once against HEAD's ffrdp.c, once against the working tree's. HEAD
+// has no timeout argument on send/recv and the working tree does, so the test calls these wrappers -- both
+// sides compile, and both sides mean "do not wait", which is exactly what HEAD does. run.sh defines
+// FFRDP_API_HAS_TIMEOUT for the side that has it.
+#ifdef FFRDP_API_HAS_TIMEOUT
+#define TEST_SEND(c, b, l) ffrdp_send(c, b, l, 0)
+#define TEST_RECV(c, b, l) ffrdp_recv(c, b, l, 0)
+#else
+#define TEST_SEND(c, b, l) ffrdp_send(c, b, l)
+#define TEST_RECV(c, b, l) ffrdp_recv(c, b, l)
+#endif
+
 static void make_ack(unsigned char *ack, unsigned int una, unsigned int mack, unsigned char rwnd)
 {
     memset(ack, 0, 8);
@@ -25,7 +37,7 @@ int main(void)
     sim_config(0, 0, 0, 0);
     c = ffrdp_init("127.0.0.1", 8001, NULL, NULL, 0, 1024, 0);
     sim_begin(0);
-    ffrdp_send(c, (char*)buf, 8 * 1024);
+    TEST_SEND(c, (char*)buf, 8 * 1024);
     ffrdp_update(c);
 
     make_ack(ack, 1, 0x00, 255); sim_inject(0, ack, 8); ffrdp_update(c);

@@ -175,16 +175,18 @@ fd/线程零泄漏 ✓、无期限时 `exit` 及时返回 ✓）、定时器（�
 ```c
 void* ffrdp_init  (char *ip, int port, char *txkey, char *rxkey, int server, int smss, int sfec);
 void  ffrdp_free  (void *ctxt);
-int   ffrdp_send  (void *ctxt, char *buf, int len);   // 原子：返回 len = 整条接受；-1 = 什么都没接受（队列满）
-int   ffrdp_recv  (void *ctxt, char *buf, int len);   // 取应用层数据（有序可靠**字节流**，无消息边界）
+int   ffrdp_send  (void *ctxt, char *buf, int len, int timeout_ms);  // 原子：len = 整条接受；-1 = 一个字节都没接受
+int   ffrdp_recv  (void *ctxt, char *buf, int len, int timeout_ms);  // 取应用层数据（有序可靠**字节流**，无消息边界）
 int   ffrdp_isdead(void *ctxt);                       // 对端是否已失联
-void  ffrdp_update(void *ctxt);                       // 必须被周期性调用（收发/计时/重传都在里面）
 void  ffrdp_flush (void *ctxt);                       // 把未填满的帧立刻发出（不要攒着）
 void  ffrdp_dump  (void *ctxt, int clearhistory);     // 打印诊断
+void  ffrdp_update(void *ctxt);                       // ⚠️ 过渡态：协议仍需要被周期性驱动（下一步交给 lowlevel）
 ```
 
-> `ffrdp_update()` 需要应用**周期性调用**（`test.c` 里是主循环每轮调用一次），
-> 协议的所有定时行为都以它被调用的时刻为准。
+> `timeout_ms`：**0 = 不等待**（旧行为，既有调用方加一个 `, 0` 即完全等价）；`>0` = 最多等这么多毫秒，
+> 等待期间协议照常跑；`<0` = 等到有数据 / 能接受为止。`ffrdp_recv` 有数据就立刻返回，不为凑满 `len` 而等。
+> `ffrdp_update()` 是过渡态：删掉它的前提是"协议由别人按时驱动"，也就是把它交给 lowlevel 的工作线程
+> （见 `docs/notes.md` 第 14 节：先删后换，实测吞吐 55.5 → 11.6 MB/s）。
 
 ---
 

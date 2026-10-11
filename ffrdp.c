@@ -580,9 +580,29 @@ void ffrdp_free(void *ctxt)
 #endif
 }
 
-int ffrdp_send(void *ctxt, char *buf, int len)
+static int ffrdp_send_try(FFRDPCONTEXT *ffrdp, char *buf, int len);
+void       ffrdp_update(void *ctxt);   // 内部函数：ffrdp.h 不再声明它（应用不再周期性调用）
+
+// 发送对外只有一个入口。语义没有变：**要么整条接受、要么一个字节都不接受**；区别只是调用方现在可以说
+// "最多等多久" —— 等待期间协议照常跑（ack 回来、队列腾出空间），这就是 socket 那种阻塞写。
+int ffrdp_send(void *ctxt, char *buf, int len, int timeout_ms)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
+    uint32_t      t0;
+    if (!ffrdp) return -1;
+    t0 = get_tick_count();
+    for (;;) {
+        if (ffrdp_send_try(ffrdp, buf, len) == len) return len;
+        if (timeout_ms == 0) return -1;
+        if (timeout_ms > 0 && (int32_t)(get_tick_count() - t0) >= timeout_ms) return -1;
+        // 一个字节都没被接受，而调用方要求等：跑一轮协议（它自己会在传输上 nap 一小会儿）再试。
+        // 这一轮里 ack 会到达、send_list 会腾出空间，所以"等一下再发"是真的能发出去了。
+        ffrdp_update(ffrdp);
+    }
+}
+
+static int ffrdp_send_try(FFRDPCONTEXT *ffrdp, char *buf, int len)
+{
     FFRDP_FRAME_NODE *spare = NULL, *node;
     int           n = len, size, need, room;
     if (  !ffrdp || ((ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0)
@@ -630,17 +650,28 @@ int ffrdp_send(void *ctxt, char *buf, int len)
     return len - n; // with the pre-allocation above this is always len: the call is atomic
 }
 
-int ffrdp_recv(void *ctxt, char *buf, int len)
+// 接收：有数据就立刻返回（不会为了凑满 len 而等），没数据时按 timeout_ms 等。
+// 等待期间由协议自己驱动（ffrdp_update 里就是在传输上 nap），所以应用不再需要"主循环里调 update"
+// 这件事 —— 这个函数就是应用侧的等待点。对端失联时提前返回 0，免得调用方永远等下去。
+int ffrdp_recv(void *ctxt, char *buf, int len, int timeout_ms)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
+    uint32_t      t0;
     int           ret;
-    if (!ctxt) return -1;
-    ret = MIN(len, ffrdp->recv_size);
-    if (ret > 0) {
-        ffrdp->recv_head = ringbuf_read(ffrdp->recv_buff, sizeof(ffrdp->recv_buff), ffrdp->recv_head, (uint8_t*)buf, ret);
-        ffrdp->recv_size-= ret; ffrdp->counter_recv_bytes += ret;
+    if (!ffrdp || !buf || len <= 0) return -1;
+    t0 = get_tick_count();
+    for (;;) {
+        ret = MIN(len, ffrdp->recv_size);
+        if (ret > 0) {
+            ffrdp->recv_head = ringbuf_read(ffrdp->recv_buff, sizeof(ffrdp->recv_buff), ffrdp->recv_head, (uint8_t*)buf, ret);
+            ffrdp->recv_size-= ret; ffrdp->counter_recv_bytes += ret;
+            return ret;
+        }
+        if (timeout_ms == 0) return 0;
+        ffrdp_update(ffrdp);
+        if (ffrdp_isdead(ffrdp)) return 0;
+        if (timeout_ms > 0 && (int32_t)(get_tick_count() - t0) >= timeout_ms) return 0;
     }
-    return ret;
 }
 
 int ffrdp_isdead(void *ctxt)

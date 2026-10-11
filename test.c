@@ -232,7 +232,11 @@ static void* peer_thread(void *param)
         }
 
         if (msg_len > 0) {
-            ret = ffrdp_send(ffrdp, (char*)sendbuf, msg_len);
+            // 这一版仍传 0（不等待）：测试程序本来就是"队列满就下一轮原样重试这一条"，节奏由下面的
+            // ffrdp_update 提供。实测：单线程阶段在这里传 >0，等于让"等"跑成 10ms 级的协议 nap，
+            // 每轮只发得出一条消息 ⇒ 吞吐 55 -> 13 MB/s。等协议由 lowlevel 线程驱动之后（下一步），
+            // 应用侧才真正需要等待语义。
+            ret = ffrdp_send(ffrdp, (char*)sendbuf, msg_len, 0);
             if (ret == msg_len) {                       // 整条被接受
                 v.sent_msgs++; v.sent_bytes += (uint32_t)msg_len;
                 if (quota) tokens -= (uint32_t)msg_len;
@@ -245,10 +249,14 @@ static void* peer_thread(void *param)
             }
             // ret == -1：队列满（正常背压）⇒ 什么都不动，下一轮原样重试这一条
         }
-        // tokens 不够装下最小一条消息时 msg_len 会是 0 ⇒ 这一轮只收不发，协议照常 update
+        // tokens 不够装下最小一条消息时 msg_len 会是 0 ⇒ 这一轮只收不发，协议照常由循环末尾的 update 驱动
 
         if (stream_len < TEST_STREAM_MAX) {
-            ret = ffrdp_recv(ffrdp, (char*)stream + stream_len, TEST_STREAM_MAX - stream_len);
+            // 同样是 0（不等待）：接收到的数据一有就立刻取走，等待由循环末尾的 ffrdp_update 负责。
+            // 传 >0 时 ffrdp_recv 会把等待时间用来跑协议，那本身是对的语义，但在"协议还挂在应用线程
+            // 上"这一步里会把应用自己的循环节拍压到 10ms 一档 ⇒ 实测吞吐 35 -> 13 MB/s。
+            // 等协议交给 lowlevel 线程之后，应用侧才应该用 >0 来等。
+            ret = ffrdp_recv(ffrdp, (char*)stream + stream_len, TEST_STREAM_MAX - stream_len, 0);
             if (ret > 0) {
                 stream_len += ret;
                 if (connected == 0) {
@@ -263,6 +271,8 @@ static void* peer_thread(void *param)
                     tick_dump = get_tick_count();
                 }
             }
+        } else {
+            usleep(10 * 1000);   // 流满了 ⇒ 这一轮没地方收；睡一下别空转（正常情况下到不了这里）
         }
         if (stream_len > 0) {   // 每轮都试着解析（不足一条时这个循环体不会进入）
             int used = msg_parse(&v, peer->name, peer->peer, stream, stream_len);
@@ -272,7 +282,7 @@ static void* peer_thread(void *param)
             }
         }
 
-        ffrdp_update(ffrdp);
+        ffrdp_update(ffrdp);   // 过渡态：协议仍由这里按时驱动（见 ffrdp.h 的说明）；下一步交给 lowlevel
         if (connected && peer_is_lost(ffrdp, tick_recv)) {
             printf("%s lost !\n", peer->peer);
             ffrdp_free(ffrdp); ffrdp = NULL;
