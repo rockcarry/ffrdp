@@ -11,22 +11,16 @@
 #endif
 
 #ifdef WIN32
+// WSAStartup / WSACleanup 还在这里用（见 ffrdp_init / ffrdp_free），所以 winsock2.h 仍然需要。
 #include <winsock2.h>
-#define usleep(t) Sleep((t) / 1000)
 #define get_tick_count GetTickCount
-#define socklen_t int32_t
 #else
 #include <time.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#define SOCKET int
-#define closesocket close
-#define stricmp strcasecmp
-#define strtok_s strtok_r
+// 这里原来还有一整块 socket 时代的东西：winsock2.h、usleep、socklen_t、SOCKET / closesocket / stricmp /
+// strtok_s 这些可移植别名、fcntl/sys-types/sys-socket/arpa-inet/netinet 这几个头。协议不再碰 socket 之后
+// 现在它们一个都用不到了 —— 真正的 socket 在 lowlevel-udp.c + socket.c 里，那些别名也在它们自己的头里
+// （socket.h）。唯一不能动的是下面这个时钟：协议到处在用它取时间，`ts.tv_nsec` 那一行也是差分仿真用来
+// 把时钟虚拟化的锚点。
 static uint32_t get_tick_count()
 {
     struct timespec ts;

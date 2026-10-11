@@ -9,7 +9,11 @@
 set -e
 cd "$(dirname "$0")"
 
-vtick() { sed 's|.*ts.tv_nsec.*|    return sim_tick();|' ; }
+# Virtualise the clock by replacing that ONE line of get_tick_count, matched on its whole shape. Matching on
+# "ts.tv_nsec" alone used to be enough, but it also rewrote anything else that mentions the field -- a comment
+# did exactly that and put a bare `return` at file scope, and the layer's own deadline arithmetic builds a
+# timespec with the same field. Anchor it to the statement instead.
+vtick() { sed 's|^\( *\)return (ts\.tv_sec \* 1000 + ts\.tv_nsec / 1000000);|\1return sim_tick();|' ; }
 if [ -n "$REF" ]; then vtick < "$REF" > ffrdp_base.c; else git -C ../.. show HEAD:ffrdp.c | vtick > ffrdp_base.c; fi
 vtick < ../../ffrdp.c > ffrdp_new.c
 grep -q sim_tick ffrdp_base.c || { echo "FATAL: failed to virtualise the clock"; exit 1; }
