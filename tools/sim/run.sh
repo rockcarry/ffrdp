@@ -29,11 +29,28 @@ grep -q sim_tick ffrdp_new.c  || { echo "FATAL: failed to virtualise the clock";
 # bother freeing in a child that is about to exit, and the core limit removes the other way a crash can
 # leave bulk behind. Do not add handle_segv=0 style options here: measured, they make the whole run die
 # on the first crash instead of reporting it.
+#
+# RUN is empty normally and becomes a setarch prefix on every sanitized binary when ASAN=1, and that prefix
+# is not optional either. On this kernel the sanitizer sometimes cannot place its shadow memory at startup,
+# because the address space it is handed is randomised further than that layout can absorb: measured on the
+# sanitized t_rto binary, 5 runs out of 20 died with "AddressSanitizer:DEADLYSIGNAL" before main() was
+# reached, and because the handler re-enters, the whole failure is that one line repeated until the pipe
+# closes -- the same flood described above, but from a crash that has nothing to do with the code under
+# test, which is exactly the sort of thing a crash test must not have to distinguish. It is not this code:
+# with ASLR off for that process the same binary ran 20 out of 20 clean. setarch -R does that for the one
+# process, needs no privileges, and does not weaken what the sanitizer is being used for. halt_on_error=1
+# does not cover this case: the flood comes from the handler re-entering, not from a report repeating.
 ASANFLAGS=""
+RUN=""
 if [ -n "$ASAN" ]; then
     ASANFLAGS="-fsanitize=address -fno-omit-frame-pointer -g"
     export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0:halt_on_error=1"
     ulimit -c 0
+    if command -v setarch > /dev/null 2>&1; then
+        RUN="setarch $(uname -m) -R"
+    else
+        echo "warning: setarch not found, the sanitizer can fail to start at random under high entropy ASLR"
+    fi
 fi
 
 CFLAGS="-O1 -w -I../.. -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -include simdefs.h \
@@ -60,26 +77,26 @@ for t in $TESTS; do
     case $t in
     t_rto)
         echo "===== t_rto: rto inflation ====="
-        echo "-- HEAD --"; ./t_rto_base || true
-        echo "-- work --"; ./t_rto_new  || true ;;
+        echo "-- HEAD --"; $RUN ./t_rto_base || true
+        echo "-- work --"; $RUN ./t_rto_new  || true ;;
     t_ack)
         echo
         echo "===== t_ack: ack diagnostics ====="
-        echo "-- HEAD --"; ./t_ack_base || true
-        echo "-- work --"; ./t_ack_new  || true ;;
+        echo "-- HEAD --"; $RUN ./t_ack_base || true
+        echo "-- work --"; $RUN ./t_ack_new  || true ;;
     t_fuzz)
         echo
         echo "===== t_fuzz: hostile fragments (a crash names the bytes)"
-        echo "-- HEAD --"; ./t_fuzz_base || true
-        echo "-- work --"; ./t_fuzz_new  || true ;;
+        echo "-- HEAD --"; $RUN ./t_fuzz_base || true
+        echo "-- work --"; $RUN ./t_fuzz_new  || true ;;
     e2e)
         echo
         echo "===== e2e: loss burst delay jitter ====="
         # loss burst delay jitter steps maxchunk shaper_rate(KB/s) shaper_queue(KB)
         for cfg in "0.0 0 4 0 6000 16384" "0.0 0 10 0 6000 16384" "0.05 0 4 0 6000 16384" "0.02 6 4 0 6000 16384" "0.10 0 4 0 6000 16384" "0.0 0 4 1 6000 16384 1200 200" "0.0 0 4 1 6000 16384 1200 64" "0.0 0 4 1 6000 16384 600 200" "0.0 0 4 1 6000 2048 1200 200" "0.0 0 4 40 6000 16384" "0.0 0 4 60 6000 16384" "0.0 0 4 100 6000 16384" "0.0 0 4 1 6000 16384 1200 200 400 4" "0.0 0 4 0 6000 16384 0 0 0 0 15 300" "0.0 0 4 0 6000 16384 1200 200 0 0 15 300" "0.0 0 40 0 6000 16384 0 0 0 0 5 200" "0.0 0 30 0 6000 16384 0 0 0 0 3 150"; do
             echo "-- $cfg --"
-            echo -n "  HEAD "; ./e2e_base $cfg
-            echo -n "  work "; ./e2e_new  $cfg
+            echo -n "  HEAD "; $RUN ./e2e_base $cfg
+            echo -n "  work "; $RUN ./e2e_new  $cfg
         done ;;
     esac
 done
