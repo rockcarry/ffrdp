@@ -15,12 +15,33 @@ vtick < ../../ffrdp.c > ffrdp_new.c
 grep -q sim_tick ffrdp_base.c || { echo "FATAL: failed to virtualise the clock"; exit 1; }
 grep -q sim_tick ffrdp_new.c  || { echo "FATAL: failed to virtualise the clock"; exit 1; }
 
+# ASAN=1 turns on the address sanitizer. A read one byte past a buffer usually does not crash, so
+# without this the fuzz test can only see the fragments that kill the process outright.
+#
+# halt_on_error=1 is the important one, and it is not a preference. The sanitizer's default is to report
+# an error and then CARRY ON -- and in a crash test the process carrying on is by definition one whose
+# state is already broken (the fragment that gets here is the one that made a 4GB memcpy land on a 190KB
+# ring buffer). It then faults again inside the sanitizer's own handler, the handler re-enters, and the
+# same line is printed for ever: measured on the vulnerable code, 90 seconds of that produced 1.5GB of
+# identical output -- 51 million DEADLYSIGNAL lines, 17MB/s -- which matches the ~19GB a previous
+# unbounded run accumulated before anyone looked. With halt_on_error=1 the same run stops after 81KB and
+# names the 8 fragments that crashed. detect_leaks=0 drops report noise from a harness that does not
+# bother freeing in a child that is about to exit, and the core limit removes the other way a crash can
+# leave bulk behind. Do not add handle_segv=0 style options here: measured, they make the whole run die
+# on the first crash instead of reporting it.
+ASANFLAGS=""
+if [ -n "$ASAN" ]; then
+    ASANFLAGS="-fsanitize=address -fno-omit-frame-pointer -g"
+    export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0:halt_on_error=1"
+    ulimit -c 0
+fi
+
 CFLAGS="-O1 -w -I../.. -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -include simdefs.h \
  -D'calloc(n,s)=sim_calloc(n,s)' -D'free(p)=sim_free(p)' \
  -D'sendto(s,b,l,f,d,a)=sim_send(b,l)' -D'recvfrom(s,b,l,f,d,a)=sim_recv(b,l)' -D'select(n,r,w,e,t)=sim_select()'"
 
 gcc -O1 -w -c simnet.c -o simnet.o
-TESTS="${TESTS:-t_rto t_ack e2e}"
+TESTS="${TESTS:-t_rto t_ack t_fuzz e2e}"
 for t in $TESTS; do
     for v in base new; do
         sed "s|#include \"../../ffrdp.c\"|#include \"ffrdp_$v.c\"|" $t.c > ${t}_$v.c
@@ -31,7 +52,7 @@ for t in $TESTS; do
         grep -q 'uint32_t rmss, smss, swnd, inflight' ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_INFLIGHT"
         grep -q counter_ooo_d1_24 ffrdp_$v.c && EXTRA="$EXTRA -DOOO_HIST"
         grep -q counter_ooo_d65_128 ffrdp_$v.c && EXTRA="$EXTRA -DOOO_HIST2"
-        eval gcc $CFLAGS $EXTRA ${t}_$v.c simnet.o -o ${t}_$v
+        eval gcc $CFLAGS $ASANFLAGS $EXTRA ${t}_$v.c simnet.o -o ${t}_$v
     done
 done
 
@@ -46,6 +67,11 @@ for t in $TESTS; do
         echo "===== t_ack: ack diagnostics ====="
         echo "-- HEAD --"; ./t_ack_base || true
         echo "-- work --"; ./t_ack_new  || true ;;
+    t_fuzz)
+        echo
+        echo "===== t_fuzz: hostile fragments (a crash names the bytes)"
+        echo "-- HEAD --"; ./t_fuzz_base || true
+        echo "-- work --"; ./t_fuzz_new  || true ;;
     e2e)
         echo
         echo "===== e2e: loss burst delay jitter ====="

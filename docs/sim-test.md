@@ -52,13 +52,51 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 > 生成的中间文件（`ffrdp_base.c`、`ffrdp_new.c`、`*_base`、`*_new`、`simnet.o`）
 > 都在 `.gitignore` 里 ✓ —— 它们不是源码，每次 `run.sh` 都会重写 ✓。
 
-## 三个测试
+## 四个测试
 
 | 测试 | 内容 | 判据 |
 |---|---|---|
 | `t_rto` | 12 个同时过期的帧被逐个重传，观察 RTO 被放大多少次 | 期望"**每往返退让一次**"⇒ `rto_backoff` 只有 1 次，而不是 12 次 ✗ |
 | `t_ack` | 手工注入 3 个 ACK 帧（无洞 / 连续 / 有洞），验证诊断计数 | 期望 `ack_recv=3 mack=2 hole=1` ⇒ 打印 `PASS` ✓ |
 | `e2e` | 端到端跑 `steps` 步，输出一行摘要 + 若干诊断行 | A/B 对比 `recv`（交付量）与 `resend%`（重传率）✓ |
+| `t_fuzz` | **敌意输入**：398 个畸形片段（长度扫过每种帧类型 × 3 种载荷 + 定种子随机），**每个片段 fork 一个子进程**喂进解析器；另做洞上方洪泛的内存有界检查 | 没有片段能杀死子进程（`all N fragments survived`）**且**洪泛内存有界（`-> bounded`）✓ 见下 |
+
+### t_fuzz：敌意输入（端口健壮性的回归）
+
+**它回答的问题**：server bind 了端口，任何人往这个端口发非法数据，进程至少要**不崩** ✓。
+这里不关心"对端说谎"（那是协议问题），只关心**陌生人能发什么**。
+
+**为什么 fork**：崩溃就是数据 ✓。每个片段在一个**独立子进程**里跑（建 server 上下文 → 注入 → update），
+父进程用 `waitpid` 读状态 ⇒ 一个片段能杀死进程，报告里也只是**一行**，并且**指名是哪几个字节**：
+
+```
+  CRASH case  12: SIGFPE (divide by zero?)  len=4 | 00 00 00 00
+```
+
+**另外两项检查**：乱序洪泛（洞上方 2000 vs 4000 个帧）看内存是否**有界** ✓ —— 一个受信用额度约束的
+实现对端不该越存越多 ✗。
+
+**怎么跑**：
+
+```bash
+cd tools/sim
+TESTS="t_fuzz" bash run.sh          # HEAD 与工作区各跑一遍（天然 A/B）
+ASAN=1 TESTS="t_fuzz" bash run.sh   # 地址消毒器：不崩但越界读也要抓
+```
+
+**`halt_on_error=1` 才是这条路的重点**（`run.sh` 已设）：sanitizer 的默认行为是**报完错继续跑** ✗，
+而崩溃测试里"继续跑"的那个进程，状态本来就是坏的（能走到这里的那条路径正是"4GB 的 memcpy 砸在
+190KB 环形缓冲上"）⇒ 它会在 sanitizer **自己的 handler 里再次 fault** ⇒ handler 递归 ⇒ 同一行
+无限刷。实测：默认选项下 90 秒产出 **1.5GB / 5100 万行 DEADLYSIGNAL**（17MB/s ✗）—— 与一次
+"无截断重定向到文件"攒下的 **19GB** 完全吻合；同一跑法加上 `halt_on_error=1` 后只有 **469 字节** ✓
+（打脆弱版本时 81KB、并正常报出 8 个崩溃 ✓）。
+
+⚠️ 两条纪律仍然成立：**跑崩溃侧时不要把输出直接重定向到文件**（用 `| head` 或 `timeout`）✗；
+**不要加 `handle_segv=0` 这类"看起来更彻底"的开关** ✗ —— 实测它们会让整跑在第一个崩溃处直接
+死掉、反而报不出崩溃 ✓。
+
+**判据**：`all 398 fragments survived` ✓ ＋ `flood above a hole: … -> bounded` ✓。
+修 `ffrdp.c` 之前是 `33 of 398 fragments killed the context` ✗ ＋ `-> UNBOUNDED` ✗（见 `notes.md` 12）。
 
 ### e2e 的参数（12 个，位置固定，都有默认值）
 

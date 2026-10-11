@@ -114,6 +114,13 @@ static uint32_t get_tick_count()
 #define FFRDP_WASTE_LO       40   // % below which the repairs are real and the floor is given back
 
 #define FFRDP_RECVBUF_SIZE  (128 * (FFRDP_MAX_MSS + 0))
+// how far ahead of the hole a received frame may sit before it is dropped instead of stored. The window
+// we advertise travels in a one byte field of the ack, so it is never more than 255 frames, and a peer
+// that respects its credit cannot be further ahead than that. Anything beyond it is a lie or a
+// duplicate, and storing it is how one stranger - with no session, no handshake and one datagram per
+// frame - grows this process's memory without limit (measured before this bound existed: 4000
+// datagrams, 4000 frames kept).
+#define FFRDP_RECV_QUEUE_MAX 256
 #define FFRDP_UDPSBUF_SIZE  (128 * (FFRDP_MAX_MSS + 6))
 #define FFRDP_UDPRBUF_SIZE  (128 * (FFRDP_MAX_MSS + 6))
 #define FFRDP_SELECT_SLEEP   1
@@ -217,6 +224,12 @@ typedef struct {
     uint32_t counter_ack_dup;    // ... as reported back to us by the peer: retransmits of ours that were pointless
     uint32_t dup_seen;           // duplicates seen since our last ack, the value that ack carries
     uint32_t counter_txshort, counter_rxshort;
+    // fragments that were thrown away instead of being acted on, counted separately because they mean
+    // different things: rx_bad is a fragment whose length cannot describe anything (it is malformed,
+    // whoever sent it), recv_drop is a well formed frame that sat further ahead of the hole than the
+    // window we advertise, so storing it would only spend our memory on someone else's lie.
+    uint32_t counter_rx_bad;
+    uint32_t counter_recv_drop;
     uint32_t counter_fec_tx;
     uint32_t counter_fec_rx;
     uint32_t counter_fec_ok;
@@ -441,10 +454,21 @@ static int ffrdp_send_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame, s
 static int ffrdp_recv_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame)
 {
     uint32_t fecseq, fecrdc, *psrc, *pdst, type, i;
+    // The length below is not just a number: the payload size of the peer (rmss) is learned from it, and
+    // rmss is used as a divisor (the window this ack advertises) and as a copy length (the bytes handed
+    // to the application). A fragment shorter than its own overhead therefore does not merely look odd:
+    // a four byte "full" frame makes rmss zero (divide by zero, SIGFPE), a four byte "fec" frame -- whose
+    // overhead is six -- makes it negative, which underflows to four billion and reaches memcpy as a
+    // length (SIGSEGV). Both were reachable with a single datagram sent by anyone who can reach the port,
+    // and both are what tools/sim/t_fuzz.c exists to keep out.
     switch (frame->data[0]) {
     case FFRDP_FRAME_TYPE_SHORT: ffrdp->counter_rxshort++; return 0; // short frame
-    case FFRDP_FRAME_TYPE_FULL : ffrdp->counter_rxfull ++; ffrdp->rmss = frame->size - 4; return 0; // full frame
-    default:                     ffrdp->counter_fec_rx ++; ffrdp->rmss = frame->size - 6; break;    // fec  frame
+    case FFRDP_FRAME_TYPE_FULL :
+        if (frame->size <= 4) { ffrdp->counter_rx_bad++; return -1; }  // header only: no payload at all
+        ffrdp->counter_rxfull ++; ffrdp->rmss = frame->size - 4; return 0; // full frame
+    default:
+        if (frame->size <= 6) { ffrdp->counter_rx_bad++; return -1; }  // header + fec seq, no payload
+        ffrdp->counter_fec_rx ++; ffrdp->rmss = frame->size - 6; break;    // fec  frame
     }
     fecseq = *(uint16_t*)(frame->data + frame->size - 2);
     fecrdc = frame->data[0];
@@ -638,7 +662,11 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, struct sockaddr_in *
     uint8_t data[9];
     while (ffrdp->recv_list_head) {
         dist = seq_distance(GET_FRAME_SEQ(ffrdp->recv_list_head), ffrdp->recv_seq);
-        if (dist == 0 && (size = frame_payload_size(ffrdp->recv_list_head)) <= (int)(sizeof(ffrdp->recv_buff) - ffrdp->recv_size)) {
+        // size > 0 is the second line of defence against a frame whose length arithmetic went negative:
+        // ringbuf_write would take that as four billion bytes to copy. The recv path no longer lets such
+        // a frame in (see ffrdp_recv_data_frame), and this keeps a future path from doing it silently.
+        if (dist == 0 && (size = frame_payload_size(ffrdp->recv_list_head)) > 0 &&
+            size <= (int)(sizeof(ffrdp->recv_buff) - ffrdp->recv_size)) {
 #ifdef CONFIG_ENABLE_AES256
             if ((ffrdp->flags & FLAG_RX_AES256)) frame_node_encrypt(ffrdp->recv_list_head, &ffrdp->aes_decrypt_key, AES_DECRYPT);
 #endif
@@ -658,7 +686,9 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, struct sockaddr_in *
     // not a frame count -- it answers "is the reporting happening at all", which is the question that
     // counter_ack_mack (acks carrying any bit) is too coarse to answer.
     for (i = 0; i < 24; i++) if (recv_mack & (1 << i)) ffrdp->counter_mack_bits_sent++;
-    recv_wnd = (sizeof(ffrdp->recv_buff) - ffrdp->recv_size) / ffrdp->rmss;
+    // rmss is a divisor learned from whatever arrived (ffrdp_recv_data_frame rejects the lengths that
+    // cannot carry a payload; it starts at FFRDP_MAX_MSS). Never divide by it unconditionally.
+    recv_wnd = ffrdp->rmss ? (sizeof(ffrdp->recv_buff) - ffrdp->recv_size) / ffrdp->rmss : 0;
     recv_wnd = MIN(recv_wnd, 255);
     *(uint32_t*)(data + 0) = (FFRDP_FRAME_TYPE_ACK << 0) | (ffrdp->recv_seq << 8);
     *(uint32_t*)(data + 4) = (recv_mack <<  0);
@@ -829,7 +859,11 @@ void ffrdp_update(void *ctxt)
                 // below the range we have already taken in: the peer sent this again although we had it,
                 // which is exactly the waste we want to count and report back.
                 if (dist < 0) { ffrdp->counter_recv_dup++; ffrdp->dup_seen++; }
-                if (dist >= 0) { list_enqueue(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, node); node = NULL; }
+                // further ahead than the window we hand out in every ack: the peer is credit limited to
+                // that, so this is a lie or a duplicate. storing it would let anyone who can reach the
+                // port spend our memory at one frame per datagram, for ever (see FFRDP_RECV_QUEUE_MAX).
+                if (dist >= (int32_t)FFRDP_RECV_QUEUE_MAX) { ffrdp->counter_recv_drop++; }
+                else if (dist >= 0) { list_enqueue(&ffrdp->recv_list_head, &ffrdp->recv_list_tail, node); node = NULL; }
                 got_data = 1;
             }
         } else if (node->data[0] == FFRDP_FRAME_TYPE_ACK) { // ack frame
@@ -1252,6 +1286,11 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     printf("counter_rto_chain   : %u\n"  , ffrdp->counter_rto_chain   );
     printf("counter_rto_stale   : %u\n"  , ffrdp->counter_rto_stale   );
     printf("counter_recv_dup    : %u\n"  , ffrdp->counter_recv_dup    );
+    // what was thrown away instead of acted on: bad = a fragment whose length cannot describe anything,
+    // drop = a well formed frame further ahead of the hole than the window we advertise. On a healthy
+    // run both stay at zero; a non zero one means somebody is probing the port.
+    printf("counter_rx_bad      : %u\n"  , ffrdp->counter_rx_bad      );
+    printf("counter_recv_drop   : %u\n"  , ffrdp->counter_recv_drop   );
     printf("counter_ack_dup     : %u\n"  , ffrdp->counter_ack_dup     );
     printf("rto_floor           : %u\n"  , ffrdp->rto_floor); // 白费率见上面的 counter_resend_waste（同一个量，不再打两遍）
     printf("counter_rto_behind  : %u\n"  , ffrdp->counter_rto_behind  );

@@ -143,6 +143,8 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
 │   └── notes.md            开发与调试记录（按时间顺序，含每次上机的原始 log）
 └── tools/
     ├── sim/                差分仿真：虚拟时钟 + 假 socket，把两版代码放在同一条确定假链路上 A/B
+    ├── ffrdp-fuzz.c        端口侧敌意输入：以不讲协议的对端身份打监听端口，判进程是否存活
+    ├── inflight-sweep.sh   在途上限扫描：钉住上限并关掉探测，量出在途 ->（延迟, 速率）
     └── keylog.sh           从 test_ffrdp 的输出里只留关键行，并打印"最后一块汇总 + 逐块趋势"
 ```
 

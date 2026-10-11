@@ -14,3 +14,7 @@ t_ack_base
 t_ack_new
 e2e_base
 e2e_new
+t_fuzz_base
+t_fuzz_new
+t_fuzz_base.c
+t_fuzz_new.c
