@@ -26,7 +26,7 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 
 | 环境变量 | 含义 | 默认 |
 |---|---|---|
-| `TESTS` | 要跑哪些测试（可多选，空格分隔）| `t_rto t_ack e2e` |
+| `TESTS` | 要跑哪些测试（可多选，空格分隔）| `t_rto t_ack t_fuzz e2e` |
 | `REF` | **基线**源码路径 | `git show HEAD:ffrdp.c` |
 
 **被测版本恒为工作区当前 `ffrdp.c`** ✓ —— 所以典型用法是：改完代码直接 `bash tools/sim/run.sh`，
