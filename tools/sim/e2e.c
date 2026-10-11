@@ -19,6 +19,16 @@
 #define TEST_RECV(c, b, l) ffrdp_recv(c, b, l)
 #endif
 
+// One step of the protocol. HEAD is driven by the test (ffrdp_update); the working tree is driven by
+// its transport, so a step is a step of the fake lowlevel: every packet queued for endpoint idx is
+// handed over as one RECV, then one TIMER. idx must be the number the test passes to sim_begin();
+// with two contexts the two endpoints are 0 and 1.
+#ifdef FFRDP_LL_DRIVEN
+#define TEST_RUN(c, idx) sim_ll_run(idx, c)
+#else
+#define TEST_RUN(c, idx) ffrdp_update(c)
+#endif
+
 static unsigned hash(unsigned k, unsigned salt)
 {
     unsigned h = k * 2654435761u + salt * 40503u + 12345u;
@@ -59,8 +69,8 @@ int main(int argc, char *argv[])
     for (i = 0; i < steps; i++) {
         sim_setstep(i);
         // same shape as test.c: a random chunk of 1..sndsz bytes every iteration
-        sim_begin(0); TEST_SEND(c0, (char*)sbuf, 1 + (int)(hash(i, 11) % (unsigned)sndsz)); ffrdp_update(c0);
-        sim_begin(1); TEST_SEND(c1, (char*)sbuf, 1 + (int)(hash(i, 12) % (unsigned)sndsz)); ffrdp_update(c1);
+        sim_begin(0); TEST_SEND(c0, (char*)sbuf, 1 + (int)(hash(i, 11) % (unsigned)sndsz)); TEST_RUN(c0, 0);
+        sim_begin(1); TEST_SEND(c1, (char*)sbuf, 1 + (int)(hash(i, 12) % (unsigned)sndsz)); TEST_RUN(c1, 1);
         sim_begin(1); while ((ret = TEST_RECV(c1, (char*)rbuf, sizeof(rbuf))) > 0) r1 += ret;
         sim_begin(0); while ((ret = TEST_RECV(c0, (char*)rbuf, sizeof(rbuf))) > 0) r0 += ret;
     }

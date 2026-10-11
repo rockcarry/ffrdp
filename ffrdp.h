@@ -21,10 +21,8 @@ int   ffrdp_isdead(void *ctxt);
 void  ffrdp_flush (void *ctxt);                       // 把还没攒满的那一帧立刻发出去
 void  ffrdp_dump  (void *ctxt, int clearhistory);     // 打印诊断
 
-// ⚠️ 过渡态：协议**仍然需要被周期性驱动**，所以这一步还留着它。
-// 试过"删掉它、让收发顺带驱动协议"，实测不成立：协议只在应用接收环空着时才转一圈，应用一积压就把
-// 协议饿住 —— 本机回环吞吐从 55.5MB/s 掉到 11.6MB/s。删掉它的前提是"协议由别人按时驱动"，
-// 也就是下一步把它交给 lowlevel 的工作线程（见 lowlevel.h 的 timer / 回调）；那一步之后这个函数删除。
-void  ffrdp_update(void *ctxt);
+// 应用不再需要周期性驱动协议：协议跑在 lowlevel 的工作线程上（收包走 RECV 回调、到期走 TIMER 回调），
+// ffrdp_init 里传进去的传输层自带那个线程。应用侧唯一的等待点是 ffrdp_recv 的 timeout_ms。
+// （这里曾经有一个 ffrdp_update 让应用轮询，它已经删掉了 —— 见 notes 16。）
 
 #endif

@@ -61,6 +61,8 @@ typedef struct {
 // params:
 //  - if NULL return NULL
 //  - "bind:127.0.0.1:1234", indicate bind address and port
+//  - "none": do not bind. A client endpoint wants this: the source port is then chosen by the kernel when
+//    the first frame goes out, which is what this project did before the transport owned the socket.
 FFRDP_LOWLEVEL* ffrdp_udp_lowlevel_init(void *params, FFRDP_LOWLEVEL_CB callback, void *cbctx);
 
 #endif

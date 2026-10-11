@@ -31,6 +31,15 @@
 #include "simdefs.h"
 #include "../../ffrdp.c"
 
+// One step of the protocol. HEAD is driven by the test (ffrdp_update); the working tree is driven by
+// its transport, so a step is a step of the fake lowlevel: every packet queued for endpoint 0 is
+// handed over as one RECV, then one TIMER.
+#ifdef FFRDP_LL_DRIVEN
+#define TEST_RUN(c, idx) sim_ll_run(idx, c)
+#else
+#define TEST_RUN(c, idx) ffrdp_update(c)
+#endif
+
 // ---- how many cases each phase has ------------------------------------------------------------
 #define PHASE_SWEEP   6          // type x length x payload
 #define SWEEP_LENS    11         // 0..10
@@ -94,8 +103,8 @@ static void run_case(const unsigned char *buf, int len)
     sim_begin(0);
     if (len > 0) sim_inject(0, (void*)buf, len);
     (void)big;
-    ffrdp_update(c);
-    ffrdp_update(c);                  // a second pass: some of the damage lands on the next ack
+    TEST_RUN(c, 0);
+    TEST_RUN(c, 0);                   // a second pass: some of the damage lands on the next ack
     _exit(0);
 }
 
@@ -140,7 +149,7 @@ static unsigned long flood_live(int count)
         len = 4 + 8;                                   // a plausible payload, so nothing is rejected
         sim_begin(0);
         sim_inject(0, buf, len);
-        ffrdp_update(c);
+        TEST_RUN(c, 0);
     }
     return (sim_alloc() - sim_freed()) - before;
 }

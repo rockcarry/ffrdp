@@ -21,6 +21,15 @@
 #define TEST_RECV(c, b, l) ffrdp_recv(c, b, l)
 #endif
 
+// One step of the protocol. HEAD is driven by the test (ffrdp_update); the working tree is driven by
+// its transport, so a step is a step of the fake lowlevel: every packet queued for endpoint idx is
+// handed over as one RECV, then one TIMER. idx is the number the test passes to sim_begin().
+#ifdef FFRDP_LL_DRIVEN
+#define TEST_RUN(c, idx) sim_ll_run(idx, c)
+#else
+#define TEST_RUN(c, idx) ffrdp_update(c)
+#endif
+
 static void make_ack(unsigned char *ack, unsigned int una, unsigned int mack, unsigned char rwnd)
 {
     memset(ack, 0, 8);
@@ -38,11 +47,11 @@ int main(void)
     c = ffrdp_init("127.0.0.1", 8001, NULL, NULL, 0, 1024, 0);
     sim_begin(0);
     TEST_SEND(c, (char*)buf, 8 * 1024);
-    ffrdp_update(c);
+    TEST_RUN(c, 0);
 
-    make_ack(ack, 1, 0x00, 255); sim_inject(0, ack, 8); ffrdp_update(c);
-    make_ack(ack, 1, 0x07, 255); sim_inject(0, ack, 8); ffrdp_update(c);
-    make_ack(ack, 1, 0x0a, 255); sim_inject(0, ack, 8); ffrdp_update(c);
+    make_ack(ack, 1, 0x00, 255); sim_inject(0, ack, 8); TEST_RUN(c, 0);
+    make_ack(ack, 1, 0x07, 255); sim_inject(0, ack, 8); TEST_RUN(c, 0);
+    make_ack(ack, 1, 0x0a, 255); sim_inject(0, ack, 8); TEST_RUN(c, 0);
 
 #ifdef NEW_COUNTERS
     printf("  ack_recv=%u ack_mack=%u ack_hole=%u (expect 3/2/1) -> %s\n",

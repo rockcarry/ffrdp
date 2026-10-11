@@ -1965,3 +1965,36 @@ int ffrdp_recv(void *ctxt, char *buf, int len, int timeout_ms);
 **验证**：差分仿真 **20 个块两侧逐字相同、0 差异** ✓（纯搬迁的判据 ✓）；本机回环两端 `verify: OK` ✓、
 `seq_gap / crc_err / len_err / partial_err` 全 0 ✓、吞吐与 HEAD 同级别（46.0 vs 50.0 MB/s ✓）；
 `-Wall -Wextra -Werror` 零告警 ✓。
+
+### 17.5 差分仿真：接缝换了，差异只应来自 ack 粒度
+
+仿真接缝从"假 socket"换成"假 lowlevel"：`tools/sim/simll.c` 提供一个 `FFRDP_LOWLEVEL` 的假实现，
+`run.sh` 用 `-D'ffrdp_udp_lowlevel_init(p,cb,ctx)=sim_ll_init(p,cb,ctx)'` 把 `ffrdp_init` 的那一次调用
+引过去；两侧的驱动方式由 `-DFFRDP_LL_DRIVEN` 分开 —— base（HEAD，协议挂在应用线程上）继续 `ffrdp_update`，
+工作区这一侧每步调用 `sim_ll_run(idx, ctxt)`：先把该端点此刻待收的包逐包以 `RECV` 回调交给协议，
+再给一次 `TIMER`。假 lowlevel 的 `timer()` **只记录、绝不触发回调** ✓（否则应用线程在 `ffrdp_send` 之后
+的唤醒会改变测试的步进模型）。
+
+结果（`bash tools/sim/run.sh`，rc=0）：
+
+| 测试 | 结果 |
+|---|---|
+| `t_fuzz` | **两侧逐字相同** ✓（398 个敌意片段全部存活，上界行为一致）|
+| `t_ack` | **两侧相同且 PASS** ✓（3/2/1 与 5 都对）|
+| `t_rto` | 有可见数值差：`rto 24 → 90`、`retransmits 12 → 11`、`rto_backoff 1 → 0` |
+| `e2e` | 17 个配置都有差异：11 个只有数字不同，6 个多/少一行诊断（flag 行）|
+
+主因只有一个，而且正是 17 节开头说的那一条：**应答粒度从"一批一 ack"变成"一帧一 ack"** ✓。
+最干净的证据是无丢包配置那一行：
+
+```
+HEAD  c0 recv= 47.26MB ... ack_recv=5782
+work  c0 recv= 47.29MB ... ack_recv=38708      <- 6.7 倍的 ack
+```
+
+**数据速率基本没动** ✓（47.26 → 47.29 MB ✓），变的几乎全是 ack 与由 ack 派生的计数
+（`mack` / `dup` / `rto_floor` / rtt 采样 ✓）。t_rto 的数值差也是这一类：ack 什么时候到决定了 rtt 采样，
+rtt 决定了 rto。
+
+⇒ 下一步最值得试的一件事：**把 ack 推到这一段结束再发**（每帧只标记 `got_data`，由 tick 统一回一个 ack）。
+那既恢复旧版 ack 的经济性，也很可能把 17.2 里那 30% 的回环代价收回去 —— 因为多出来的正是包数与唤醒。

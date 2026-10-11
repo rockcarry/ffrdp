@@ -165,6 +165,13 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
             // non blocking, the same contract this project's own socket has: a frame that cannot be handed
             // to the kernel must come back as an error to the caller, not as a stall in a receive loop.
             socket_setopt(udp->sockfd, "nonblock_io", 1);
+            // 套接字缓冲区大小跟着 socket 一起搬到这里：它本来就是"这个后端要多大缓冲"的问题，不是协议
+            // 的问题。值按一帧的最大长度算，与协议层以前写死的那个量级一致（128 帧）。socket_setopt 没有
+            // 这两个 key，所以直接设。
+            {   int bs = 128 * (FFRDP_LOWLEVEL_FRAME_MAX + 6);
+                setsockopt(udp->sockfd, SOL_SOCKET, SO_SNDBUF, (char*)&bs, sizeof(bs));
+                setsockopt(udp->sockfd, SOL_SOCKET, SO_RCVBUF, (char*)&bs, sizeof(bs));
+            }
             if (udp->sockfd < 0) { printf("<2> ffrdp-udp failed to create socket !\n"); usleep(100 * 1000); continue; }
             if ((udp->flags & FLAG_BIND_ADDR) && bind(udp->sockfd, (struct sockaddr*)&udp->addr, sizeof(udp->addr)) < 0) {
                 printf("<2> udpproxy failed to bind socket to port %d !\n", ntohs(udp->addr.sin_port));
@@ -254,6 +261,12 @@ static void ffrdp_udp_lowlevel_exit(void *fl)
     // to sleep for ever, while this side sits in the join. Both have to happen, flag first, or the join is
     // a coin flip. (Setting the flag here is not a shortcut around the state call below: state 0 does the
     // same thing to the same field and then joins, so this only makes the order explicit.)
+    // 从工作线程里调用 exit 是"join 自己"：状态 0 会一直等一个只有它自己能走完的退出，于是整个进程
+    // 卡死。契约上禁止这样做（见 lowlevel.h），这里再把代价压成"这一轮之后自然退出"而不是挂住。
+    if (udp->mthread.hthread && udp->mthread.hthread == (void*)pthread_self()) {
+        udp->mthread.flags |= MOD_THREAD_FLAG_STOP;
+        return;
+    }
     udp->mthread.flags |= MOD_THREAD_FLAG_STOP;
     ffrdp_udp_notify(udp);
     // Then stop it and wait for it: that thread owns the socket and dereferences this handle, so freeing
@@ -277,8 +290,11 @@ static int ffrdp_udp_lowlevel_parse(UDP_LOWLEVEL *udp, const char *params)
     int         port;
     size_t      iplen;
 
+    // "none": 明确表示"这个端点不绑定"（客户端就是这样：源端口由内核在第一次发包时定）。它是一条正常
+    // 的配置，不是笔误，所以不打印、也没有 flags 位 —— 没有 FLAG_BIND_ADDR，接收线程就不去 bind。
+    if (strcmp(params, "none") == 0) return 0;
     if (strncmp(params, "bind:", 5) != 0) {
-        printf("<3> ffrdp-udp params \"%s\" is not \"bind:ip:port\", no bind address is set\n", params);
+        printf("<3> ffrdp-udp params \"%s\" is not \"bind:ip:port\" or \"none\", no bind address is set\n", params);
         return 0;
     }
     rest  = params + 5;

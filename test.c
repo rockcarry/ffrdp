@@ -25,6 +25,7 @@ static uint32_t get_tick_count()
 #define TEST_PEER_SILENCE_MS     2000   // 这么久没收到对端数据就认为它失联（见 peer_is_lost）
 #define TEST_SPEED_INTERVAL_MS   1000   // 发送限速：每这么久补一次令牌（见 peer_thread）
 #define TEST_STREAM_MAX        (256 * 1024) // 接收侧累积缓冲：ffrdp_recv 是字节流，消息要自己拼回来
+#define TEST_RECV_WAIT_MS            10    // 没有数据时 ffrdp_recv 等这么久：应用侧的节拍点
 
 // 每条消息的格式（全部小端）：
 //   [4B 总长 len][4B seq][payload...][4B crc32]      len = 整条消息字节数（含头尾）
@@ -232,10 +233,9 @@ static void* peer_thread(void *param)
         }
 
         if (msg_len > 0) {
-            // 这一版仍传 0（不等待）：测试程序本来就是"队列满就下一轮原样重试这一条"，节奏由下面的
-            // ffrdp_update 提供。实测：单线程阶段在这里传 >0，等于让"等"跑成 10ms 级的协议 nap，
-            // 每轮只发得出一条消息 ⇒ 吞吐 55 -> 13 MB/s。等协议由 lowlevel 线程驱动之后（下一步），
-            // 应用侧才真正需要等待语义。
+            // 传 0（不等待）：这个测试的背压方式就是"队列满就下一轮原样重试这一条"，重试的节拍由下面
+            // 那次带超时的 ffrdp_recv 提供。协议跑在自己的线程上之后，等待不再等于"让协议停一会儿"，
+            // 所以这里的 0 只是这个测试自己的选择，不再是必须。
             ret = ffrdp_send(ffrdp, (char*)sendbuf, msg_len, 0);
             if (ret == msg_len) {                       // 整条被接受
                 v.sent_msgs++; v.sent_bytes += (uint32_t)msg_len;
@@ -252,11 +252,10 @@ static void* peer_thread(void *param)
         // tokens 不够装下最小一条消息时 msg_len 会是 0 ⇒ 这一轮只收不发，协议照常由循环末尾的 update 驱动
 
         if (stream_len < TEST_STREAM_MAX) {
-            // 同样是 0（不等待）：接收到的数据一有就立刻取走，等待由循环末尾的 ffrdp_update 负责。
-            // 传 >0 时 ffrdp_recv 会把等待时间用来跑协议，那本身是对的语义，但在"协议还挂在应用线程
-            // 上"这一步里会把应用自己的循环节拍压到 10ms 一档 ⇒ 实测吞吐 35 -> 13 MB/s。
-            // 等协议交给 lowlevel 线程之后，应用侧才应该用 >0 来等。
-            ret = ffrdp_recv(ffrdp, (char*)stream + stream_len, TEST_STREAM_MAX - stream_len, 0);
+            // 这里就是应用侧唯一的等待点：一有数据立刻返回，没有数据最多等 TEST_RECV_WAIT_MS。协议由
+            // lowlevel 的工作线程驱动，所以这个等待是真的在"等数据"，不再顺便决定协议的节拍 —— 这正是
+            // 旧版传 >0 会掉吞吐（55 -> 13 MB/s）的原因，那时"等"同时是协议的 nap。
+            ret = ffrdp_recv(ffrdp, (char*)stream + stream_len, TEST_STREAM_MAX - stream_len, TEST_RECV_WAIT_MS);
             if (ret > 0) {
                 stream_len += ret;
                 if (connected == 0) {
@@ -282,7 +281,8 @@ static void* peer_thread(void *param)
             }
         }
 
-        ffrdp_update(ffrdp);   // 过渡态：协议仍由这里按时驱动（见 ffrdp.h 的说明）；下一步交给 lowlevel
+        // 这里原来有一句 ffrdp_update()：应用按自己的节奏驱动协议。协议现在由 lowlevel 的工作线程驱动
+        // （收包走 RECV 回调、到期走 TIMER 回调），应用不再需要、也没有这个函数可调了。
         if (connected && peer_is_lost(ffrdp, tick_recv)) {
             printf("%s lost !\n", peer->peer);
             ffrdp_free(ffrdp); ffrdp = NULL;
@@ -381,7 +381,9 @@ int main(int argc, char *argv[])
     // 退出只认 quit / exit，或 stdin 结束（Ctrl+D、管道关闭）—— 后者在脚本里跑很有用。
     while (!g_exit) {
         char cmd[256];
-        if (scanf("%256s", cmd) != 1) break;
+        // %255s：宽度必须比缓冲区小一个字节，否则一个 256 字符的输入就会把那一个 NUL 写到栈上（ASAN 报
+        // 的就是这个：WRITE of size 257）。这个 bug 与协议无关，是在这次验证里被撞出来的。
+        if (scanf("%255s", cmd) != 1) break;
         if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) g_exit = 1;
     }
 

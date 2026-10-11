@@ -19,6 +19,7 @@ void  sim_setstep(int step);
 void  sim_advance(uint32_t ms);      // jump the virtual clock forward
 void  sim_inject(int idx, void *buf, int len); // queue a raw packet for one side
 int   sim_queued(int idx);
+void  sim_ll_run(int idx, void *ctxt); // drive the fake lowlevel: one RECV per queued packet, then one TIMER
 unsigned long sim_alloc(void);
 unsigned long sim_freed(void);
 

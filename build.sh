@@ -39,15 +39,27 @@ build_package()
     *mingw*)
         LDFLAGS="$LDFLAGS -lws2_32 -lwinmm"
         ;;
+    *)
+        # socket.c / utils.c / lowlevel-udp.c 的 Linux 实现被 #ifdef LINUX 挡着：不给这个宏，它们编出来
+        # 是空函数（或者干脆编不过），而这三个文件是传输层本身。mingw 那一支不需要它。
+        CFLAGS="$CFLAGS -DLINUX"
+        ;;
     esac
 
     gen_libffrdp_pkgconfig_file
+    # 协议层依赖传输层：ffrdp.c 现在只认 lowlevel 的接口（send / timer / 回调），实现是 lowlevel-udp.c，
+    # 它自己又用 socket.c 与 utils.c（工作线程）。所以这几份一起进库 —— 少一份就是运行期才发现的
+    # undefined reference。
     ${CROSS_COMPILE}gcc -c $CFLAGS ffrdp.c
-    ${CROSS_COMPILE}ar rcs libffrdp.a ffrdp.o
+    ${CROSS_COMPILE}gcc -c $CFLAGS lowlevel-udp.c
+    ${CROSS_COMPILE}gcc -c $CFLAGS socket.c
+    ${CROSS_COMPILE}gcc -c $CFLAGS utils.c
+    ${CROSS_COMPILE}ar rcs libffrdp.a ffrdp.o lowlevel-udp.o socket.o utils.o
     ${CROSS_COMPILE}gcc $CFLAGS test.c libffrdp.a $LDFLAGS -o test_ffrdp
     mkdir -p $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/include
     mkdir -p $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/lib/pkgconfig
     cp $TOPDIR/ffrdp.h     $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/include/
+    cp $TOPDIR/lowlevel.h  $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/include/
     mv $TOPDIR/libffrdp.a  $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/lib/
     mv $TOPDIR/libffrdp.pc $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/lib/pkgconfig
 }
