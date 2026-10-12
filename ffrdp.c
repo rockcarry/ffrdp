@@ -376,7 +376,7 @@ static void frame_node_encrypt(FFRDP_FRAME_NODE *node, AES_KEY *key, int enc)
 #endif
 
 static int frame_payload_size(FFRDP_FRAME_NODE *node) {
-    return  node->size - 4 - (node->data[0] <= FFRDP_FRAME_TYPE_SHORT ? 0 : 2);
+    return node->size - 4 - (node->data[0] <= FFRDP_FRAME_TYPE_SHORT ? 0 : 2);
 }
 
 static void list_enqueue(FFRDP_FRAME_NODE **head, FFRDP_FRAME_NODE **tail, FFRDP_FRAME_NODE *node)
@@ -1068,9 +1068,19 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp)
 {
     const FFRDP_FRAME_NODE *q;
     uint32_t now = get_timestamp32_ms(), due = 0, x;
+    int      n_sent = 0;
     int      pending_first = 0;                            // 发送表里有还没首发出去的帧
+    int      sent_before_pending = 0;                      // 第一个"还没首发"的帧前面有几帧已首发
     for (q = ffrdp->send_list_head; q; q = q->next) {
-        if (!(q->flags & FLAG_FIRST_SEND)) { pending_first = 1; continue; }   // tick_timeout 是绝对时刻
+        if (!(q->flags & FLAG_FIRST_SEND)) {
+            // tick 的发送循环是"从表头起最多看 cwnd 帧"。表头那些已首发、在等 ack 的帧会把窗口占满，
+            // 排在后面的未首发帧这一圈根本够不着 —— 那时候报"现在有活"就是空转：对端静默时 cwnd 塌成
+            // 1，实测每秒 ~50 万圈、工作线程 ~40% CPU（notes 19.6 第 1 条）。记下它们的序号，下面一起判。
+            if (!pending_first) sent_before_pending = n_sent;
+            pending_first = 1;
+            continue;
+        }
+        n_sent++;
         if (!due || (int32_t)(q->tick_timeout - due) < 0) due = q->tick_timeout;
     }
     if (ffrdp->cur_new_node) { x = ffrdp->cur_new_tick + FFRDP_FLUSH_TIMEOUT; if (!due || (int32_t)(x - due) < 0) due = x; }
@@ -1083,7 +1093,10 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp)
     //   * 少了"还没首发的帧"那一半：一个 ack 刚把窗口/在途数打开，却没有人立刻把队列里的帧顶上 ——
     //     管线在每个 ack 之后空一段。实测 tick 次数腰斩（45253 -> 22793 / 12s），吞吐同步腰斩。
     // 条件是"发得出去"而不是"有东西要发"：窗口关着时叫醒只是空转，那种情况下一个 ack 自然会来敲门。
-    if (ffrdp->app_tx_size || pending_first) {
+    // 立刻叫醒的判据必须与 tick 真正"发得出去"的判据一致（否则窗口关着时空转）：
+    //   * 应用队列里有东西 —— drain 不受 cwnd 限制，它一定能成帧 ⇒ 有活，叫醒；
+    //   * 或者发送表里那个"还没首发"的帧，真的落在 tick 这一圈看得见的范围内（序号 < cwnd）。
+    if (ffrdp->app_tx_size || (pending_first && sent_before_pending < (int)ffrdp->cwnd)) {
         uint32_t limit = MAX(ffrdp->inflight_max ? ffrdp->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX, (uint32_t)FFRDP_INFLIGHT_MIN);
         if (ffrdp->swnd > 0 && ffrdp->inflight_used < limit) due = now;
     }

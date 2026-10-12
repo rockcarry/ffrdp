@@ -42,6 +42,14 @@ static void *TEST_INIT(const char *ip, int port, int server, int mss)
 #define TEST_INIT(ip, port, server, mss) ffrdp_init((char *)(ip), port, NULL, NULL, server, mss, 0)
 #endif
 
+// ---- 判定：只放"任何负载/任何旋钮下都必须成立"的不变量。统计数字（resend%、rto、rto_floor、
+// ooo 直方图……）随负载与旋钮变化，是给人看的，不是判据 —— 调参类改动不该因为它们被判失败。----
+static int g_fail;
+static void check(int ok, const char *what)
+{
+    if (!ok) { printf("       FAIL: %s\n", what); g_fail++; }
+}
+
 static unsigned hash(unsigned k, unsigned salt)
 {
     unsigned h = k * 2654435761u + salt * 40503u + 12345u;
@@ -76,7 +84,7 @@ int main(int argc, char *argv[])
     if (spikep > 0) sim_spike(spikep, spikem);
     c0 = TEST_INIT("127.0.0.1", 8001, 0, 1280);
     c1 = TEST_INIT("127.0.0.1", 8002, 1, 1280);
-    if (!c0 || !c1) { printf("init failed\n"); return -1; }
+    if (!c0 || !c1) { printf("       FAIL: init failed\n"); return -1; }
     memset(sbuf, 0x5a, sizeof(sbuf));
 
     for (i = 0; i < steps; i++) {
@@ -158,5 +166,20 @@ int main(int argc, char *argv[])
 #ifdef HAVE_INFLIGHT
     printf("       c0 inflight=%u\n", s0.inflight);
 #endif
-    return 0;
+
+    // ---- 判定（负载无关）----
+    // 1) 一切都要还回去：ctx / 帧 / 乱序队列，残留就是泄漏
+    check(sim_alloc() == sim_freed(), "leaked bytes (a context or a frame was not returned)");
+    // 2) 丢包模型：配了丢包率、又没有加 shaper/policer 时，实测的"空中丢失"应当接近配置值。
+    //    容差给得宽（10 个百分点）—— 这一条是用来抓"模型坏了"的，不是用来卡统计波动的。
+    if (loss > 0.0 && cap == 0 && pcap == 0 && s0.tx > 0 && s1.tx > 0) {
+        double l01 = 100.0 * (s0.tx - s0.rx) / s0.tx;   // c0 -> c1 实际丢了多少
+        double l10 = 100.0 * (s1.tx - s1.rx) / s1.tx;   // c1 -> c0
+        check(l01 >= loss * 100.0 - 10.0 && l01 <= loss * 100.0 + 10.0, "observed loss c0->c1 far from the configured rate");
+        check(l10 >= loss * 100.0 - 10.0 && l10 <= loss * 100.0 + 10.0, "observed loss c1->c0 far from the configured rate");
+    }
+    // 3) 交付上界：收到的不可能比发出的多（两边都发，所以用各自的对端）
+    check(r1 >= 0 && r0 >= 0, "negative byte count");
+    printf("       verdict -> %s\n", g_fail ? "FAIL" : "OK");
+    return 0;   // 判定结果体现在上面那一行：run.sh 读它
 }

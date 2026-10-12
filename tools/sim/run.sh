@@ -101,6 +101,12 @@ gcc -O1 -w $HAVE_B -DSIMLL_BASE -c simll.c -o simll_base.o
 # -I../..: the copy sits here, so its quoted includes ("utils.h") need the repo root on the path.
 gcc -O1 -w -I../.. -c utils_sim.c -o utils.o
 TESTS="${TESTS:-t_rto t_ack t_fuzz e2e}"
+
+# 每一侧的输出同时进终端与一份日志：末尾的"判定汇总"从日志里读，免得靠人眼看统计数字。
+# 统计行（resend%、rto_floor、ooo 直方图……）随负载与旋钮变化，不是判据。
+SIMLOG="${SIMLOG:-/tmp/ffrdp-sim-harness.log}"
+: > "$SIMLOG"
+run() { "$@" 2>&1 | tee -a "$SIMLOG" || true; }
 for t in $TESTS; do
     for v in base new; do
         sed "s|#include \"../../ffrdp.c\"|#include \"ffrdp_$v.c\"|; s|#include \"../../ffrdp.h\"|#include \"ffrdp_$v.h\"|" $t.c > ${t}_$v.c
@@ -136,26 +142,48 @@ for t in $TESTS; do
     case $t in
     t_rto)
         echo "===== t_rto: rto inflation ====="
-        echo "-- HEAD --"; $RUN ./t_rto_base || true
-        echo "-- work --"; $RUN ./t_rto_new  || true ;;
+        echo "-- HEAD --" | tee -a "$SIMLOG"; run $RUN ./t_rto_base
+        echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_rto_new ;;
     t_ack)
         echo
         echo "===== t_ack: ack diagnostics ====="
-        echo "-- HEAD --"; $RUN ./t_ack_base || true
-        echo "-- work --"; $RUN ./t_ack_new  || true ;;
+        echo "-- HEAD --" | tee -a "$SIMLOG"; run $RUN ./t_ack_base
+        echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_ack_new ;;
     t_fuzz)
         echo
         echo "===== t_fuzz: hostile fragments (a crash names the bytes)"
-        echo "-- HEAD --"; $RUN ./t_fuzz_base || true
-        echo "-- work --"; $RUN ./t_fuzz_new  || true ;;
+        echo "-- HEAD --" | tee -a "$SIMLOG"; run $RUN ./t_fuzz_base
+        echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_fuzz_new ;;
     e2e)
         echo
         echo "===== e2e: loss burst delay jitter ====="
         # loss burst delay jitter steps maxchunk shaper_rate(KB/s) shaper_queue(KB)
         for cfg in "0.0 0 4 0 6000 16384" "0.0 0 10 0 6000 16384" "0.05 0 4 0 6000 16384" "0.02 6 4 0 6000 16384" "0.10 0 4 0 6000 16384" "0.0 0 4 1 6000 16384 1200 200" "0.0 0 4 1 6000 16384 1200 64" "0.0 0 4 1 6000 16384 600 200" "0.0 0 4 1 6000 2048 1200 200" "0.0 0 4 40 6000 16384" "0.0 0 4 60 6000 16384" "0.0 0 4 100 6000 16384" "0.0 0 4 1 6000 16384 1200 200 400 4" "0.0 0 4 0 6000 16384 0 0 0 0 15 300" "0.0 0 4 0 6000 16384 1200 200 0 0 15 300" "0.0 0 40 0 6000 16384 0 0 0 0 5 200" "0.0 0 30 0 6000 16384 0 0 0 0 3 150"; do
             echo "-- $cfg --"
-            echo -n "  HEAD "; $RUN ./e2e_base $cfg
-            echo -n "  work "; $RUN ./e2e_new  $cfg
+            printf "  HEAD " | tee -a "$SIMLOG"; run $RUN ./e2e_base $cfg
+            printf "  work " | tee -a "$SIMLOG"; run $RUN ./e2e_new  $cfg
         done ;;
     esac
 done
+
+# ---- 判定汇总：只看"判定"，不看统计 ----
+# 侧别由日志里的 "-- HEAD --" / "-- work --" 决定；e2e 自己的 "-- <cfg> --" 不改变侧别。
+# 判定行有两种形状：t_ack/t_fuzz 的 "... -> PASS"，e2e 的 "verdict -> OK/FAIL"。
+awk '
+  BEGIN { side = "(开头)" }
+  /^-- HEAD --$/ { side = "HEAD"; next }
+  /^-- work --$/ { side = "work"; next }
+  /^-- /         { next }
+  /^  HEAD /     { side = "HEAD" }   # e2e 的侧别是行首前缀，不是独立一行；不能 next（本行可能带判定）
+  /^  work /     { side = "work" }
+  /-> PASS/       { p[side]++; next }
+  /verdict -> OK/ { p[side]++; next }
+  /-> FAIL|FAIL:|verdict -> FAIL/ { f[side]++; bad[side] = bad[side] "\n        " $0 }
+  END {
+    printf "\n===== 判定汇总（只统计判定行；统计数字仅供参考，随负载与旋钮变化）=====\n";
+    for (s in p) printf "  %-5s 判定通过 %d\n", s, p[s];
+    for (s in f) printf "  %-5s 判定失败 %d%s\n", s, f[s], bad[s];
+    wf = ("work" in f) ? f["work"] : 0;
+    printf "  ⇒ work 侧: %s\n", (wf ? "有 FAIL（见上）" : "全通过");
+    exit (wf ? 1 : 0);
+  }' "$SIMLOG"
