@@ -911,49 +911,67 @@ int main(int argc, char **argv)
     }
 
     /* ---------------------------------------------------------------- */
-    section("10. addr_parse: a peer that has not spoken yet can still be addressed");
+section("10. addr: the shared text->addr convention (utils)");
 
-    {
-        char     text[64];
-        uint64_t parsed = 0, learnt = 0;
-        int      n, before;
+{
+    char     text[64];
+    uint32_t ip = 0, ip2 = 0, keep_ip;
+    uint16_t port16 = 0;
+    int      port = 0, keep_port;
+    uint64_t made = 0, learnt = 0;
+    int      n, before;
 
-        // a configured addr must be indistinguishable from one learnt from a datagram -- that is what lets
-        // the layer above send the first frame to a peer that has not said anything yet
-        snprintf(text, sizeof(text), "127.0.0.1:%d", port_peer);
-        CHECK_EQ(fl->addr_parse(fl, text, &parsed), 0);
-        before = rx_count(&rx);
-        CHECK_EQ(peer_send_to(fd, port_ep, "whoami", 7), 7);
-        CHECK(rx_wait(&rx, before + 1, 1500));
-        pthread_mutex_lock(&rx.lock);
-        learnt = rx.last_addr;
-        pthread_mutex_unlock(&rx.lock);
-        note("configured addr 0x%llX, addr learnt from a datagram 0x%llX",
-             (unsigned long long)parsed, (unsigned long long)learnt);
-        CHECK_EQ(parsed, learnt);
+    // 文本形式（协议层给还没开口的对端起名）与从数据报学到的（传输层）必须给出同一个 addr
+    snprintf(text, sizeof(text), "127.0.0.1:%d", port_peer);
+    CHECK_EQ(ffrdp_addr_parse_text(text, &ip, &port, FFRDP_ADDR_DEFAULT_PORT), 0);
+    CHECK_EQ(port, port_peer);
+    made = ffrdp_addr_make(ip, (uint16_t)port);
 
-        // and it addresses: send to the configured addr, and the far side receives from our bound port
-        uint64_t from_ep = 0;
-        CHECK_EQ(fl->send(fl, parsed, (uint8_t *)"configured", 11), 0);
-        n = peer_recv(fd, buf, sizeof(buf), &from_ep);
-        CHECK_EQ(n, 11);
-        CHECK(memcmp(buf, "configured", 10) == 0);
-        CHECK_EQ((uint32_t)(from_ep & 0xFFFF), (uint32_t)port_ep);
+    before = rx_count(&rx);
+    CHECK_EQ(peer_send_to(fd, port_ep, "whoami", 7), 7);
+    CHECK(rx_wait(&rx, before + 1, 1500));
+    pthread_mutex_lock(&rx.lock);
+    learnt = rx.last_addr;
+    pthread_mutex_unlock(&rx.lock);
+    note("addr from text 0x%llX, addr learnt from a datagram 0x%llX",
+         (unsigned long long)made, (unsigned long long)learnt);
+    CHECK_EQ(made, learnt);
 
-        // a rejected parse must not touch the output, so a caller cannot mistake a stale value for a new one
-        uint64_t keep = parsed;
-        CHECK_EQ(fl->addr_parse(fl, NULL, &parsed), -1);
-        CHECK_EQ(fl->addr_parse(fl, "", &parsed), -1);
-        CHECK_EQ(fl->addr_parse(fl, "127.0.0.1", &parsed), -1);       // no port
-        CHECK_EQ(fl->addr_parse(fl, ":8000", &parsed), -1);           // no address
-        CHECK_EQ(fl->addr_parse(fl, "127.0.0.1:0", &parsed), -1);     // a peer needs a real port
-        CHECK_EQ(fl->addr_parse(fl, "127.0.0.1:99999", &parsed), -1);
-        CHECK_EQ(fl->addr_parse(fl, "no.such.host:8000", &parsed), -1);
-        CHECK_EQ(fl->addr_parse(fl, "1.2.3.4.5.6.7.8.9.0.1.2.3.4.5.6.7.8.9.0.1.2.3.4.5.6.7.8.9.0.1:80", &parsed), -1);
-        CHECK_EQ(fl->addr_parse(fl, "127.0.0.1:8000", NULL), -1);
-        CHECK_EQ(parsed, keep);
-        note("9 malformed forms rejected, the output addr left untouched");
-    }
+    // 拆回来是主机序的 ip/port；send() 用它能把帧送到（对端看到的是我们的绑定端口）
+    ffrdp_addr_split(learnt, &ip2, &port16);
+    CHECK_EQ(ip2, ip);
+    CHECK_EQ((int)port16, port);
+    uint64_t from_ep = 0;
+    CHECK_EQ(fl->send(fl, learnt, (uint8_t *)"configured", 11), 0);
+    n = peer_recv(fd, buf, sizeof(buf), &from_ep);
+    CHECK_EQ(n, 11);
+    CHECK(memcmp(buf, "configured", 10) == 0);
+    CHECK_EQ((uint32_t)(from_ep & 0xFFFF), (uint32_t)port_ep);
+
+    // 省略端口 ⇒ 用默认值（这正是 ffrdp_init 将来单参数 addr 的依据）
+    CHECK_EQ(ffrdp_addr_parse_text("127.0.0.1", &ip, &port, FFRDP_ADDR_DEFAULT_PORT), 0);
+    CHECK_EQ(port, FFRDP_ADDR_DEFAULT_PORT);
+    // default_port < 0 ⇒ 端口必须显式给（bind: 就是这种）
+    CHECK_EQ(ffrdp_addr_parse_text("127.0.0.1", &ip, &port, -1), -1);
+    // 端口 0：约定本身允许（含义是"由内核选"），"对端必须给真端口"是协议层的策略
+    CHECK_EQ(ffrdp_addr_parse_text("127.0.0.1:0", &ip, &port, -1), 0);
+    CHECK_EQ(port, 0);
+
+    // 畸形形式：拒绝，且不动输出（与旧 addr_parse 相同的拒绝面）
+    keep_ip = ip; keep_port = port;
+    CHECK_EQ(ffrdp_addr_parse_text(NULL, &ip, &port, -1), -1);
+    CHECK_EQ(ffrdp_addr_parse_text("", &ip, &port, -1), -1);
+    CHECK_EQ(ffrdp_addr_parse_text(":8000", &ip, &port, -1), -1);
+    CHECK_EQ(ffrdp_addr_parse_text("127.0.0.1:99999", &ip, &port, -1), -1);
+    CHECK_EQ(ffrdp_addr_parse_text("no.such.host:8000", &ip, &port, -1), -1);
+    CHECK_EQ(ffrdp_addr_parse_text("1.2.3.4.5:80", &ip, &port, -1), -1);
+    CHECK_EQ(ffrdp_addr_parse_text("127.0.0.256:80", &ip, &port, -1), -1);
+    CHECK_EQ(ffrdp_addr_parse_text("127.0.0.1:8000", NULL, &port, -1), -1);
+    CHECK_EQ(ffrdp_addr_parse_text("127.0.0.1:8000", &ip, NULL, -1), -1);
+    CHECK_EQ(ip, keep_ip);
+    CHECK_EQ(port, keep_port);
+    note("malformed forms rejected, the output left untouched");
+}
 
     /* ---------------------------------------------------------------- */
     close(fd);

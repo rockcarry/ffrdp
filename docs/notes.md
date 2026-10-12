@@ -1769,8 +1769,8 @@ v2.0.0 要把协议层和 socket 解耦，底层不一定是 UDP，于是先做 
 |---|---|
 | `timer(fl, deadline_ms)` | **绝对**毫秒 ✓，与 `ffrdp_get_timestamp32_ms()` 同一时间基 ✓ |
 | `deadline_ms == 0` | 没有期限 ⇒ 睡到有数据为止 ✓（空闲时不影响 CPU 唤醒 ✓）|
-| `addr_parse(fl, "1.2.3.4:5678", &addr)` | **configured peer 与 learnt peer 同构** ✓：把对端的文本形式变成 `send` 能用的 addr ✓ —— 因为从 RECV 拿到的 addr 只能"回发" ✓，而**还没开过口的对端必须有人先给它起个名字** ✓（客户端发第一帧就是这种情况 ✓）；实现复用收包路径同一个编码函数 ✓ ⇒ 两种来源逐位相同 ✓ |
-| `FFRDP_LOWLEVEL_FRAME_MAX`（= 1500 ✓）| **接口帧长上限**：低层一个缓冲能收下的最大帧 ✓，上层据此定帧大小（`FFRDP_MAX_MSS` = 1500 − 8 ✓ 给 UDP 头留位 ✓）；**超过的接收会被静默截断** ✓ —— 放在 `lowlevel.h` 里，正是为了让 `ffrdp.c` 用同一个数 ✓ |
+| ~~`addr_parse(fl, "1.2.3.4:5678", &addr)`~~（**已下掉**：约定搬进 `utils.h`，见 §21）| **configured peer 与 learnt peer 同构** ✓：把对端的文本形式变成 `send` 能用的 addr ✓ —— 因为从 RECV 拿到的 addr 只能"回发" ✓，而**还没开过口的对端必须有人先给它起个名字** ✓（客户端发第一帧就是这种情况 ✓）；实现复用收包路径同一个编码函数 ✓ ⇒ 两种来源逐位相同 ✓ |
+| `FFRDP_LOWLEVEL_FRAME_MAX`（= 1500 ✓）| **接口帧长上限**：低层一个缓冲能收下的最大帧 ✓，上层据此定帧大小（`FFRDP_MAX_MSS` 现在由它派生 ✓ —— 2026-10-12 起不再写死 1500 ✓）；**超过的接收会被静默截断** ✓ —— 放在 `lowlevel.h` 里，正是为了让 `ffrdp.c` 用同一个数 ✓ |
 | 期限已过 | **立刻**回调一次 ✓（这就是"催发"的唯一写法 ✓）|
 | 重复调用 | **覆盖式** ✓（替换上一次，不是累加 ✓）|
 | 调用线程 | **任意线程可调** ✓（上层从应用线程催发就是靠它 ✓）|
@@ -1819,7 +1819,7 @@ v2.0.0 要把协议层和 socket 解耦，底层不一定是 UDP，于是先做 
 | 同端点嵌套 | 全程 **0** ✓（跨端点并发 5~10 次 ✓ 允许 ✓）|
 | `exit`（无期限）| **0 ms** ✓ |
 | 资源 | 70 次 init/exit 后 fd 9→9 ✓、线程 2→2 ✓（ASAN 泄漏检测开着 ✓）|
-| `addr_parse` | 配置的 addr `0x7F0000018601` 与从数据报学到的 addr **逐位相同** ✓；用它 `send` 能送达且源端口正确 ✓；9 种非法形式全部拒绝 ✓ 且**不改动输出** ✓ |
+| ~~`addr_parse`~~（§21：第 10 节已改为直接测共享约定）| 配置的 addr `0x7F0000018601` 与从数据报学到的 addr **逐位相同** ✓；用它 `send` 能送达且源端口正确 ✓；9 种非法形式全部拒绝 ✓ 且**不改动输出** ✓ |
 
 运行：`bash tools/test-lowlevel-udp.sh` ✓（普通约 11.8s ✓）／`ASAN=1 bash tools/test-lowlevel-udp.sh`
 ✓（约 7.5s ✓，需 `setarch -R`，见 12.5 ✓[^1]）。
@@ -1829,7 +1829,7 @@ v2.0.0 要把协议层和 socket 解耦，底层不一定是 UDP，于是先做 
 ### 13.6 没做的（暂时看不到需求 ✓）
 
 `addr_format` ✓（只影响打印 ✓）、`get_mtu` ✓、`stats` ✓、背压开关 ✓、多通道（一个事件循环 + N 个
-socket）✓、`TYPE_TX_READY` ✓ —— 都不做 ✓。~~`addr_parse`~~ **后来加了** ✓：v2.0.0 要把 ffrdp.c 接到
+socket）✓、`TYPE_TX_READY` ✓ —— 都不做 ✓。~~`addr_parse`~~ **后来加了** ✓（**2026-10-12 又下掉了**：它不是后端差异，约定搬进 `utils.h`，见 §21）：v2.0.0 要把 ffrdp.c 接到
 lowlevel 上时，客户端必须先发第一帧 ✓ ⇒ "对端还没开口，上层怎么给它一个 addr" 这个需求到了 ✓。其中**多通道**是唯一值得提前想一想的 ✗：现在
 "一个 handle = 一个 socket + 一个线程"，多 peer 就是多线程 ✓（客户端/几路没问题 ✓；若将来做
 VPN 服务器/路由器，接口形状要留出 cookie 化的通道 ✓）。
@@ -2064,7 +2064,7 @@ C2 唯一有意改变的时序是"应答粒度"（notes 16 预告、17.5 量化�
 ### 19.1 接缝：跨架构不可比，同一架构内可比 ✓
 
 `run.sh:17` 的 base 侧默认取 `git show HEAD:ffrdp.c`（`REF=` 可换文件 ✓，不需要另外的 `REFH`：base 头文件
-仍取 HEAD，实测 `45d91a4` 的实现在当前 `ffrdp.h` 下编得过、跑得完 ✓）。
+仍取 HEAD，实测 `45d91a4` 的实现在当前 `ffrdp.h` 下编得过、跑得完 ✓）。**2026-10-12 起 `lowlevel.h` 也版本化** ✓：接口改动现在同样能两侧同跑（见 §21.3 ✓）。
 
 **跨架构对照不可信** ✗：新侧的"一圈收多少 + 多久给一次 TIMER"由假 lowlevel 决定（`simll.c`），而旧侧由
 应用每步的 `ffrdp_update` 驱动 ⇒ 两侧节拍不同 ⇒ 输出里的"数量级差异"里混着**节拍假象**。实测：同一份
@@ -2248,3 +2248,53 @@ TSAN 现在仍会报，但都已判定为**形式竞争**（顺序本身是对�
   **用 `gcc-10 -fsanitize=thread` 即可** ✓（`-L` 补空对象的绕法**无效** ✗：那个对象只从 gcc 自己的目录找）；
   TSAN 二进制配 `setarch $(uname -m) -R` 跑 ✓（规避 ASAN/TSAN 在高熵 ASLR 下的启动抖动 ✓）。
 - core 走不通的原因：`core_pattern` 指向 `|/wsl-capture-crash ...`，而本机**没有这个助手** ✗ 且 `ulimit -c 0` ✓。
+## 21. 低层接口收敛：addr_parse 下掉，地址约定进 utils（2026-10-12）
+
+### 21.1 改了什么、为什么
+
+`FFRDP_LOWLEVEL` 原来有一个 `addr_parse(fl, text, &addr)` 槽位，把对端的文本形式变成 `send()` 能用的
+addr。撤掉它的理由是它**不是后端差异**：`uint64_t = ipv4（高 32 位，主机序）+ port（低 16 位）` 是两条
+层**共同的约定**——`lowlevel-udp.c` 里那句"只有本文件需要知道布局"是当时的**事实**，不是理由：任何后端
+都得按同一套编码，把它做成 vtable 的一个槽位，只是把一份共同代码藏进了其中一个后端里。
+
+现在约定只有一份，在 `utils.h / utils.c`：
+
+- `ffrdp_addr_make(ip, port)` / `ffrdp_addr_split(addr, &ip, &port)` —— 位布局的唯一出处；
+- `ffrdp_addr_parse_text(text, &ip, &port, default_port)` —— 解析 `"ip[:port]"`；`default_port < 0` 表示
+  **端口必须显式给**；地址要求严格的四段点分十进制（**手写**，不引 socket 头 ⇒ 协议层仍然不碰 socket）；
+- `FFRDP_ADDR_DEFAULT_PORT 8000`（与 `readme.md` / `test.c` 的默认一致）。
+
+顺手**并掉了两份重复代码**：`lowlevel-udp.c` 里 `"bind:ip:port"` 的字符串解析（原来自己写了一遍
+`strrchr`/`atoi`/`inet_addr`）改为调用同一个函数。`pack`/`unpack` 保留 —— `sockaddr_in ↔ (ip, port)` 的
+胶水只有传输层需要 —— 但布局改由 `ffrdp_addr_make/split` 给出。
+
+**策略留在调用方**，不塞进约定："对端必须给真端口（0 不算）"在 `ffrdp.c` 的客户端分支；`bind:` 允许 0
+（含义是"由内核选端口"）。
+
+### 21.2 判据
+
+| 判据 | 结果 |
+|---|---|
+| `tools/test-lowlevel-udp.sh` | **十节、250 项断言全过** ✓（改前 241 ✓ —— 第 10 节从"测 vtable 的 addr_parse"改成"直接测共享约定"，并补了"失败时不动输出"的检查）|
+| `-Wall -Wextra -Werror` | `ffrdp.c` / `lowlevel-udp.c` / `utils.c` / `test-lowlevel-udp.c` **零告警** ✓ |
+| 本机回环 8s ×2 | **25532 / 26067 msgs** ✓、两端 `verify: OK` ✓、四个错误计数全 0 ✓ |
+| 差分仿真 `tools/sim/run.sh`（base = HEAD）| **rc=0 跑通** ✓（两侧都能编、都能跑完；17 组 e2e 全部执行）|
+
+### 21.3 顺手把 harness 的"接口在飞"能力补齐
+
+这次动的是 `lowlevel.h` 的 vtable，而 `run.sh` 原来只给 `ffrdp.h` 做版本化 ⇒ base 侧（HEAD 的
+`ffrdp.c`）会拿工作区的 `lowlevel.h` 去编 ⇒ 两边对 `FFRDP_LOWLEVEL` 的形状看法不同，**连编都编不过** ✗
+（这正是之前"这一步跳过差分"的原因）。现在：
+
+- `lowlevel.h` 也版本化（`lowlevel_base.h` / `lowlevel_new.h`，逐侧 `sed` 重写 `#include`）；
+- 假 lowlevel **每侧编译一份**（`simll.o` / `simll_base.o`，后者带 `-DSIMLL_BASE`）—— 它在 base 侧还要
+  提供已被下掉的 `addr_parse` 槽位（base 的 `ffrdp_init` 仍会用 ✓）；
+- 链接 `utils.o`（工作区侧解析 `"ip:port"` 要用它）⇒ 链接行加 `-lpthread`。
+
+⇒ 从此"接口改动也能两侧同跑"是 harness 的常规能力 ✓，不必再靠"跳过差分" ✓。
+
+### 21.4 一处历史记载的更正
+
+`notes 19.x` 里"要给 `run.sh` 加 `REFH`"那条**不必做** ✓：`REF=` 早就有，而且 base 头文件是按 **HEAD**
+取的（`ffrdp.h`、`lowlevel.h` 都是）⇒ 只要 base 侧能与 HEAD 的头文件编在一起就够用 ✓。本文件里描述
+`addr_parse` 为 vtable 成员的那几处（3.2 / 10.2）保留原样作为历史，并加了指向本节的指针 ✓。

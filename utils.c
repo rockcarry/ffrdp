@@ -21,6 +21,73 @@ uint32_t ffrdp_get_timestamp32_ms(void)
     return (ms += !ms);
 }
 
+uint64_t ffrdp_addr_make(uint32_t ip, uint16_t port)
+{
+    return ((uint64_t)ip << 16) | (uint64_t)port;
+}
+
+void ffrdp_addr_split(uint64_t addr, uint32_t *ip, uint16_t *port)
+{
+    if (ip)   *ip   = (uint32_t)(addr >> 16);
+    if (port) *port = (uint16_t)(addr & 0xFFFF);
+}
+
+// 严格的四段点分十进制。手写而不走 inet_addr：协议层不该为了这一步去引 socket 头。
+static int ffrdp_addr_ipv4_parse(const char *text, int len, uint32_t *ip)
+{
+    uint32_t v = 0;
+    int      i, part = 0, val = 0, digits = 0;
+
+    for (i = 0; i < len; i++) {
+        char c = text[i];
+        if (c >= '0' && c <= '9') {
+            if (++digits > 3) return -1;
+            val = val * 10 + (c - '0');
+            if (val > 255) return -1;
+        } else if (c == '.') {
+            if (digits == 0 || part >= 3) return -1;
+            v = (v << 8) | (uint32_t)val;
+            part++; val = 0; digits = 0;
+        } else {
+            return -1;
+        }
+    }
+    if (digits == 0 || part != 3) return -1;
+    *ip = (v << 8) | (uint32_t)val;
+    return 0;
+}
+
+int ffrdp_addr_parse_text(const char *text, uint32_t *ip, int *port, int default_port)
+{
+    const char *colon;
+    uint32_t    vip = 0;
+    int         i, len, p = 0, vport = 0;
+
+    if (!text || !ip || !port) return -1;
+    len = (int)strlen(text);
+    if (len <= 0 || len >= 64) return -1;
+
+    colon = strrchr(text, ':');
+    if (colon) {
+        if ((int)(colon - text) <= 0) return -1;                       // ":port"：没有地址
+        if (ffrdp_addr_ipv4_parse(text, (int)(colon - text), &vip) != 0) return -1;
+        for (i = 1; colon[i]; i++) {
+            if (colon[i] < '0' || colon[i] > '9') return -1;
+            p++;
+        }
+        if (p == 0 || p > 5) return -1;                                // 空端口 / 超过 5 位
+        vport = atoi(colon + 1);
+    } else {
+        if (default_port < 0) return -1;                               // 端口必须显式给
+        if (ffrdp_addr_ipv4_parse(text, len, &vip) != 0) return -1;
+        vport = default_port;
+    }
+    if (vport < 0 || vport > 65535) return -1;
+    *ip   = vip;          // 只有全部通过才动输出：调用方不会把旧值误当新值
+    *port = vport;
+    return 0;
+}
+
 int ffrdp_module_thread_get_state(MOD_THREAD *mt)
 {
     if (!mt->hthread) return 0;

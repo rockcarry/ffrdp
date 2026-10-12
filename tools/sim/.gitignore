@@ -3,6 +3,8 @@ ffrdp_base.c
 ffrdp_new.c
 ffrdp_base.h
 ffrdp_new.h
+lowlevel_base.h
+lowlevel_new.h
 t_rto_base.c
 t_rto_new.c
 t_ack_base.c
@@ -11,6 +13,8 @@ e2e_base.c
 e2e_new.c
 simnet.o
 simll.o
+simll_base.o
+utils.o
 t_rto_base
 t_rto_new
 t_ack_base

@@ -13,7 +13,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include "simdefs.h"
+#ifdef SIMLL_BASE
+#include "lowlevel_base.h"   // HEAD 的 vtable 还有 addr_parse 这个槽位
+#else
 #include "../../lowlevel.h"
+#endif
 
 // In the sim an addr is opaque: sim_send() ignores it. It must still be non zero, because a server
 // stores the addr of the first frame it receives as its peer (ffrdp_lowlevel_cb), and 0 is "no peer".
@@ -63,13 +67,18 @@ static void simll_exit(void *fl)
     if (s) s->used = 0;
 }
 
+#ifdef SIMLL_BASE
+// HEAD 的 ffrdp_init 会把 "ip:port" 交给传输层解析（工作区已经没有这个槽位：约定搬去了 utils.h）。
+// 仿真里 addr 是不透明的 —— sim_send() 根本不看它 —— 只要非 0 就够；服务端会把收到的第一帧的 addr
+// 当作对端。
 static int simll_addr_parse(void *fl, const char *text, uint64_t *addr)
 {
     (void)fl; (void)text;
     if (!addr) return -1;
-    *addr = SIMLL_ADDR; // opaque in the sim; send() ignores it
+    *addr = SIMLL_ADDR;
     return 0;
 }
+#endif
 
 void *sim_ll_init(void *params, FFRDP_LOWLEVEL_CB cb, void *cbctx)
 {
@@ -85,7 +94,9 @@ void *sim_ll_init(void *params, FFRDP_LOWLEVEL_CB cb, void *cbctx)
             s->ll.send      = simll_send;
             s->ll.timer     = simll_timer;
             s->ll.exit      = simll_exit;
-            s->ll.addr_parse= simll_addr_parse;
+#ifdef SIMLL_BASE
+            s->ll.addr_parse = simll_addr_parse;   // HEAD 的 ffrdp_init 靠这个槽位解析对端
+#endif
             return &s->ll;
         }
     }

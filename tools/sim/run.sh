@@ -28,6 +28,16 @@ cp ../../ffrdp.h ffrdp_new.h
 sed -i 's|#include "ffrdp.h"|#include "ffrdp_base.h"|' ffrdp_base.c
 sed -i 's|#include "ffrdp.h"|#include "ffrdp_new.h"|'  ffrdp_new.c
 
+# The transport header is versioned for the same reason. This change drops a slot from the lowlevel
+# vtable (addr_parse -- the text->addr convention moved to utils.h, where both layers can see it), so
+# HEAD's implementation and the working tree's no longer agree on the shape of FFRDP_LOWLEVEL. Each
+# side gets its own copy; the fake lowlevel is compiled once per side below, so what it fills in
+# always matches the header that side calls through.
+git -C ../.. show HEAD:lowlevel.h > lowlevel_base.h
+cp ../../lowlevel.h lowlevel_new.h
+sed -i 's|#include "lowlevel.h"|#include "lowlevel_base.h"|' ffrdp_base.c
+sed -i 's|#include "lowlevel.h"|#include "lowlevel_new.h"|'  ffrdp_new.c
+
 # ASAN=1 turns on the address sanitizer. A read one byte past a buffer usually does not crash, so
 # without this the fuzz test can only see the fragments that kill the process outright.
 #
@@ -75,7 +85,14 @@ gcc -O1 -w -c simnet.c -o simnet.o
 # The working tree no longer owns a socket: ffrdp_init asks lowlevel for a transport, so the fake
 # socket macros above only matter to the HEAD side. The new side is given a fake lowlevel instead --
 # simll.c -- and the function-like macro is what redirects the one call ffrdp_init makes for it.
-gcc -O1 -w -c simll.c  -o simll.o
+gcc -O1 -w -c simll.c -o simll.o
+# HEAD's side still has the addr_parse slot in its vtable, so the fake that serves it has to fill it
+# in; -DSIMLL_BASE is what tells simll.c which of the two headers it is being compiled against.
+gcc -O1 -w -c -DSIMLL_BASE simll.c -o simll_base.o
+# The addr convention (ffrdp_addr_make / _split / _parse_text) now lives in utils.c and the working
+# side resolves "ip:port" through it, so it has to be linked in.
+# utils.c lives one level up (run.sh works from tools/sim).
+gcc -O1 -w -c ../../utils.c -o utils.o
 TESTS="${TESTS:-t_rto t_ack t_fuzz e2e}"
 for t in $TESTS; do
     for v in base new; do
@@ -96,9 +113,13 @@ for t in $TESTS; do
         LL=""
         if grep -q ffrdp_udp_lowlevel_init ffrdp_$v.c; then
             EXTRA="$EXTRA -DFFRDP_LL_DRIVEN"
-            LL="simll.o"
+            # One fake per side: each is compiled against its own lowlevel.h, so the struct handed
+            # back has exactly the slots that side's calls expect.
+            if [ "$v" = base ]; then LL="simll_base.o utils.o"; else LL="simll.o utils.o"; fi
         fi
-        eval gcc $CFLAGS $ASANFLAGS $EXTRA ${t}_$v.c simnet.o $LL -o ${t}_$v
+        # -lpthread: utils.o carries the address convention and also the module-thread helpers, both of
+        # which live in the same file and the latter needs pthread at link time.
+        eval gcc $CFLAGS $ASANFLAGS $EXTRA ${t}_$v.c simnet.o $LL -lpthread -o ${t}_$v
     done
 done
 

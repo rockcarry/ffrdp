@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "ffrdp.h"
+#include "utils.h"
 #include "lowlevel.h"
 #include <pthread.h>
 
@@ -548,11 +549,15 @@ void* ffrdp_init(char *ip, int port, char *txkey, char *rxkey, int server, int s
         }
         if (!server) {
             // 客户端要先能说话：对端地址的书写形式属于后端，只有它能解析（addr 的布局对协议是黑盒）
-            snprintf(peer, sizeof(peer), "%s:%d", ip ? ip : "127.0.0.1", port);
-            if (ffrdp->lowlevel->addr_parse(ffrdp->lowlevel, peer, &ffrdp->peer_addr) != 0) {
+        uint32_t peer_ip;
+        int      peer_port;
+        snprintf(peer, sizeof(peer), "%s:%d", ip ? ip : "127.0.0.1", port);
+        // 解析走共享约定（utils）；"对端必须给真端口（0 不算）"是协议这边的策略。
+        if (ffrdp_addr_parse_text(peer, &peer_ip, &peer_port, FFRDP_ADDR_DEFAULT_PORT) != 0 || peer_port <= 0) {
                 printf("failed to parse peer address \"%s\" !\n", peer);
                 goto failed;
             }
+        ffrdp->peer_addr = ffrdp_addr_make(peer_ip, (uint16_t)peer_port);
         }
     }
 

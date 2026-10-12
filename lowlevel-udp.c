@@ -34,7 +34,6 @@ typedef struct {
     int  (*send)(void *fl, uint64_t addr, uint8_t *buf, int len);
     int  (*timer)(void *fl, uint32_t deadline_ms);
     void (*exit)(void *fl);
-    int  (*addr_parse)(void *fl, const char *text, uint64_t *addr);
 
     #define FLAG_BIND_ADDR (1 << 0)
     uint32_t           flags;
@@ -52,22 +51,23 @@ typedef struct {
     uint32_t        deadline;  // absolute ms on the ffrdp_get_timestamp32_ms() clock, 0 = nothing due
 } UDP_LOWLEVEL;
 
-// The addr that crosses the API is one uint64: the IPv4 address in the high 32 bits, the port in the low
-// 16, both in host order. The address is kept in host order on purpose -- 127.0.0.1 comes out as
-// 0x7F000001, which is what a log line prints, instead of the byte swapped number a raw s_addr would give
-// on a little endian machine. Only this file needs to know the layout: a caller takes the addr out of the
-// receive message and hands it back to send unchanged.
+// 跨 API 的 addr 是 uint64：布局是两条层共同的约定（见 utils.h 的 ffrdp_addr_make），不是本文件的私事。
+// 这里只剩 "sockaddr_in ↔ (ip, port)" 这层胶水（字节序转换）。
 static uint64_t ffrdp_udp_addr_pack(const struct sockaddr_in *sin)
 {
-    return ((uint64_t)ntohl(sin->sin_addr.s_addr) << 16) | (uint64_t)ntohs(sin->sin_port);
+    return ffrdp_addr_make(ntohl(sin->sin_addr.s_addr), ntohs(sin->sin_port));
 }
 
 static void ffrdp_udp_addr_unpack(uint64_t addr, struct sockaddr_in *sin)
 {
+    uint32_t ip;
+    uint16_t port;
+
+    ffrdp_addr_split(addr, &ip, &port);
     memset(sin, 0, sizeof(*sin));
     sin->sin_family      = AF_INET;
-    sin->sin_addr.s_addr = htonl((uint32_t)(addr >> 16));
-    sin->sin_port        = htons((uint16_t)(addr & 0xFFFF));
+    sin->sin_addr.s_addr = htonl(ip);
+    sin->sin_port        = htons(port);
 }
 
 static void ffrdp_udp_set_nonblock(int fd)
@@ -135,31 +135,6 @@ static int ffrdp_udp_lowlevel_timer(void *fl, uint32_t deadline_ms)
 
 // "1.2.3.4:5678" -> addr, going through the same encoder the receive path uses, so that a peer named up
 // front is addressed exactly like one that has spoken. A peer needs a real port, so 0 is refused here.
-static int ffrdp_udp_lowlevel_addr_parse(void *fl, const char *text, uint64_t *addr)
-{
-    struct sockaddr_in sin;
-    const char        *colon;
-    char               ip[64];
-    size_t             iplen;
-    int                port;
-
-    if (!fl || !text || !addr) return -1;
-    colon = strrchr(text, ':');
-    iplen = colon ? (size_t)(colon - text) : 0;
-    if (!colon || iplen == 0 || iplen >= sizeof(ip)) return -1;
-    memcpy(ip, text, iplen);
-    ip[iplen] = '\0';
-    port = atoi(colon + 1);
-    if (port <= 0 || port > 65535) return -1;
-
-    memset(&sin, 0, sizeof(sin));
-    sin.sin_family      = AF_INET;
-    sin.sin_addr.s_addr = inet_addr(ip);
-    if (sin.sin_addr.s_addr == INADDR_NONE) return -1;
-    sin.sin_port        = htons((uint16_t)port);
-    *addr = ffrdp_udp_addr_pack(&sin);
-    return 0;
-}
 
 static void* ffrdp_udp_lowlevel_proc(void *arg)
 {
@@ -305,10 +280,9 @@ static void ffrdp_udp_lowlevel_exit(void *fl)
 // bind requested" with a line of output, which keeps a send-only endpoint usable.
 static int ffrdp_udp_lowlevel_parse(UDP_LOWLEVEL *udp, const char *params)
 {
-    const char *rest, *colon;
-    char        ip[64];
+    const char *rest;
+    uint32_t    ip;
     int         port;
-    size_t      iplen;
 
     // "none": 明确表示"这个端点不绑定"（客户端就是这样：源端口由内核在第一次发包时定）。它是一条正常
     // 的配置，不是笔误，所以不打印、也没有 flags 位 —— 没有 FLAG_BIND_ADDR，接收线程就不去 bind。
@@ -317,28 +291,16 @@ static int ffrdp_udp_lowlevel_parse(UDP_LOWLEVEL *udp, const char *params)
         printf("<3> ffrdp-udp params \"%s\" is not \"bind:ip:port\" or \"none\", no bind address is set\n", params);
         return 0;
     }
-    rest  = params + 5;
-    colon = strrchr(rest, ':');   // the last colon: an IPv4 literal has none, so this splits ip and port
-    iplen = colon ? (size_t)(colon - rest) : 0;
-    if (!colon || iplen == 0 || iplen >= sizeof(ip)) {
-        printf("<2> ffrdp-udp params \"%s\" has no ip:port after \"bind:\"\n", params);
-        return -1;
-    }
-    memcpy(ip, rest, iplen);
-    ip[iplen] = '\0';
-    port = atoi(colon + 1);
-    if (port < 0 || port > 65535) {
-        printf("<2> ffrdp-udp params \"%s\" has a port outside 0..65535\n", params);
+    rest = params + 5;
+    // 解析走共享约定（协议层解析对端用的是同一个函数）；default_port < 0 ⇒ 端口必须显式给。
+    if (ffrdp_addr_parse_text(rest, &ip, &port, -1) != 0) {
+        printf("<2> ffrdp-udp params \"%s\" needs an ip:port after \"bind:\" (dotted quad, port 0..65535)\n", params);
         return -1;
     }
     memset(&udp->addr, 0, sizeof(udp->addr));
-    udp->addr.sin_family = AF_INET;
-    udp->addr.sin_port   = htons((uint16_t)port);
-    udp->addr.sin_addr.s_addr = inet_addr(ip);
-    if (udp->addr.sin_addr.s_addr == INADDR_NONE) {
-        printf("<2> ffrdp-udp params \"%s\" has an address that is not a dotted quad\n", params);
-        return -1;
-    }
+    udp->addr.sin_family      = AF_INET;
+    udp->addr.sin_port        = htons((uint16_t)port);
+    udp->addr.sin_addr.s_addr = htonl(ip);
     udp->flags |= FLAG_BIND_ADDR;
     return 0;
 }
@@ -353,7 +315,6 @@ FFRDP_LOWLEVEL* ffrdp_udp_lowlevel_init(void *params, FFRDP_LOWLEVEL_CB callback
     udp->send         = ffrdp_udp_lowlevel_send;
     udp->timer        = ffrdp_udp_lowlevel_timer;
     udp->exit         = ffrdp_udp_lowlevel_exit;
-    udp->addr_parse   = ffrdp_udp_lowlevel_addr_parse;
     udp->sockfd       = -1;   // 0 is a valid descriptor, so "no socket yet" cannot be spelled with a zero
     udp->notify[0]    = -1;
     udp->notify[1]    = -1;

@@ -203,7 +203,7 @@ rtts = (1 - 1/8) * rtts + (1/8) * rttm;       rttd = (1 - 1/4) * rttd + (1/4) * 
 
 | 常量 | 值 | 含义 |
 |---|---|---|
-| `FFRDP_MAX_MSS` | `1500 - 8` = 1492 | 4 字节帧头 + 2 字节 FEC seq（需 4 字节对齐）|
+| `FFRDP_MAX_MSS` | `(FFRDP_LOWLEVEL_FRAME_MAX - 6) & ~3` = 1492 | 由 `lowlevel.h` 的单帧上限派生：减掉 4 字节帧头 + 2 字节 FEC seq（`FFRDP_FRAME_OVERHEAD`），再向下对齐到 4 字节 |
 | `FFRDP_MIN_RTO` | 20 ms | RTO 下限（v1.1.0 改为 16）|
 | `FFRDP_MAX_RTO` | 2000 ms | RTO 上限 |
 | `FFRDP_MAX_WAITSND` | 256 帧 | 应用侧发送队列上限 |

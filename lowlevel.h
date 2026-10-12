@@ -59,7 +59,8 @@ typedef struct {
     // can simply be echoed back, but a peer that has not spoken yet has to be named some other way, and
     // the layout of the value is private to the backend -- only send() and this call ever look inside it.
     // Returns 0 on success, -1 if the text is not a peer the backend can address.
-    int  (*addr_parse)(void *fl, const char *text, uint64_t *addr);
+    // 这里没有"文本 → addr"的槽位：那个转换没有后端差异（addr 的布局是两条层共同的约定，见
+    // utils.h 的 ffrdp_addr_make / ffrdp_addr_parse_text），所以它不属于传输层的接口。
 } FFRDP_LOWLEVEL;
 
 // params:
