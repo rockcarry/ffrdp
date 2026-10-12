@@ -585,9 +585,14 @@ void ffrdp_free(void *ctxt)
     ffrdp->closing = 1;
     pthread_cond_broadcast(&ffrdp->cond);
     ll = ffrdp->lowlevel;
-    ffrdp->lowlevel = NULL;
     pthread_mutex_unlock(&ffrdp->lock);
-    if (ll) ll->exit(ll);                    // 停线程 + join；socket 是它自己关的（见 lowlevel.h）
+    // 先停线程 + join（socket 是它自己关的，见 lowlevel.h）。**必须在摘掉把手之前**：工作线程此刻可能正在
+    // 回调里跑一整段（ffrdp_tick 会经 ffrdp_send_data_frame 用 ffrdp->lowlevel）—— 先前这里先把 lowlevel
+    // 置 NULL 再 exit，那把正在跑的 tick 就会在 ffrdp.c:439 对 NULL 取成员，实测 0.17% 的收尾段错误就是这么来的。
+    if (ll) ll->exit(ll);
+    pthread_mutex_lock(&ffrdp->lock);
+    ffrdp->lowlevel = NULL;                  // 线程已停、handle 也已被它自己释放 ⇒ 现在摘掉才安全
+    pthread_mutex_unlock(&ffrdp->lock);
     if (ffrdp->app_tx_buff) free(ffrdp->app_tx_buff);
     if (ffrdp->cur_new_node) free(ffrdp->cur_new_node);
     list_free(&ffrdp->send_list_head, &ffrdp->send_list_tail);
