@@ -2055,6 +2055,10 @@ C2 唯一有意改变的时序是"应答粒度"（notes 16 预告、17.5 量化�
 下一步该做的：`ulimit -c unlimited` 抓 core、或装上 libtsan 后用 ThreadSanitizer 反复跑（本机镜像缺
 `libtsan_preinit.o`，装不了）。**在那之前，C2 及其之后的状态都不能算"已验完"。**
 
+> **2026-10-12 结案** ✓：已定位并修复 —— 根因见 §20（`ffrdp_free` 把把手摘早了）。本节当时那句"未定位"是当时的
+> 事实 ✓；当时记的"下一步"里，core 那条走不通的原因（本机没有 `wsl-capture-crash` 助手 + `ulimit -c 0`）与
+> TSAN 那条的解法（缺的是 **gcc-9** 目录下的 `libtsan_preinit.o`，用 gcc-10 即可）都补在 §20.5。
+
 ## 19. C2 之后：这个仿真能不能回答"搬家有没有改坏"（2026-10-12）
 
 ### 19.1 接缝：跨架构不可比，同一架构内可比 ✓
@@ -2165,13 +2169,82 @@ C2 唯一有意改变的时序是"应答粒度"（notes 16 预告、17.5 量化�
    功能与内存、期限未 arm、"唤醒过多"（那只是症状）。**第一步是统一口径** ✗：19.3 的 2.2× 与 18.1 的
    39.4~41.8 MB/s 不是同一套脚本 ⇒ 先定一条权威命令，再谈"收回多少"。若继续查，现象层目标是
    "每条消息的协议回合成本"（19.3 末）。
-3. **崩溃：仍未定位** ✗（18.2 起）。三条事实与新观察：
-   - 会崩的组合是"**回调内回 ack + 低层一圈收批**"，它**从未作为提交存在过** ✓ —— `0daa8b8`…`39b1cff`
-     八个提交各含前半（低层仍是一圈一帧），`99525ff` 含后半（ack 已挪到 TIMER）⇒ 只有"编译期拼接"出来
-     的二进制会崩；
-   - 复现器（那套拼接的 `/tmp/bin_c2b`，平跑 120 轮）：**120 轮崩 1 次**（第 62 轮，server 段）；
-   - **2026-10-12 新观察** ✓：两侧都放到 gdb 下、并按 gdb 自己的 `Program received signal` 判定之后，
-     **两侧都会崩**（首次运行的第 1 轮就各撞一次，其中一次是 **client 侧** ✗）⇒ 它比原先以为的好撞 ✓，
-     抓栈可行 ✓；同时说明"拿日志文本 grep `Segmentation fault`"是**误报源** ✗（bash 的作业控制消息会混进日志）。
-   - 拿 core 的现状 ✗：`core_pattern` 指向 `wsl-capture-crash`，而本机**没有这个助手** ✗ 且 `ulimit -c 0`
-     ⇒ core 落不了盘；可行路径是 gdb（两侧各一个 ✓）或 `LD_PRELOAD=libSegFault.so`（几乎不拖慢 ✓）。
+3. ~~**崩溃：仍未定位** ✗（18.2 起）~~ ⇒ **2026-10-12 已定位并修复** ✓ —— 根因、修复、判据与留下的两处
+   形式竞争见 **§20**。相关的历史事实（会崩的那套组合从未作为提交存在过、复现率 ~1/120~0.17%）保留在
+   §20.2，并附带三条**测量陷阱**的教训 ✓。
+
+## 20. 那个偶发崩溃：定位与修复（2026-10-12）
+
+### 20.1 根因 ✓
+
+`ffrdp_free`（`ffrdp.c`）原来的顺序是"**先摘把手、后停线程**"：
+
+```c
+ll = ffrdp->lowlevel;
+ffrdp->lowlevel = NULL;      // ✗ 先把把手摘掉
+pthread_mutex_unlock(&ffrdp->lock);
+if (ll) ll->exit(ll);        // ✗ 之后才停线程 + join
+```
+
+工作线程此刻**可能已经在回调里跑一整段**（它只在回调*入口*查 `closing`，`ffrdp.c:1114`，而那是锁外的普通 int
+读），而 `ffrdp_tick` 会经 `ffrdp_send_data_frame`（`ffrdp.c:439`）用 `ffrdp->lowlevel` ⇒ **对 NULL 取成员** ✗。
+
+TSAN 在**真实流量**下把两条都拍了下来（修复前）：
+
+```
+data race  ffrdp.c:585 in ffrdp_free        ← closing：ffrdp_free 写 / 回调入口 1114 读（锁外）
+SEGV       ffrdp.c:439 in ffrdp_send_data_frame（读 0 地址），栈在工作线程上：
+           ffrdp_udp_lowlevel_proc → ffrdp_udp_tick → ffrdp_lowlevel_cb → ffrdp_tick → ffrdp_send_data_frame
+```
+
+⇒ 窗口很窄（必须正好有在途回调在跑），这就是它为什么是 ~0.17% 的偶发 ✓，也解释了"整轮干净、退出时崩" ✓。
+（顺带：`ffrdp_init` 的 `failed:` 路径（`ffrdp.c:568`）顺序是对的 —— 只有 `ffrdp_free` 写反了 ✓。）
+
+**修复**（一笔提交）：把手留在原处，等 `ll->exit()`（内部 join）返回之后再在锁内摘掉；`closing` 改成 `_Atomic`，
+`ffrdp.c` 自己带上 `<stdatomic.h>`。
+
+### 20.2 测量陷阱（这次踩到的三条，写下来避免重犯）✗
+
+1. **端口 > 65535** ✗：抓栈脚本里端口用 `69xxx` 递增 ⇒ 客户端 `failed to parse peer address` ⇒ **一条消息都没传**，
+   "TSAN 0 条报告"是空跑出来的假象。凡是"干净"的结论，先确认日志里有 `connect to server ok` 与**非零消息数** ✓。
+2. **gdb 会把它藏起来** ✗：两侧都放 gdb，80 轮全干净；同一二进制平跑却很容易撞 ⇒ **对时序敏感的崩溃要在平跑下抓**
+   （用 `LD_PRELOAD` 的近零开销 SIGSEGV 处理器 ✓）。
+3. **`/tmp` 不可靠** ✗：这个环境里 `/tmp` 会在两次调用之间丢文件（脚本、二进制都丢过）⇒ 抓栈的东西全部搬进
+   `~/hunt/`（源码、二进制、日志、脚本）✓。
+
+另外两条当时的事实：会崩的组合（回调内回 ack + 低层一圈收批）**从未作为提交存在过** ✓（八个提交各含一半）；
+平跑复现率：原复现器 120 轮 1 次、后续多组合计约 ~0.17% ✓。
+
+### 20.3 判据 ✓
+
+| 判据 | 修复前 | 修复后 |
+|---|---|---|
+| TSAN + 真实流量：`ffrdp.c:585`（竞争）| 有 ✗ | **0** ✓ |
+| TSAN + 真实流量：`ffrdp.c:439`（SEGV）| 有 ✗ | **0** ✓ |
+| 低层一致性测试 | 241 / 0 ✓ | **241 / 0** ✓ |
+| 编译（`-Wall -Wextra -Werror`）| 零告警 ✓ | 零告警 ✓ |
+| 本机回环 8 秒 ×2 | verify OK ✓ | 29007 / 28468 msgs、两端 verify OK ✓ |
+
+### 20.4 留下的两处形式竞争（按决定暂不修）✓
+
+TSAN 现在仍会报，但都已判定为**形式竞争**（顺序本身是对的，只是缺 C11 意义上的同步）：
+
+| 位置 | 是什么 | 影响 |
+|---|---|---|
+| `lowlevel-udp.c:172/290`（`MOD_THREAD.flags`，`utils.h` 里的裸 `uint32_t`）| 工作线程轮询 `check_exit`，owner 线程置 STOP | x86 上实践可用；风险是 `-O2`/LTO 把那次读提到循环外 ⇒ 线程永不退出 ✗ |
+| `test.c:207/387`（`g_exit`，`static volatile int`）| main 写、`peer_thread` 读 | 只在测试程序里 ✓ |
+
+若要修 ✓：把 `flags`/`g_exit` 改成 `_Atomic` 并把 `check_exit`/`check_pause` 两个宏改成显式原子操作
+（`atomic_load_explicit` / `atomic_fetch_or_explicit`）—— 试过，241 项与零告警都保持 ✓，只是当时判定"与崩溃无关、
+不必附带"，故回退 ✓。
+
+### 20.5 复现器与工具（`~/hunt/`）✓
+
+- `src/`：那套"会崩的拼接"（`39b1cff` 的 `ffrdp.c/ffrdp.h/test.c` + 当前 `lowlevel/socket/utils`）；
+- 二进制：`bin_c2g`（`-O2 -g -rdynamic` ✓）、`bin_c2dbg`（`-O0` ✓）、`bin_c2asan`（ASAN ✓）；
+- `segv.so`：`LD_PRELOAD` 的 SIGSEGV 处理器，打印带符号的栈（几乎不拖慢 ✓）；
+- `scripts/`：抓栈循环（日志写 `logs/` ✓）；**端口必须 < 65535** ✓（见 20.2）。
+- TSAN：本机 `libtsan0` 是 **gcc-10** 版，而默认 `gcc` 是 9 ⇒ 缺 `gcc-9` 目录下的 `libtsan_preinit.o` ⇒
+  **用 `gcc-10 -fsanitize=thread` 即可** ✓（`-L` 补空对象的绕法**无效** ✗：那个对象只从 gcc 自己的目录找）；
+  TSAN 二进制配 `setarch $(uname -m) -R` 跑 ✓（规避 ASAN/TSAN 在高熵 ASLR 下的启动抖动 ✓）。
+- core 走不通的原因：`core_pattern` 指向 `|/wsl-capture-crash ...`，而本机**没有这个助手** ✗ 且 `ulimit -c 0` ✓。
