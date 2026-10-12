@@ -29,7 +29,13 @@ static uint32_t get_tick_count()
 }
 #endif
 
-#define FFRDP_MAX_MSS       (1500 - 8) // should align to 4 bytes and <= 1500 - 8
+// 帧的固定开销：4 字节头（类型/长度）+ FEC 帧再加 2 字节 fec seq。见 frame_node_new / frame_payload_size。
+#define FFRDP_FRAME_HEAD      4
+#define FFRDP_FRAME_FEC_TAIL  2
+#define FFRDP_FRAME_OVERHEAD  (FFRDP_FRAME_HEAD + FFRDP_FRAME_FEC_TAIL)
+// 单帧载荷上限：由传输层的一帧上限派生（**不再写死 1500**）——减掉最大帧开销，再向下对齐到 4 字节。
+// 1500 - 6 = 1494 ⇒ &~3 = 1492，与旧值 (1500 - 8) 相同 ⇒ 这次只是把来源写清、行为不变。
+#define FFRDP_MAX_MSS       ((FFRDP_LOWLEVEL_FRAME_MAX - FFRDP_FRAME_OVERHEAD) & ~3)
 #define FFRDP_MIN_RTO        16
 #define FFRDP_MAX_RTO        2000
 #define FFRDP_MAX_WAITSND    256
