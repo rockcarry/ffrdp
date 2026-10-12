@@ -32,6 +32,19 @@
 #define TEST_RUN(c, idx) ffrdp_update(c)
 #endif
 
+// ffrdp_init 的参数形状变过一次：ip + port 收敛成单个 "ip:port"。两侧都要能编，所以测试走这个入口
+// （调用点只关心 ip / port / 角色 / smss）。
+#ifdef FFRDP_API_HAS_ADDR
+static void *TEST_INIT(const char *ip, int port, int server, int mss)
+{
+    char addr[64];
+    snprintf(addr, sizeof(addr), "%s:%d", ip, port);
+    return ffrdp_init(addr, NULL, NULL, server, mss, 0);
+}
+#else
+#define TEST_INIT(ip, port, server, mss) ffrdp_init((char *)(ip), port, NULL, NULL, server, mss, 0)
+#endif
+
 static void make_ack(unsigned char *ack, unsigned int una, unsigned int mack, unsigned char rwnd)
 {
     memset(ack, 0, 8);
@@ -47,7 +60,7 @@ int main(void)
 
     sim_reset();
     sim_config(0, 0, 0, 0);
-    c = ffrdp_init("127.0.0.1", 8001, NULL, NULL, 0, 1024, 0);
+    c = TEST_INIT("127.0.0.1", 8001, 0, 1024);
     sim_begin(0);
     TEST_SEND(c, (char*)buf, n * 1024);    // n frames
     TEST_RUN(c, 0);                         // first send them all

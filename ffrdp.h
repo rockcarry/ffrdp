@@ -1,7 +1,12 @@
 #ifndef __FFRDP_H__
 #define __FFRDP_H__
 
-void* ffrdp_init  (char *ip, int port, char *txkey, char *rxkey, int server, int smss, int sfec);
+// addr：一个地址字符串，取代原来的 (ip, port) 两个参数。
+//   服务端（server=1）：本端 bind 的地址 —— "1.2.3.4:9000" / "1.2.3.4"（端口取默认 8000）/ 也可以
+//                       自带 "bind:" 前缀（那是传输层的原样写法）；NULL ⇒ bind 0.0.0.0 的默认端口。
+//   客户端（server=0）：对端地址 —— 同一套写法；不带端口取默认 8000；端口必须非 0（0 会被拒绝）。
+// 解析走 utils.h 的共享约定（两条层同一份代码），addr 的布局对协议是黑盒。
+void* ffrdp_init  (char *addr, char *txkey, char *rxkey, int server, int smss, int sfec);
 void  ffrdp_free  (void *ctxt);
 
 // 发送是**原子**的：返回 len = 整条被接受；返回 -1 = 一个字节都没接受（队列满、参数错、对端还没连上）。

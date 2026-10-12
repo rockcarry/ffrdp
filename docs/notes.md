@@ -2298,3 +2298,44 @@ addr。撤掉它的理由是它**不是后端差异**：`uint64_t = ipv4（高 3
 `notes 19.x` 里"要给 `run.sh` 加 `REFH`"那条**不必做** ✓：`REF=` 早就有，而且 base 头文件是按 **HEAD**
 取的（`ffrdp.h`、`lowlevel.h` 都是）⇒ 只要 base 侧能与 HEAD 的头文件编在一起就够用 ✓。本文件里描述
 `addr_parse` 为 vtable 成员的那几处（3.2 / 10.2）保留原样作为历史，并加了指向本节的指针 ✓。
+## 22. ffrdp_init 的参数收敛：ip + port → 单个 addr（2026-10-12）
+
+### 22.1 改了什么、为什么
+
+低层已经用 params 字符串描述 bind（"bind:ip:port" / "none"），而地址解析已经是两条层共享的约定
+（§21 搬进 `utils.h`）⇒ 协议层没必要把 `(ip, port)` 收下来、再拼回一个字符串交给别人解析。一个
+`addr` 同时覆盖三种写法：`"1.2.3.4:9000"`、`"1.2.3.4"`（端口取默认 **8000**）、以及服务端直接给
+传输层的原样写法 `"bind:..."`。
+
+- 签名：`ffrdp_init(char *addr, char *txkey, char *rxkey, int server, int smss, int sfec)`；
+- 服务端：params = `"bind:<addr>"`（addr 已带 `bind:` 前缀则原样用；NULL ⇒ `bind:0.0.0.0` 的默认端口）；
+- 客户端：`addr` 就是**对端**地址，走 `ffrdp_addr_parse_text(..., FFRDP_ADDR_DEFAULT_PORT)`；
+  "对端必须给真端口（0 不算）"这条策略仍留在协议侧（它不属于共享约定）；
+- 顺带修掉 C2 在客户端分支留下的缩进；
+- 应用与测试：`test.c` 按 `peer->ip` + `*peer->port` 拼 `"ip:port"`；四个仿真测试加 `TEST_INIT`
+  （`run.sh` 用 `grep 'void\* ffrdp_init(char \*addr'` 探测形状 ⇒ `-DFFRDP_API_HAS_ADDR`）。
+
+### 22.2 判据
+
+| 判据 | 结果 |
+|---|---|
+| 四个单元 `-Wall -Wextra -Werror` | 零告警 ✓ |
+| `tools/test-lowlevel-udp.sh`（普通 + ASAN）| **250 passed / 0 failed** ×2 ✓ |
+| 本机回环 8s ×2 | 24249 / 24495 msgs ✓、两端 `verify: OK` ✓ |
+| 差分仿真（base = C2，work = 本笔）| rc=0 ✓，且两侧输出 **26 / 26 行逐字相同** ✓ ⇒ 参数收敛没有改行为 ✓ |
+
+最后一条是本笔最强的判据：两版之间**只差这一次签名收敛** ⇒ 输出逐字一致，就说明改的是形状、不是行为 ✓。
+
+### 22.3 顺手修掉 harness 里一个"一提交就自破"的假设
+
+C2 那笔给 `lowlevel.h` 做版本化时，把"base 侧一定有 `addr_parse` 槽位"写成了 `#ifdef SIMLL_BASE` —— 它
+在 C2 提交的那一刻就假了（HEAD 的 `lowlevel.h` 也没有那个槽位了），结果 `simll_base.o` 编不过。现在
+改成**按头文件探测**：`grep -q '(*addr_parse)' lowlevel_base.h` ⇒ `-DSIMLL_BASE_HAS_ADDR_PARSE` ✓。
+
+注意不能只用 `grep addr_parse`：新头文件的注释里有 `ffrdp_addr_parse_text` 字样，会误命中 ⇒ 探针必须
+匹配 vtable 成员本身的写法（`(*addr_parse)`）✓。
+
+### 22.4 readme 的同步
+
+readme 的对外 API 列表里那条 `ffrdp_update()` 其实是 C2 就删掉的，本次一并更新（连注释里"过渡态"的
+说法一起改成事实）✓。

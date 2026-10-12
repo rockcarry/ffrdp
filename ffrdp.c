@@ -503,7 +503,7 @@ static int ffrdp_recv_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame)
 }
 
 static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len);   // lowlevel 的工作线程从这里回到协议
-void* ffrdp_init(char *ip, int port, char *txkey, char *rxkey, int server, int smss, int sfec)
+void* ffrdp_init(char *addr, char *txkey, char *rxkey, int server, int smss, int sfec)
 {
     FFRDPCONTEXT *ffrdp = NULL;
 #ifdef WIN32
@@ -532,15 +532,17 @@ void* ffrdp_init(char *ip, int port, char *txkey, char *rxkey, int server, int s
     if (!(ffrdp->app_tx_buff = calloc(1, ffrdp->app_tx_cap))) goto failed;
 
     // 传输层：socket、bind、非阻塞、缓冲区大小、收包线程、定时，全在 lowlevel 里。协议只认
-    // send / timer / 回调。服务端把 bind 地址交给它；客户端交 "none"（不绑定，由内核在第一次发包时
-    // 择源端口，与旧版一致），再请后端把对端地址解析成它自己的形式。
+    // send / timer / 回调。服务端把 addr 交给它（bind:<addr>）；客户端交 "none"（不绑定，由内核在
+    // 第一次发包时择源端口，与旧版一致），再按同一套约定解析对端。
     pthread_mutex_init(&ffrdp->lock, NULL);
     pthread_cond_init(&ffrdp->cond, NULL);
     {
-        char params[64], peer[80];
+        char params[128], peer[128];
         if (server) {
             ffrdp->flags |= FLAG_SERVER;
-            snprintf(params, sizeof(params), "bind:%s:%d", ip ? ip : "0.0.0.0", port);
+            // 允许直接给传输层的原样写法（"bind:..."），其余情况由这里补前缀。
+            if (addr && strncmp(addr, "bind:", 5) == 0) snprintf(params, sizeof(params), "%s", addr);
+            else snprintf(params, sizeof(params), "bind:%s", (addr && *addr) ? addr : "0.0.0.0");
         } else snprintf(params, sizeof(params), "none");
         ffrdp->lowlevel = ffrdp_udp_lowlevel_init(params, ffrdp_lowlevel_cb, ffrdp);
         if (!ffrdp->lowlevel) {
@@ -548,16 +550,15 @@ void* ffrdp_init(char *ip, int port, char *txkey, char *rxkey, int server, int s
             goto failed;
         }
         if (!server) {
-            // 客户端要先能说话：对端地址的书写形式属于后端，只有它能解析（addr 的布局对协议是黑盒）
-        uint32_t peer_ip;
-        int      peer_port;
-        snprintf(peer, sizeof(peer), "%s:%d", ip ? ip : "127.0.0.1", port);
-        // 解析走共享约定（utils）；"对端必须给真端口（0 不算）"是协议这边的策略。
-        if (ffrdp_addr_parse_text(peer, &peer_ip, &peer_port, FFRDP_ADDR_DEFAULT_PORT) != 0 || peer_port <= 0) {
+            uint32_t peer_ip;
+            int      peer_port;
+            snprintf(peer, sizeof(peer), "%s", (addr && *addr) ? addr : "127.0.0.1");
+            // 解析走共享约定（utils）；"对端必须给真端口（0 不算）"是协议这边的策略。
+            if (ffrdp_addr_parse_text(peer, &peer_ip, &peer_port, FFRDP_ADDR_DEFAULT_PORT) != 0 || peer_port <= 0) {
                 printf("failed to parse peer address \"%s\" !\n", peer);
                 goto failed;
             }
-        ffrdp->peer_addr = ffrdp_addr_make(peer_ip, (uint16_t)peer_port);
+            ffrdp->peer_addr = ffrdp_addr_make(peer_ip, (uint16_t)peer_port);
         }
     }
 

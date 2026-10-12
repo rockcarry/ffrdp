@@ -40,6 +40,19 @@
 #define TEST_RUN(c, idx) ffrdp_update(c)
 #endif
 
+// ffrdp_init 的参数形状变过一次：ip + port 收敛成单个 "ip:port"。两侧都要能编，所以测试走这个入口
+// （调用点只关心 ip / port / 角色 / smss）。
+#ifdef FFRDP_API_HAS_ADDR
+static void *TEST_INIT(const char *ip, int port, int server, int mss)
+{
+    char addr[64];
+    snprintf(addr, sizeof(addr), "%s:%d", ip, port);
+    return ffrdp_init(addr, NULL, NULL, server, mss, 0);
+}
+#else
+#define TEST_INIT(ip, port, server, mss) ffrdp_init((char *)(ip), port, NULL, NULL, server, mss, 0)
+#endif
+
 // ---- how many cases each phase has ------------------------------------------------------------
 #define PHASE_SWEEP   6          // type x length x payload
 #define SWEEP_LENS    11         // 0..10
@@ -98,7 +111,7 @@ static void run_case(const unsigned char *buf, int len)
     FFRDPCONTEXT *c;
     sim_reset();
     sim_config(0, 0, 0, 0);           // no loss, no delay: the fragment itself is the whole test
-    c = ffrdp_init("127.0.0.1", 8001, NULL, NULL, 1, 1280, 0);   // server, the role that faces the port
+    c = TEST_INIT("127.0.0.1", 8001, 1, 1280);   // server, the role that faces the port
     if (!c) _exit(0);                 // could not even start: not this fragment's doing
     sim_begin(0);
     if (len > 0) sim_inject(0, (void*)buf, len);
@@ -137,7 +150,7 @@ static unsigned long flood_live(int count)
     int i, len;
     sim_reset();
     sim_config(0, 0, 0, 0);
-    c = ffrdp_init("127.0.0.1", 8001, NULL, NULL, 1, 1280, 0);
+    c = TEST_INIT("127.0.0.1", 8001, 1, 1280);
     if (!c) return 0;
     before = sim_alloc() - sim_freed();
     for (i = 1; i <= count; i++) {

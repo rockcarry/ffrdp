@@ -85,10 +85,15 @@ gcc -O1 -w -c simnet.c -o simnet.o
 # The working tree no longer owns a socket: ffrdp_init asks lowlevel for a transport, so the fake
 # socket macros above only matter to the HEAD side. The new side is given a fake lowlevel instead --
 # simll.c -- and the function-like macro is what redirects the one call ffrdp_init makes for it.
-gcc -O1 -w -c simll.c -o simll.o
-# HEAD's side still has the addr_parse slot in its vtable, so the fake that serves it has to fill it
-# in; -DSIMLL_BASE is what tells simll.c which of the two headers it is being compiled against.
-gcc -O1 -w -c -DSIMLL_BASE simll.c -o simll_base.o
+# The fake is compiled once per side, against that side's lowlevel.h (-DSIMLL_BASE picks which).
+# Whether it also has to fill in the old addr_parse slot is NOT a property of the side -- it is a
+# property of that side's header, and while an interface change is in flight HEAD can be on either
+# side of it. So probe the header. (The first version of this assumed "base always has the slot" and
+# stopped compiling the moment the change landed in HEAD itself.)
+HAVE_N=""; grep -q '(*addr_parse)' lowlevel_new.h  && HAVE_N="-DSIMLL_NEW_HAS_ADDR_PARSE"
+HAVE_B=""; grep -q '(*addr_parse)' lowlevel_base.h && HAVE_B="-DSIMLL_BASE_HAS_ADDR_PARSE"
+gcc -O1 -w $HAVE_N -c simll.c -o simll.o
+gcc -O1 -w $HAVE_B -DSIMLL_BASE -c simll.c -o simll_base.o
 # The addr convention (ffrdp_addr_make / _split / _parse_text) now lives in utils.c and the working
 # side resolves "ip:port" through it, so it has to be linked in.
 # utils.c lives one level up (run.sh works from tools/sim).
@@ -108,6 +113,8 @@ for t in $TESTS; do
         # sides, so tell them which shape they are looking at (the tests' TEST_SEND/TEST_RECV wrappers
         # mean "do not wait" on both, which is what HEAD does).
         grep -q 'int timeout_ms)' ffrdp_$v.c && EXTRA="$EXTRA -DFFRDP_API_HAS_TIMEOUT"
+        # ffrdp_init 的 (ip, port) 收敛成了单个 addr 字符串：两侧形状不同，测试用 TEST_INIT 适配。
+        grep -q 'void\* ffrdp_init(char \*addr' ffrdp_$v.c && EXTRA="$EXTRA -DFFRDP_API_HAS_ADDR"
         # A side that carries lowlevel (the working tree) is stepped by sim_ll_run() instead of
         # ffrdp_update(), and needs the fake lowlevel linked in; HEAD is still stepped by ffrdp_update().
         LL=""

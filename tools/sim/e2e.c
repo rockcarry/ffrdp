@@ -29,6 +29,19 @@
 #define TEST_RUN(c, idx) ffrdp_update(c)
 #endif
 
+// ffrdp_init 的参数形状变过一次：ip + port 收敛成单个 "ip:port"。两侧都要能编，所以测试走这个入口
+// （调用点只关心 ip / port / 角色 / smss）。
+#ifdef FFRDP_API_HAS_ADDR
+static void *TEST_INIT(const char *ip, int port, int server, int mss)
+{
+    char addr[64];
+    snprintf(addr, sizeof(addr), "%s:%d", ip, port);
+    return ffrdp_init(addr, NULL, NULL, server, mss, 0);
+}
+#else
+#define TEST_INIT(ip, port, server, mss) ffrdp_init((char *)(ip), port, NULL, NULL, server, mss, 0)
+#endif
+
 static unsigned hash(unsigned k, unsigned salt)
 {
     unsigned h = k * 2654435761u + salt * 40503u + 12345u;
@@ -61,8 +74,8 @@ int main(int argc, char *argv[])
     if (cap  > 0) sim_shaper (cap  * 1024.0 / 1000.0, qmax * 1024);  // KB/s -> bytes per ms
     if (pcap > 0) sim_policer(pcap * 1024.0 / 1000.0, pburst * 1024);
     if (spikep > 0) sim_spike(spikep, spikem);
-    c0 = ffrdp_init("127.0.0.1", 8001, NULL, NULL, 0, 1280, 0);
-    c1 = ffrdp_init("127.0.0.1", 8002, NULL, NULL, 1, 1280, 0);
+    c0 = TEST_INIT("127.0.0.1", 8001, 0, 1280);
+    c1 = TEST_INIT("127.0.0.1", 8002, 1, 1280);
     if (!c0 || !c1) { printf("init failed\n"); return -1; }
     memset(sbuf, 0x5a, sizeof(sbuf));
 

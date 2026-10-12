@@ -14,9 +14,16 @@
 #include <string.h>
 #include "simdefs.h"
 #ifdef SIMLL_BASE
-#include "lowlevel_base.h"   // HEAD 的 vtable 还有 addr_parse 这个槽位
+#include "lowlevel_base.h"
 #else
 #include "../../lowlevel.h"
+#endif
+
+// 接口改动还在飞的时候，某一侧的头文件里可能还留着 addr_parse 槽位（那个约定后来搬去了 utils.h）。
+// run.sh 按头文件探测，探测到才传对应的 -DSIMLL_*_HAS_ADDR_PARSE。这一处是唯一给
+// HAVE_ADDR_PARSE_SLOT 取值的地方，且在所有使用点之前。
+#if defined(SIMLL_BASE_HAS_ADDR_PARSE) || defined(SIMLL_NEW_HAS_ADDR_PARSE)
+#define HAVE_ADDR_PARSE_SLOT 1
 #endif
 
 // In the sim an addr is opaque: sim_send() ignores it. It must still be non zero, because a server
@@ -67,10 +74,9 @@ static void simll_exit(void *fl)
     if (s) s->used = 0;
 }
 
-#ifdef SIMLL_BASE
-// HEAD 的 ffrdp_init 会把 "ip:port" 交给传输层解析（工作区已经没有这个槽位：约定搬去了 utils.h）。
-// 仿真里 addr 是不透明的 —— sim_send() 根本不看它 —— 只要非 0 就够；服务端会把收到的第一帧的 addr
-// 当作对端。
+#ifdef HAVE_ADDR_PARSE_SLOT
+// 老接口：把 "ip:port" 解析成 addr。仿真里 addr 是不透明的 —— sim_send() 根本不看它 —— 只要非 0
+// 就够；服务端会把收到的第一帧的 addr 当作对端。
 static int simll_addr_parse(void *fl, const char *text, uint64_t *addr)
 {
     (void)fl; (void)text;
@@ -94,8 +100,8 @@ void *sim_ll_init(void *params, FFRDP_LOWLEVEL_CB cb, void *cbctx)
             s->ll.send      = simll_send;
             s->ll.timer     = simll_timer;
             s->ll.exit      = simll_exit;
-#ifdef SIMLL_BASE
-            s->ll.addr_parse = simll_addr_parse;   // HEAD 的 ffrdp_init 靠这个槽位解析对端
+#ifdef HAVE_ADDR_PARSE_SLOT
+            s->ll.addr_parse = simll_addr_parse;   // 只有那一侧的头文件里还有这个槽位时才补
 #endif
             return &s->ll;
         }

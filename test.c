@@ -206,7 +206,9 @@ static void* peer_thread(void *param)
     tokens     = quota;   // 一开跑就有一个周期的额度，否则头 1 秒发不出去、平均速率会偏低
     while (!g_exit) {
         if (!ffrdp) {
-            ffrdp = ffrdp_init(peer->ip, *peer->port, NULL, NULL, peer->is_server, 1280, 0);
+            char addr[80];
+            snprintf(addr, sizeof(addr), "%s:%d", peer->ip, *peer->port);
+            ffrdp = ffrdp_init(addr, NULL, NULL, peer->is_server, 1280, 0);
             if (!ffrdp) { usleep(100 * 1000); continue; }
         }
 
