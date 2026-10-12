@@ -211,8 +211,11 @@ typedef struct {
     // almost every sampling instant. The ack/query/fec paths do not check their sendto at all, so until
     // this counter existed, an ack that could not be sent was invisible everywhere.
     uint32_t counter_send_err;
-    uint32_t counter_send_bytes;   // payload of the frames the peer acked: bytes DELIVERED, not bytes put on the wire
-    uint32_t counter_recv_bytes;   // ... of the frames we acked
+    // 注意：这两个是【字节】计数，必须是 64 位。32 位版本累计到 4 GiB 就回绕，而 averg_* 拿
+    // 回绕后的值去除以"已经过去的秒数"，打印出来就是突然掉到地板上的假速率 —— 实测 140s 处
+    // total_send 4031MB、150s 处 207MB，而同一刻瞬时 confirmed rate 一直是 2.2 万帧/s。
+    uint64_t counter_send_bytes;   // payload of the frames the peer acked: bytes DELIVERED, not bytes put on the wire
+    uint64_t counter_recv_bytes;   // ... of the frames we acked
     uint32_t counter_send_1sttime; // first transmissions: the denominator of counter_resend_ratio
     uint32_t counter_send_failed;  // ffrdp_send refused the call (app queue full, or an allocation failed)
     uint32_t counter_send_query;
@@ -1163,7 +1166,8 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     secs = ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_ffrdp_dump) / 1000;
     secs = secs ? secs : 1;
     printf("total_send, total_recv: %.2fMB, %.2fMB\n"    , ffrdp->counter_send_bytes / (1024.0 * 1024), ffrdp->counter_recv_bytes / (1024.0 * 1024));
-    printf("averg_send, averg_recv: %.2fKB/s, %.2fKB/s\n", ffrdp->counter_send_bytes / (1024.0 * secs), ffrdp->counter_recv_bytes / (1024.0 * secs));
+    // secs 是距上一次 dump 的秒数：刚起来的第一次 dump 可能不足一秒，别拿 0 当除数。
+    printf("averg_send, averg_recv: %.2fKB/s, %.2fKB/s\n", ffrdp->counter_send_bytes / (1024.0 * MAX(secs, 1)), ffrdp->counter_recv_bytes / (1024.0 * MAX(secs, 1)));
     printf("rttm: %u, rtts: %u, rttd: %u, rto: %u\n", ffrdp->rttm, ffrdp->rtts, ffrdp->rttd, ffrdp->rto);
     // which binary is this? the compile stamp makes a stale executable impossible to mistake for a fresh
     // one: if this time is older than the build you just ran, you are running something else.
