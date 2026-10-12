@@ -665,3 +665,120 @@ build               : probe 1, queue ratio 3, inflight default 64, compiled Oct 
 - **pacing**：闸门修好后，按 `在途/RTT` 均匀发送才有意义（此前窗口不是真闸门，pacing 收效甚微）。
   但注意：简单控制律**已全部试完**，都满足不了"无负优化" ⇒ 目前**正式搁置** ✗
   （见 [`notes.md`](notes.md) 5.3）；若要重启，作为独立系列，不与其它改动混做 ✓。
+
+# 第三部分：当前版本的可配置参数与内存账
+
+> 第一部分/第二部分里的小节（含 §6 的 v1.0.0 参数表、§3.4 的流控量）是**版本快照**，保留原样；
+> **当前版本**的可配参数与内存占用以本部分为准。全部常量都是编译期常量（`#define`），没有运行期配置入口
+> —— 这是"应用队列不分配内存"的代价（见 11.3）。
+
+## 11. 可配置参数（编译期常量）
+
+### 11.1 派生链：一个旋钮决定三块内存
+
+```
+FFRDP_LOWLEVEL_FRAME_MAX                                   （lowlevel.h，默认 1500）
+  └─ FFRDP_MAX_MSS = (FRAME_MAX - FFRDP_FRAME_OVERHEAD) & ~3        （6 = 4 字节帧头 + 2 字节 FEC seq）
+       ├─ FFRDP_RECVBUF_SIZE = 128 × MSS                   接收缓冲（协议可见：rwnd 由它算并报给对端）
+       ├─ FFRDP_APP_TX_SIZE  = FFRDP_MAX_WAITSND × (MSS+4)  应用发送队列（纯应用侧，协议不播报）
+       └─ smss ≤ MSS                                      运行期参数：ffrdp_init() 的每帧负载
+  └─ FFRDP_LOWLEVEL_BUFFER_SIZE = 128 × (FRAME_MAX + 6)     仅作 socket 选项，占内核内存，不占本进程
+```
+
+1500 这个默认值是为了不触发 IP 分片；**嵌入式上它是第一个该动的旋钮**。
+
+### 11.2 常量表
+
+| 常量 | 位置 | 默认值 | 作用与约束 |
+|---|---|---|---|
+| `FFRDP_LOWLEVEL_FRAME_MAX` | `lowlevel.h` | 1500 | 传输层一帧的上限；下面几块内存全由它派生 |
+| `FFRDP_MAX_MSS` | `ffrdp.c` | `(1500-6)&~3 = 1492` | 每帧最大负载（派生量，不要单独改）|
+| `smss` | `ffrdp_init()` 参数 | 调用方给定 | 运行期每帧负载，被夹到 `1 ≤ smss ≤ FFRDP_MAX_MSS` |
+| `sfec` | `ffrdp_init()` 参数 | 调用方给定 | FEC 冗余度（0 ~ `FFRDP_FRAME_TYPE_FEC32`）|
+| `FFRDP_RECVBUF_SIZE` | `ffrdp.c` | `128 × MSS ≈ 186 KiB` | 接收缓冲；**决定接收窗口**（`rwnd` 经 ACK 报给对端，按 255 帧夹一下）⇒ 缩它要和对端成对考虑 |
+| `FFRDP_APP_TX_SIZE` | `ffrdp.c` | `FFRDP_MAX_WAITSND × (MSS+4) ≈ 93.5 KiB` | 应用发送队列（结构体里的静态环形）；**纯应用侧**，可以放心配小 ⇒ 见 11.3、11.5 |
+| `FFRDP_MAX_WAITSND` | `ffrdp.c` | 64 帧 | 在途帧数上限（判在 `ffrdp_send` 的受理判据里，见 11.4），同时也是应用队列容量的乘数 ⇒ 见 11.5 |
+| `FFRDP_RECV_QUEUE_MAX` | `ffrdp.c` | 256 帧 | 乱序暂存上限（"陌生帧"能往前多少帧就丢，防内存被撑爆）|
+| `FFRDP_LOWLEVEL_BUFFER_SIZE` | `lowlevel.h` | `128 × (FRAME_MAX+6) ≈ 188 KiB` | 只是 `SO_SNDBUF/SO_RCVBUF` 的**请求值**，不是本进程内存 |
+| `FFRDP_LOWLEVEL_RX_BATCH_MAX` | `lowlevel-udp.c` | 2 | 一圈最多交给协议几帧（吞吐/延迟旋钮）；每帧用栈上 `buf[FRAME_MAX]` |
+| `FFRDP_COND_WAIT_MS` | `ffrdp.c` | 200 | 应用等待时 `timedwait` 的间隔 |
+| `FFRDP_QUERY_CYCLE` / `FFRDP_FLUSH_TIMEOUT` / `FFRDP_DEAD_TIMEOUT` | `ffrdp.c` | 500 / 500 / 5000 ms | 空闲询问周期 / 未填满的帧最长等多久 / 判对端失联 |
+| `FFRDP_MIN_RTO` / `FFRDP_MAX_RTO` | `ffrdp.c` | 16 / 2000 ms | RTO 上下限 |
+| `FFRDP_MIN/DEF/MAX_CWND_SIZE` | `ffrdp.c` | 1 / 32 / 64 帧 | 拥塞窗口 |
+| `FFRDP_INFLIGHT_MAX` / `FFRDP_INFLIGHT_MIN` | `ffrdp.c` | 64 / 4 帧 | 在途量闸门的上限 / 地板（探测那一组常量见 `notes.md` 10.3.5）|
+
+### 11.3 把 `FFRDP_APP_TX_SIZE` 配小
+
+- **上限**：能发送的单条消息必须 ≤ `FFRDP_APP_TX_SIZE - 4`（4 字节长度前缀）。超过它的消息被 `ffrdp_send`
+  **直接拒绝**（返回 -1），**不会空等** —— 这一条守卫是"可以随意配小"的前提。
+- **代价**：发送背压来得更早（非阻塞调用更早返回 -1，阻塞调用等得更久），吞吐上限下降。
+  实测：容量配到 4 条消息（5984 B）时回环吞吐从 ~300 MB/12s 降到约 180 KB/s，但
+  `seq_gap / crc_err / len_err / partial_err` 全为 0 ⇒ 正确性不受影响。
+- **不再随 `smss` 变**：容量是编译期常量（结构体内的静态环形，没有 `calloc`、没有分配失败这条路）。
+  于是 `smss` 配小时不会自动省这块内存 —— 这是"队列不分配内存"的代价。
+- **运行时不可配**：要运行期决定容量，就得回到堆分配或由调用方提供缓冲区（那会重新引入分配失败路径）。
+- **推荐值**：`(4 * (FFRDP_MAX_MSS + 4))` —— 恰好放得下 4 条最大消息。
+
+### 11.4 两条受理判据（都在 `ffrdp_send` 里）
+
+1. **帧数**：`ceil(len / smss) + pub_wait_snd > FFRDP_MAX_WAITSND` ⇒ 拒绝。
+   `pub_wait_snd` 是协议发布的镜像（每个回调结束时刷新），含义是"**已成帧、未确认**"的帧数，
+   **不含还排在队列里、尚未成帧的消息** ⇒ 这是一条**近似**判据。
+2. **字节**：`len + 4 + 队列里现有字节 > FFRDP_APP_TX_SIZE` ⇒ 拒绝或等待（按 `timeout_ms`）。
+   这一条是精确的，也是上面那一条的兜底。
+
+两条合起来夹住"在途 + 排队"的总量：帧数上限（近似）+ 队列容量（精确）。
+
+### 11.5 把 `FFRDP_MAX_WAITSND` 配小
+
+它是**两处内存**的乘数：
+
+- 应用发送队列容量：`FFRDP_APP_TX_SIZE = FFRDP_MAX_WAITSND × (MSS + 4)`；
+- 在途帧数上限 ⇒ `send_list` 里的帧节点数（每帧 ≈ `smss + 54` 字节，堆上）。
+
+按容量算（MSS=1492，运行期 smss=1280）：
+
+| `WAITSND` | `app_tx` | 在途帧节点上限 | 合计 |
+|---|---|---|---|
+| 256 | 374.0 KiB | 333.5 KiB | 707.5 KiB |
+| **64（当前默认）** | 93.5 KiB | 83.4 KiB | **176.9 KiB** |
+| 32 | 46.8 KiB | 41.7 KiB | 88.4 KiB |
+| 16 | 23.4 KiB | 20.8 KiB | 44.2 KiB |
+
+**约束（重要）**：必须 `WAITSND ≥ FFRDP_INFLIGHT_MAX`（= `FFRDP_MAX_CWND_SIZE` = 64）。它是"在途 **+** 排队"的
+总上限，比协议的闸门还小的话就成了更紧的刹车：在途永远填不满窗口，高 BDP 链路上掉速。
+注意**回环测不出这一条**（RTT 极小 ⇒ 实测 32/16 时吞吐也只掉 15%），别拿回环结论当安全证据。
+
+其它代价：
+
+- **最大单条消息 = `WAITSND × smss`**：帧数判据在循环之前，超了立即返回 -1（不会空等）；
+- 应用被拒的次数上升：实测（16 KB 消息、回环、12s）`WAITSND` = 256/64 时 0 次，32 时 24 次，16 时 2911 次
+  ⇒ 调用方必须按契约处理 -1（重试），否则就是丢数据；
+- 线上无影响：`wait_snd` 是本端量，从不进任何帧 ⇒ 没有互操作风险（与 `recv_buff` → `rwnd` 不同）。
+
+单独说明：接收侧乱序暂存的上限是**另一个**旋钮 `FFRDP_RECV_QUEUE_MAX`（默认 256，超了直接丢），
+它不随 `WAITSND` 变 —— 要省那块内存得单独降它，代价是重排链路上丢帧变多、重传变多。
+
+## 12. 每端内存账
+
+| 项 | 量 | 说明 |
+|---|---|---|
+| `recv_buff` | `128 × MSS` | 在 `FFRDPCONTEXT` 里（该结构体是 `calloc` 的），≈186 KiB @1500 |
+| `app_tx_buff` | `FFRDP_APP_TX_SIZE` | 同上，≈374 KiB @默认（可配，见 11.3）|
+| 帧节点 | ≈ `smss + 54` 字节/个 | `calloc(1, sizeof(NODE) + 4 + smss + 2)`；同时在途上限 `FFRDP_MAX_WAITSND`，接收侧乱序暂存上限 `FFRDP_RECV_QUEUE_MAX` |
+| `UDP_LOWLEVEL` | 约百字节 | 无大数组 |
+| 栈上每帧缓冲 | `FRAME_MAX` | `lowlevel-udp.c` 的 `uint8_t buf[FRAME_MAX]`（1.5 KiB @1500）|
+| socket 收发缓冲 | 内核内存 | `SO_SNDBUF/SO_RCVBUF` 的请求值；MCU 上没有这两行 |
+
+应用内存合计（`recv_buff + app_tx_buff`）随 `FFRDP_LOWLEVEL_FRAME_MAX` 的变化：
+
+| `FRAME_MAX` | MSS | `recv_buff` | `app_tx`（默认 = 64 条）| `app_tx`（配 4 条）| 合计（配 4 条）|
+|---|---|---|---|---|---|
+| 1500 | 1492 | 186.5 KiB | 93.5 KiB | 6.0 KiB | **193 KiB** |
+| 1024 | 1016 | 127.0 KiB | 63.8 KiB | 4.1 KiB | 131 KiB |
+| 512 | 504 | 63.0 KiB | 31.8 KiB | 2.0 KiB | 65 KiB |
+| 256 | 248 | 31.0 KiB | 15.8 KiB | 1.0 KiB | 32 KiB |
+
+⇒ 嵌入式（MCU）的调整顺序：① 降 `FFRDP_LOWLEVEL_FRAME_MAX`（一个旋钮同时压 `recv_buff` 和 `app_tx` 的默认值）；
+② 把 `FFRDP_APP_TX_SIZE` 配到几条消息；③ 还要更省，再一起降 `FFRDP_MAX_WAITSND` 与 `FFRDP_RECV_QUEUE_MAX`
+（它们管帧节点的数量）。代价：MSS 变小后同样的字节要走更多帧 —— 每帧固定 6 字节开销，且每帧都要一个 ack。

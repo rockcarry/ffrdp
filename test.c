@@ -5,27 +5,14 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "ffrdp.h"
-
-#ifdef WIN32
-#include <windows.h>
-#define usleep(t) Sleep((t) / 1000)
-#define get_tick_count GetTickCount
-#define strtok_r strtok_s
-#else
-static uint32_t get_tick_count()
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
-}
-#endif
+#include "utils.h"
 
 #define TEST_VERSION            "1.1.0" // 与 build.sh 生成的 libffrdp.pc 里的 Version 保持一致
 #define TEST_DUMP_INTERVAL_MS   10000   // 每隔这么久打印一次诊断
-#define TEST_PEER_SILENCE_MS     2000   // 这么久没收到对端数据就认为它失联（见 peer_is_lost）
-#define TEST_SPEED_INTERVAL_MS   1000   // 发送限速：每这么久补一次令牌（见 peer_thread）
+#define TEST_PEER_SILENCE_MS    2000    // 这么久没收到对端数据就认为它失联（见 peer_is_lost）
+#define TEST_SPEED_INTERVAL_MS  1000    // 发送限速：每这么久补一次令牌（见 peer_thread）
 #define TEST_STREAM_MAX        (256 * 1024) // 接收侧累积缓冲：ffrdp_recv 是字节流，消息要自己拼回来
-#define TEST_RECV_WAIT_MS            10    // 没有数据时 ffrdp_recv 等这么久：应用侧的节拍点
+#define TEST_RECV_WAIT_MS       10      // 没有数据时 ffrdp_recv 等这么久：应用侧的节拍点
 
 // 每条消息的格式（全部小端）：
 //   [4B 总长 len][4B seq][payload...][4B crc32]      len = 整条消息字节数（含头尾）
@@ -177,7 +164,7 @@ static int msg_parse(TEST_VERIFY *v, const char *name, const char *peer, const u
 static int peer_is_lost(void *ffrdp, uint32_t tick_recv)
 {
     if (ffrdp_isdead(ffrdp)) return 1;
-    return (int32_t)get_tick_count() - (int32_t)tick_recv > TEST_PEER_SILENCE_MS;
+    return (int32_t)get_timestamp32_ms() - (int32_t)tick_recv > TEST_PEER_SILENCE_MS;
 }
 
 // 服务端与客户端共用的主循环：不停地发随机长度的消息、收对端消息并逐条校验、定期打诊断。
@@ -201,7 +188,7 @@ static void* peer_thread(void *param)
         goto done;
     }
 
-    tick_dump  = get_tick_count();
+    tick_dump  = get_timestamp32_ms();
     tick_speed = tick_dump;
     tokens     = quota;   // 一开跑就有一个周期的额度，否则头 1 秒发不出去、平均速率会偏低
     while (!g_exit) {
@@ -217,7 +204,7 @@ static void* peer_thread(void *param)
         // 有了消息 framing 之后不能再"把一包裁到剩余额度"（那会把一条消息截断），
         // 所以改成"按剩余额度**选**这一条消息的大小"：额度不够装最小一条就先不发。
         if (quota) {
-            if ((int32_t)get_tick_count() - (int32_t)tick_speed >= TEST_SPEED_INTERVAL_MS) {
+            if ((int32_t)get_timestamp32_ms() - (int32_t)tick_speed >= TEST_SPEED_INTERVAL_MS) {
                 tick_speed += TEST_SPEED_INTERVAL_MS;
                 tokens      = quota;
             }
@@ -264,12 +251,12 @@ static void* peer_thread(void *param)
                     connected = 1;
                     printf("%s\n", peer->msg_up);
                 }
-                tick_recv = get_tick_count();
-                if ((int32_t)get_tick_count() - (int32_t)tick_dump > TEST_DUMP_INTERVAL_MS) {
+                tick_recv = get_timestamp32_ms();
+                if ((int32_t)get_timestamp32_ms() - (int32_t)tick_dump > TEST_DUMP_INTERVAL_MS) {
                     pthread_mutex_lock(&g_mutex);
                     ffrdp_dump(ffrdp, 0);
                     pthread_mutex_unlock(&g_mutex);
-                    tick_dump = get_tick_count();
+                    tick_dump = get_timestamp32_ms();
                 }
             }
         } else {
@@ -341,12 +328,14 @@ int main(int argc, char *argv[])
         if (strstr(argv[i], "--server=") == argv[i]) {
             server_en = 1;
             if (strcmp(argv[i] + 9, "") != 0) {
-                strncpy(server_bind_ip, argv[i] + 9, sizeof(server_bind_ip));
+                // snprintf 而不是 strncpy：源串可能比目标长，strncpy 会把 32 字节填满而不留
+                // 结尾的 0（-O2 下 gcc 的 -Wstringop-truncation 就会拦下它）。
+                snprintf(server_bind_ip, sizeof(server_bind_ip), "%s", argv[i] + 9);
             }
         } else if (strstr(argv[i], "--client=") == argv[i]) {
             client_en = 1;
             if (strcmp(argv[i] + 9, "") != 0) {
-                strncpy(client_cnnt_ip, argv[i] + 9, sizeof(client_cnnt_ip));
+                snprintf(client_cnnt_ip, sizeof(client_cnnt_ip), "%s", argv[i] + 9);
             }
         } else if (strcmp(argv[i], "--server") == 0) {
             server_en = 1;

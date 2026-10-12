@@ -3,20 +3,16 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include <fcntl.h>
+#include <unistd.h>
 #include <pthread.h>
 #include "socket.h"
 #include "utils.h"
 #include "lowlevel.h"
 
-#ifdef WIN32
-// The wakeup below is a POSIX pipe, watched with select(). That works on every unix here, and it is the one
-// thing in this file that is not portable: Windows select() only ever reports sockets, so a Windows build
-// needs a loopback socket pair (or WSAEventSelect) doing the same job. It is refused rather than quietly
-// turned into a no-op, because a loop that cannot be woken still compiles and still passes a smoke test --
-// it just answers late, and only under load.
-#error "ffrdp-udp lowlevel: needs a socket based wakeup on Windows, see the comment above"
-#endif
+// The wakeup the loop waits on is a UDP socket connected to its own loopback address, not a pipe. A pipe is
+// cheaper per call (measured here: 0.54us against 1.44us for write+drain) but select() on Windows only ever
+// reports sockets, and one code path for both platforms is worth more than that difference -- what matters
+// is how often the wakeup is used, not what one call costs, and timer() below is where that is decided.
 
 // 一圈最多收几帧再交给定时那一段。见 worker loop 里的说明。它同时是两个东西的旋钮：一圈的固定开销
 // （select + 算期限 + 交给定时那一段）被几帧摊掉，以及上层多久能回一个 ack —— ack 报的是 recv_seq +
@@ -31,9 +27,9 @@
 #define FFRDP_LOWLEVEL_RX_BATCH_MAX 2
 
 typedef struct {
-    int  (*send)(void *fl, uint64_t addr, uint8_t *buf, int len);
+    int  (*send )(void *fl, uint64_t addr, uint8_t *buf, int len);
     int  (*timer)(void *fl, uint32_t deadline_ms);
-    void (*exit)(void *fl);
+    void (*exit )(void *fl);
 
     #define FLAG_BIND_ADDR (1 << 0)
     uint32_t           flags;
@@ -44,11 +40,12 @@ typedef struct {
     MOD_THREAD         mthread;
 
     // The loop sleeps in select() with no timeout at all whenever nothing is due, and select() only ever
-    // wakes for a descriptor -- never because a variable changed. So this pipe is how "the deadline moved"
-    // and "stop" reach it: any thread writes notify[1], the loop watches notify[0].
-    int             notify[2];
-    pthread_mutex_t lock;      // guards deadline, which is written from other threads
-    uint32_t        deadline;  // absolute ms on the ffrdp_get_timestamp32_ms() clock, 0 = nothing due
+    // wakes for a descriptor -- never because a variable changed. So this socket is how "the deadline moved"
+    // and "stop" reach it: any thread sends one byte to it, the loop watches it for reading.
+    int             notify;    // UDP socket connected to its own loopback address (see ffrdp_udp_wakeup_create)
+    int             asleep;    // 1 while the loop is inside select(); written and read under this lock
+    pthread_mutex_t lock;      // guards deadline and asleep, which are written from other threads
+    uint32_t        deadline;  // absolute ms on the get_timestamp32_ms() clock, 0 = nothing due
 } UDP_LOWLEVEL;
 
 // 跨 API 的 addr 是 uint64：布局是两条层共同的约定（见 utils.h 的 ffrdp_addr_make），不是本文件的私事。
@@ -70,22 +67,37 @@ static void ffrdp_udp_addr_unpack(uint64_t addr, struct sockaddr_in *sin)
     sin->sin_port        = htons(port);
 }
 
-static void ffrdp_udp_set_nonblock(int fd)
+// The wakeup socket: bound to a loopback port and then connected to its own address, so that sending one
+// byte to it makes it readable here. Built and closed by the worker thread -- the thread where the socket
+// layer is up. Loopback delivery is immediate (measured: select() sees it on the very next call, 1000 times
+// out of 1000), and connect() means nothing else can put a byte in it.
+static int ffrdp_udp_wakeup_create(UDP_LOWLEVEL *udp)
 {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    struct sockaddr_in lo = {};
+    socklen_t          len = sizeof(lo);
+    int                fd  = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) return -1;
+    socket_setopt(fd, "nonblock_io", 1);   // a caller must never block on a full queue
+    lo.sin_family      = AF_INET;
+    lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    lo.sin_port        = 0;                // the kernel picks; nobody else ever needs to know it
+    if (bind(fd, (struct sockaddr*)&lo, sizeof(lo)) != 0) { closesocket(fd); return -1; }
+    if (getsockname(fd, (struct sockaddr*)&lo, &len) != 0) { closesocket(fd); return -1; }
+    if (connect(fd, (struct sockaddr*)&lo, sizeof(lo)) != 0) { closesocket(fd); return -1; }
+    udp->notify = fd;
+    return 0;
 }
 
 // Wake the loop. Any thread may call this; it is the only thing in this file that has to be safe to call
-// while the loop is asleep. A full pipe means a wakeup is already pending, which is all this needs.
+// while the loop is asleep. A full queue means a wakeup is already pending, which is all this needs.
 static void ffrdp_udp_notify(UDP_LOWLEVEL *udp)
 {
-    char    b = 1;
-    ssize_t n;
-    if (udp->notify[1] < 0) return;
-    // A full pipe is not an error: it means a wakeup is already pending, which is all this is for. The
-    // result goes into a variable rather than being cast away, because write() is warn_unused_result.
-    n = write(udp->notify[1], &b, 1);
+    char b = 1;
+    int  n;
+    if (udp->notify < 0) return;
+    // A full queue is not an error: it means a wakeup is already pending, which is all this is for. The
+    // result goes into a variable rather than being cast away, because send() is warn_unused_result.
+    n = (int)send(udp->notify, &b, 1, 0);
     (void)n;
 }
 
@@ -94,17 +106,30 @@ static void ffrdp_udp_notify_drain(UDP_LOWLEVEL *udp)
     char b[64];
     // It has to be drained completely: a byte left behind keeps select() reporting it readable, and the
     // loop then spins at full speed instead of sleeping.
-    if (udp->notify[0] < 0) return;
-    while (read(udp->notify[0], b, sizeof(b)) > 0) { }
+    if (udp->notify < 0) return;
+    while (recv(udp->notify, b, sizeof(b), 0) > 0) { }
 }
 
-static uint32_t ffrdp_udp_deadline_get(UDP_LOWLEVEL *udp)
+// "I am about to sleep" and "I am awake", both under the lock that also guards the deadline, so that
+// timer() can tell "the loop will re-read the deadline anyway" from "the loop has to be woken". The flag
+// goes up BEFORE the deadline is read: a timer() that lands in between sees asleep=1 and sends its byte,
+// and because that byte is buffered, the select() that follows returns at once instead of sleeping on the
+// old, later deadline. A wakeup cannot be lost here the way a condition variable's signal can.
+static uint32_t ffrdp_udp_sleep_begin(UDP_LOWLEVEL *udp)
 {
     uint32_t d;
     pthread_mutex_lock(&udp->lock);
+    udp->asleep = 1;
     d = udp->deadline;
     pthread_mutex_unlock(&udp->lock);
     return d;
+}
+
+static void ffrdp_udp_sleep_end(UDP_LOWLEVEL *udp)
+{
+    pthread_mutex_lock(&udp->lock);
+    udp->asleep = 0;
+    pthread_mutex_unlock(&udp->lock);
 }
 
 // Deliver a tick that has come due. The deadline is consumed BEFORE the callback runs, so a callback that
@@ -112,7 +137,7 @@ static uint32_t ffrdp_udp_deadline_get(UDP_LOWLEVEL *udp)
 // than being called again on every lap.
 static void ffrdp_udp_tick(UDP_LOWLEVEL *udp)
 {
-    uint32_t now = ffrdp_get_timestamp32_ms();
+    uint32_t now = get_timestamp32_ms();
     pthread_mutex_lock(&udp->lock);
     if (!udp->deadline || (int32_t)(udp->deadline - now) > 0) { pthread_mutex_unlock(&udp->lock); return; }
     udp->deadline = 0;
@@ -120,16 +145,27 @@ static void ffrdp_udp_tick(UDP_LOWLEVEL *udp)
     if (udp->callback) udp->callback(udp->cbctx, FFRDP_LOWLEVEL_TYPE_TIMER, NULL, 0);
 }
 
-// One timer request, from any thread: remember when, and wake the loop in case it is asleep on a later
-// deadline or on no deadline at all.
+// One timer request, from any thread: remember when it is due, and wake the loop only when this call is
+// the one that has to. The value is always stored; only the wakeup is conditional. Three kinds of wasted
+// wakeup are filtered out here, and this is where the cost of the layer actually lives:
+//   - the loop itself is the caller (the protocol arms its next tick from inside a callback): it re-reads
+//     the deadline before it next sleeps, so there is nobody to wake;
+//   - the new deadline is not earlier than the one already armed: the loop wakes at the earlier one anyway
+//     and re-reads the deadline then;
+//   - the loop is not asleep: it is on its way back to the top, where it reads the deadline again.
 static int ffrdp_udp_lowlevel_timer(void *fl, uint32_t deadline_ms)
 {
     UDP_LOWLEVEL *udp = (UDP_LOWLEVEL *)fl;
+    uint32_t      old;
+    int           wake;
     if (!udp) return -1;
     pthread_mutex_lock(&udp->lock);
+    old           = udp->deadline;
     udp->deadline = deadline_ms;
+    wake          = (old == 0) || ((int32_t)(deadline_ms - old) < 0) || udp->asleep;
     pthread_mutex_unlock(&udp->lock);
-    ffrdp_udp_notify(udp);
+    // The same "am I the loop?" test exit() uses: a callback is running on the loop's own thread.
+    if (wake && !(udp->mthread.hthread && udp->mthread.hthread == (void*)pthread_self())) ffrdp_udp_notify(udp);
     return 0;
 }
 
@@ -146,19 +182,20 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
 
     while (!module_thread_check_exit(&udp->mthread)) {
         if (module_thread_check_pause(&udp->mthread)) { usleep(100 * 1000); continue; }
+        // 唤醒 socket 也由这个线程建/关：它和本线程的 socket_init()/socket_exit() 同一层，所以 init/exit
+        // 不必各自再管一次平台的 socket 层。建不出来就下一圈再试，和数据 socket 一样。
+        if (udp->notify < 0 && ffrdp_udp_wakeup_create(udp) != 0) {
+            printf("<2> ffrdp-udp failed to create the wakeup socket\n");
+            usleep(100 * 1000); continue;
+        }
         if (udp->sockfd < 0) {
             udp->sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             socket_setopt(udp->sockfd, "reuse_addr" , 1); // enable reuse addr
             // non blocking, the same contract this project's own socket has: a frame that cannot be handed
             // to the kernel must come back as an error to the caller, not as a stall in a receive loop.
             socket_setopt(udp->sockfd, "nonblock_io", 1);
-            // 套接字缓冲区大小跟着 socket 一起搬到这里：它本来就是"这个后端要多大缓冲"的问题，不是协议
-            // 的问题。值按一帧的最大长度算，与协议层以前写死的那个量级一致（128 帧）。socket_setopt 没有
-            // 这两个 key，所以直接设。
-            {   int bs = 128 * (FFRDP_LOWLEVEL_FRAME_MAX + 6);
-                setsockopt(udp->sockfd, SOL_SOCKET, SO_SNDBUF, (char*)&bs, sizeof(bs));
-                setsockopt(udp->sockfd, SOL_SOCKET, SO_RCVBUF, (char*)&bs, sizeof(bs));
-            }
+            socket_setopt(udp->sockfd, "send_buffer", FFRDP_LOWLEVEL_BUFFER_SIZE);
+            socket_setopt(udp->sockfd, "recv_buffer", FFRDP_LOWLEVEL_BUFFER_SIZE);
             if (udp->sockfd < 0) { printf("<2> ffrdp-udp failed to create socket !\n"); usleep(100 * 1000); continue; }
             if ((udp->flags & FLAG_BIND_ADDR) && bind(udp->sockfd, (struct sockaddr*)&udp->addr, sizeof(udp->addr)) < 0) {
                 printf("<2> udpproxy failed to bind socket to port %d !\n", ntohs(udp->addr.sin_port));
@@ -170,9 +207,9 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
         // deadline at all, sleep indefinitely. The old fixed 100ms wakeup both capped what precision the
         // layer above could ask for and kept an idle endpoint waking ten times a second.
         struct timeval tv, *tvp = NULL;
-        uint32_t dl = ffrdp_udp_deadline_get(udp);
+        uint32_t dl = ffrdp_udp_sleep_begin(udp);
         if (dl) {
-            int32_t left = (int32_t)(dl - ffrdp_get_timestamp32_ms());
+            int32_t left = (int32_t)(dl - get_timestamp32_ms());
             if (left < 0) left = 0;                    // due already: come straight back
             tv.tv_sec  = left / 1000;
             tv.tv_usec = (left % 1000) * 1000;
@@ -181,27 +218,33 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(udp->sockfd, &rfds);
-        FD_SET(udp->notify[0], &rfds);
-        ret = select(MAX(udp->sockfd, udp->notify[0]) + 1, &rfds, NULL, NULL, tvp);
+        FD_SET(udp->notify, &rfds);
+        ret = select(MAX(udp->sockfd, udp->notify) + 1, &rfds, NULL, NULL, tvp);
+        ffrdp_udp_sleep_end(udp);       // awake again, whatever select() answered
         if (ret == -1) {
             if (socket_errno() == EINTR) continue;     // a signal is not an error, and not a reason to sleep
             printf("select error !\n"); fflush(stdout); usleep(100 * 1000); continue;
         }
 
-        if (ret > 0 && FD_ISSET(udp->notify[0], &rfds)) ffrdp_udp_notify_drain(udp);
-        // Woken in order to stop: leave without handing anything else to the layer.
-        if (module_thread_check_exit(&udp->mthread)) break;
+        if (ret > 0 && FD_ISSET(udp->notify, &rfds)) ffrdp_udp_notify_drain(udp);
+        // No stop test here, nor in the receive loop below: the condition at the top is enough, because every
+        // lap is bounded -- that loop stops after FFRDP_LOWLEVEL_RX_BATCH_MAX frames, the socket is non
+        // blocking, and select() has a deadline or is woken by the socket above. A stop that lands mid lap is
+        // seen one lap later (one more tick, two more frames at most); ffrdp_free() joins us before letting go
+        // of anything these callbacks touch.
         if (ret > 0 && FD_ISSET(udp->sockfd, &rfds)) {
             // 一圈把当前就绪的包都收下来（有上限），再交给定时那一段。为什么要收完一圈：上层是"一段
             // 一个 ack"——它报的是 recv_seq + 位图，第二个 ack 覆盖的帧第一个已经报过了，什么都不多带；
             // 而一圈只收一帧就等于一帧一个 ack，实测（差分仿真）是攒批行为的 6.7 倍。上限是给定了的：
             // 一个不停把 socket 灌满的发送方不该把下面的定时工作（重传、探测、速率采样）饿住。
             int frames = 0;
-            while (frames < FFRDP_LOWLEVEL_RX_BATCH_MAX && !module_thread_check_exit(&udp->mthread)) {
+            while (frames < FFRDP_LOWLEVEL_RX_BATCH_MAX) {
                 uint8_t buf[FFRDP_LOWLEVEL_FRAME_MAX];
                 struct  sockaddr_in from;
                 socklen_t fromlen = sizeof(from);
-                ret = recvfrom(udp->sockfd, buf, sizeof(buf), 0, (struct sockaddr*)&from, &fromlen);
+                // (void *): Winsock declares recvfrom's buffer as char*, POSIX as void* -- the buffer is
+                // bytes either way, and the cast is what keeps -Wall -Werror clean on both.
+                ret = recvfrom(udp->sockfd, (void*)buf, sizeof(buf), 0, (struct sockaddr*)&from, &fromlen);
                 if (ret <= 0) break;   // zero length datagram, an empty socket, or a socket error
                 frames++;
                 if (udp->callback) {
@@ -224,6 +267,10 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
     }
 
     closesocket(udp->sockfd); udp->sockfd = -1;
+    {   int fd = udp->notify;
+        udp->notify = -1;              // 先摘引用、再关：晚到的 timer() 只会看到"没有"，不会发到已关的 fd 上
+        if (fd >= 0) closesocket(fd);
+    }
     socket_exit();
     return NULL;
 }
@@ -268,8 +315,8 @@ static void ffrdp_udp_lowlevel_exit(void *fl)
     // the handle while the thread is still running would leave the thread reading freed memory. The thread
     // closes the socket on its way out.
     module_thread_set_state(&udp->mthread, 0);
-    if (udp->notify[0] >= 0) close(udp->notify[0]);
-    if (udp->notify[1] >= 0) close(udp->notify[1]);
+    // 唤醒 socket 已由工作线程在退出前关掉（并把引用摘成 -1）；socket_init()/socket_exit() 也都发生在
+    // 那个线程里，所以这里没有 socket 层的收尾要做。
     pthread_mutex_destroy(&udp->lock);
     free(udp);
 }
@@ -278,11 +325,11 @@ static void ffrdp_udp_lowlevel_exit(void *fl)
 // thread does the binding, so a port that is busy right now is retried instead of failing the whole start.
 // A malformed "bind:" is a configuration mistake worth refusing outright; anything else is taken as "no
 // bind requested" with a line of output, which keeps a send-only endpoint usable.
-static int ffrdp_udp_lowlevel_parse(UDP_LOWLEVEL *udp, const char *params)
+static int ffrdp_udp_lowlevel_parse_params(UDP_LOWLEVEL *udp, char *params)
 {
-    const char *rest;
-    uint32_t    ip;
-    int         port;
+    char    *rest;
+    uint32_t ip;
+    int      port;
 
     // "none": 明确表示"这个端点不绑定"（客户端就是这样：源端口由内核在第一次发包时定）。它是一条正常
     // 的配置，不是笔误，所以不打印、也没有 flags 位 —— 没有 FLAG_BIND_ADDR，接收线程就不去 bind。
@@ -310,26 +357,21 @@ FFRDP_LOWLEVEL* ffrdp_udp_lowlevel_init(void *params, FFRDP_LOWLEVEL_CB callback
     if (!params) return NULL;
     UDP_LOWLEVEL *udp = (UDP_LOWLEVEL *)calloc(1, sizeof(UDP_LOWLEVEL));
     if (!udp) return NULL;
-    if (ffrdp_udp_lowlevel_parse(udp, (const char*)params) != 0) { free(udp); return NULL; }
+    if (ffrdp_udp_lowlevel_parse_params(udp, params) != 0) { free(udp); return NULL; }
 
     udp->send         = ffrdp_udp_lowlevel_send;
     udp->timer        = ffrdp_udp_lowlevel_timer;
     udp->exit         = ffrdp_udp_lowlevel_exit;
     udp->sockfd       = -1;   // 0 is a valid descriptor, so "no socket yet" cannot be spelled with a zero
-    udp->notify[0]    = -1;
-    udp->notify[1]    = -1;
+    udp->notify       = -1;
     udp->callback     = callback;
     udp->cbctx        = cbctx;
     udp->mthread.proc = ffrdp_udp_lowlevel_proc;
     udp->mthread.arg  = udp;
-    // The wakeup pipe is created here rather than in the thread so that timer() is usable from the first
-    // moment the handle exists: a caller that gets NULL back has not been handed a half working endpoint.
-    if (pipe(udp->notify) != 0) {
-        printf("<2> ffrdp-udp failed to create the wakeup pipe\n");
-        free(udp); return NULL;
-    }
-    ffrdp_udp_set_nonblock(udp->notify[0]);
-    ffrdp_udp_set_nonblock(udp->notify[1]);   // a caller must never block on a full pipe
+    // The wakeup socket is not created here: it belongs to the worker thread, which is also the thread that
+    // has the platform's socket layer up (socket_init()/socket_exit() live there, and that thread needs the
+    // same layer for its own socket anyway). A timer() that arrives before that socket exists is not lost:
+    // the deadline is already recorded under the lock, and the worker reads it before it ever sleeps.
     pthread_mutex_init(&udp->lock, NULL);
     // State 1 starts the receive thread: it is the whole point of this layer, and there is no separate
     // start call in the API, so the handle the caller gets back is already listening. State 0 in exit()

@@ -35,6 +35,9 @@ extern "C" {
 
 int  ffrdp_socket_init(void);
 void ffrdp_socket_exit(void);
+// 可选键（未列出的键会被忽略，且只在设置失败时打印一行）：
+//   recv_timeout / send_timeout（毫秒）、nonblock_io、reuse_addr、reuse_port（仅 LINUX）、
+//   send_buffer / recv_buffer（字节，SO_SNDBUF / SO_RCVBUF）、nodelay、broadcast
 void ffrdp_socket_setopt(SOCKET sock, char *opt, int val); // set socket option
 
 #if defined(__cplusplus) || defined(c_plusplus)

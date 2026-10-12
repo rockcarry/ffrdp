@@ -15,6 +15,7 @@ simnet.o
 simll.o
 simll_base.o
 utils.o
+utils_sim.c
 t_rto_base
 t_rto_new
 t_ack_base

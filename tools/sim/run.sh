@@ -9,15 +9,16 @@
 set -e
 cd "$(dirname "$0")"
 
-# Virtualise the clock by replacing that ONE line of get_tick_count, matched on its whole shape. Matching on
-# "ts.tv_nsec" alone used to be enough, but it also rewrote anything else that mentions the field -- a comment
-# did exactly that and put a bare `return` at file scope, and the layer's own deadline arithmetic builds a
-# timespec with the same field. Anchor it to the statement instead.
-vtick() { sed 's|^\( *\)return (ts\.tv_sec \* 1000 + ts\.tv_nsec / 1000000);|\1return sim_tick();|' ; }
-if [ -n "$REF" ]; then vtick < "$REF" > ffrdp_base.c; else git -C ../.. show HEAD:ffrdp.c | vtick > ffrdp_base.c; fi
-vtick < ../../ffrdp.c > ffrdp_new.c
-grep -q sim_tick ffrdp_base.c || { echo "FATAL: failed to virtualise the clock"; exit 1; }
-grep -q sim_tick ffrdp_new.c  || { echo "FATAL: failed to virtualise the clock"; exit 1; }
+# Virtualise the clock by replacing that ONE statement of ffrdp_get_timestamp32_ms (utils.c). Matched on
+# its whole shape rather than on "ts.tv_nsec", because that field also appears in the layer's own deadline
+# arithmetic: a looser match once rewrote a comment and put a bare statement at file scope.
+# The clock is one implementation for the whole process, so one rewritten copy serves both sides -- unlike
+# ffrdp.c, which is compiled once per side and therefore keeps its -base/-new pair below.
+vtick() { sed 's|^\( *\)uint32_t ms = ((uint32_t)ts\.tv_sec \* 1000 + ts\.tv_nsec / 1000000);|\1uint32_t ms = sim_tick();|' ; }
+if [ -n "$REF" ]; then cp "$REF" ffrdp_base.c; else git -C ../.. show HEAD:ffrdp.c > ffrdp_base.c; fi
+cp ../../ffrdp.c ffrdp_new.c
+vtick < ../../utils.c > utils_sim.c
+grep -q sim_tick utils_sim.c || { echo "FATAL: failed to virtualise the clock"; exit 1; }
 
 # The header is versioned too, and each side is pointed at its own copy. It only matters while an interface
 # change is in flight -- ffrdp_send/recv gained a timeout argument, so HEAD's implementation and the working
@@ -97,7 +98,8 @@ gcc -O1 -w $HAVE_B -DSIMLL_BASE -c simll.c -o simll_base.o
 # The addr convention (ffrdp_addr_make / _split / _parse_text) now lives in utils.c and the working
 # side resolves "ip:port" through it, so it has to be linked in.
 # utils.c lives one level up (run.sh works from tools/sim).
-gcc -O1 -w -c ../../utils.c -o utils.o
+# -I../..: the copy sits here, so its quoted includes ("utils.h") need the repo root on the path.
+gcc -O1 -w -I../.. -c utils_sim.c -o utils.o
 TESTS="${TESTS:-t_rto t_ack t_fuzz e2e}"
 for t in $TESTS; do
     for v in base new; do

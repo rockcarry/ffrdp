@@ -32,7 +32,7 @@ static int    g_spikep = 0;   // percent of packets hit by a delay spike
 static int    g_spikems = 0;  // extra delay of a spike, ms
 static unsigned long g_alloc = 0, g_freed = 0;
 
-uint32_t sim_tick(void) { return g_vtick; } // replaces get_tick_count() in ffrdp.c
+uint32_t sim_tick(void) { return g_vtick; } // replaces the timestamp in utils.c
 
 static unsigned hash(unsigned k, unsigned salt)
 {

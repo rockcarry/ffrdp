@@ -64,6 +64,12 @@ void ffrdp_socket_setopt(SOCKET sock, char *opt, int val)
     } else if (strcmp(opt, "reuse_port") == 0) {
         ret = setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void*)&val, sizeof(val));
 #endif
+    // Buffer sizes in bytes, the same thing SO_SNDBUF / SO_RCVBUF take; a request is only a floor, both
+    // ends of the kernel are free to give more (Linux doubles it, which is what getsockopt then reports).
+    } else if (strcmp(opt, "send_buffer") == 0) {
+        ret = setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (void*)&val, sizeof(val));
+    } else if (strcmp(opt, "recv_buffer") == 0) {
+        ret = setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (void*)&val, sizeof(val));
     } else if (strcmp(opt, "nodelay") == 0) {
         ret = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (void*)&val, sizeof(val));
     } else if (strcmp(opt, "broadcast") == 0) {

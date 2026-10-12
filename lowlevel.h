@@ -12,6 +12,11 @@
 // for the UDP header on top.
 #define FFRDP_LOWLEVEL_FRAME_MAX 1500
 
+// 这个端点给自己开的收发缓冲大小（字节）：按上面的一帧上限算 128 帧，再给每帧留 6 字节余地 —— 协议层
+// 会在一帧外面套几字节（4 字节帧头 + 2 字节 FEC seq），这里不引用它的宏：那是协议的事，传输层只需要
+// 一个"装得下一段时间里在途的帧"的数。它跟着实现走（UDP 用一个 socket 缓冲，别的后端可能完全没有）。
+#define FFRDP_LOWLEVEL_BUFFER_SIZE (128 * (FFRDP_LOWLEVEL_FRAME_MAX + 6))
+
 enum {
     FFRDP_LOWLEVEL_TYPE_RECV  = 1,
     FFRDP_LOWLEVEL_TYPE_TIMER = 2,
@@ -45,15 +50,15 @@ typedef long (*FFRDP_LOWLEVEL_CB)(void *cbctx, int type, void *buf, int len);
 typedef struct {
     // 0 = handed to the transport, -1 = this frame was not accepted. Either way the frame is gone as far as
     // this layer is concerned; retransmitting it is the protocol's job, not the transport's.
-    int  (*send)(void *fl, uint64_t addr, uint8_t *buf, int len); // addr: 32bit ip + 16bit port
+    int  (*send )(void *fl, uint64_t addr, uint8_t *buf, int len); // addr: 32bit ip + 16bit port
     // Ask to be called back (FFRDP_LOWLEVEL_TYPE_TIMER) no later than this absolute millisecond, on the
-    // same clock the implementation reports time with (ffrdp_get_timestamp32_ms). 0 = no deadline, sleep
+    // same clock the implementation reports time with (utils.h 的 get_timestamp32_ms). 0 = no deadline, sleep
     // until a frame arrives. A deadline that has already passed means now, which is how a caller hurries
     // the thread up. Each call replaces the previous deadline rather than adding to it.
     // Callable from any thread: the layer above uses it from the application's thread when it has just
     // queued a frame, so that the frame goes out immediately instead of at the deadline set earlier.
     int  (*timer)(void *fl, uint32_t deadline_ms);
-    void (*exit)(void *fl);
+    void (*exit )(void *fl);
     // Turn a peer's text form ("1.2.3.4:5678", the backend's own syntax) into an addr that send() accepts,
     // so a layer that was configured with a peer can speak first. An addr taken out of a receive message
     // can simply be echoed back, but a peer that has not spoken yet has to be named some other way, and

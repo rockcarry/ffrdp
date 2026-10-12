@@ -37,7 +37,7 @@ build_package()
     local LDFLAGS="-lpthread"
     case "$CROSS_COMPILE" in
     *mingw*)
-        LDFLAGS="$LDFLAGS -lws2_32 -lwinmm"
+        LDFLAGS="$LDFLAGS -lws2_32"
         ;;
     *)
         # socket.c / utils.c / lowlevel-udp.c 的 Linux 实现被 #ifdef LINUX 挡着：不给这个宏，它们编出来

@@ -2339,3 +2339,96 @@ C2 那笔给 `lowlevel.h` 做版本化时，把"base 侧一定有 `addr_parse` �
 
 readme 的对外 API 列表里那条 `ffrdp_update()` 其实是 C2 就删掉的，本次一并更新（连注释里"过渡态"的
 说法一起改成事实）✓。
+
+## 23. 应用发送队列的收尾：环形、无分配、参数定稿（2026-10-12）
+
+这一节记的是"协议搬到工作线程"之后，应用队列 `app_tx_buff` 及其周边参数的最后几笔收拾。同一份工作区里
+还带着同批的 socket 唤醒（自连单 socket）与时钟收敛（`get_tick_count` → `ffrdp_get_timestamp32_ms`）等改动，
+那部分不在本节复述。
+
+### 23.1 `closing` 挪进锁内，于是 `_Atomic` 不再需要
+
+`ffrdp_lowlevel_cb` 入口原来在**拿锁之前**读 `ffrdp->closing`（省一次抢锁），因此那个字段必须是 `_Atomic`
+（否则形式上就是 data race）。查了一遍全部 6 处访问：只有这一处不在锁里，其余（写 1 处、读 3 处）本来就在
+锁内 ⇒ 把这一处挪到锁内之后，整个变量回到普通 `int`，`#include <stdatomic.h>` 也一起删掉。
+
+代价实测（`gcc -O2 -S` 对比）：seq_cst **load** 在 x86-64 上就是一条普通 `movl`（和普通 `int` 逐条相同）；
+`_Atomic` 在整个 `ffrdp.c` 里只多出**一条 `mfence`**，位置在 `ffrdp_free` 的 `closing = 1` —— 冷路径、
+每个连接一次。结论：省下的不是性能，是"这个字段为什么必须是原子的"这个解释成本。
+
+判据：`-Wall -Wextra -Werror` 零告警；低层套件 250/0（普通 + ASAN）；回环两端 `verify: OK`；把三处倒回
+去构造"改前"版做 A/B 差分仿真 ⇒ 26/26 行**逐字相同**（改动只换形状、不换行为）。
+
+### 23.2 应用队列改成环形，并去掉 `calloc`
+
+原来 `app_tx_buff` 是"线性 + 每取一条就 `memmove` 压实"、容量按运行期 `smss` 堆分配。现在：
+
+- **环形**：`app_tx_head / app_tx_tail / app_tx_size`，复用文件里既有的 `ringbuf_write/read`（`recv_buff` 用的
+  同一对函数）。取消息分三步：先"窥看"4 字节长度前缀（`ringbuf_read` 的新 head 丢掉 = 只读不推进）→
+  成帧（`ffrdp_frame_message` 只读，按环形逐段读进帧里）→ 成功后才用 `ringbuf_read(..., NULL, 4 + len)`
+  一次消费整条。失败时队列一个字都不动 ⇒ 原子性不变；`memmove` 彻底消失。
+- **静态**：容量是编译期常量 `FFRDP_APP_TX_SIZE`，数组内联在结构体里（和 `recv_buff` 一样）⇒ 没有 `calloc`、
+  没有"分配失败 ⇒ goto failed"这条路、没有两处 `free`、也没有 `app_tx_cap` 那个字段。
+
+代价（写进 `ffrdp-protocol.md` §11.3）：容量不再随 `smss` 缩，smss 小时会多占；且运行期不可配。
+
+判据：四个单元零告警；套件 250/0；回环 2×（每方向约 800 次回绕）两端 `verify: OK`；另外**专门做了一次
+强制回绕**——`/tmp` 里另建一份把容量配成 4 条消息（5984 B）、并把发送改成阻塞（免得"应用被拒"干扰），
+跑出约 430 次回绕，`seq_gap / crc_err / len_err / partial_err` 全 0；A/B 差分仿真（base = 改前快照）
+26/26 行逐字相同。
+
+### 23.3 `app_wait_snd` → `pub_wait_snd`
+
+`app_wait_snd` 与 `app_tx_*` 没有任何数据关系：它是协议 `wait_snd` 的**镜像**（每个回调结束时发布），
+含义是"已成帧、未确认"的帧数 —— 和"队列里排着的字节"是互补的两件事。名字却像一对，容易误读 ⇒ 改名
+`pub_wait_snd`（5 处：1 定义 + 2 注释 + 1 读 + 1 写；两个名字都是 12 字符，结构体列对齐不变）。
+`tools/sim/ffrdp_base.c|ffrdp_new.c` 里的同名出现是 `run.sh` 的生成物，不用手改。
+
+### 23.4 `ffrdp_send` 加"超大消息直接拒"守卫
+
+受理判据有两条：帧数（`ceil(len/smss) + pub_wait_snd > FFRDP_MAX_WAITSND`，在循环**之前**判，立即 -1）与
+字节（`len + 4 + 队列现有字节 > FFRDP_APP_TX_SIZE`，在**循环里**判）。后者一旦不成立且调用方给了
+`timeout_ms < 0`（"等到能放"），就会**永远等下去** —— 一条比队列还大的消息永远放不进去。补一行前置检查
+（`len + 4 > FFRDP_APP_TX_SIZE` ⇒ 直接拒）之后，`FFRDP_APP_TX_SIZE` 才算真的"可以随意配小"。
+
+对照实验（小环 = 4 条消息、阻塞式发送、8 KB 消息）：**改前**客户端 rc=124（被 timeout 杀掉 = 卡死）；
+**改后** rc=0，不卡。
+
+### 23.5 `FFRDP_MAX_WAITSND` 256 → 64
+
+它是**两处内存**的乘数：`FFRDP_APP_TX_SIZE = WAITSND × (MSS+4)`，以及"在途帧数上限"⇒ `send_list` 的帧节点数
+（每帧 ≈ `smss + 54` 字节）。按容量算（MSS=1492、smss=1280）：256 时 707.5 KiB、64 时 **176.9 KiB**（省 530 KiB）。
+
+取 64 的依据：必须 `≥ FFRDP_INFLIGHT_MAX`（= `FFRDP_MAX_CWND_SIZE` = 64），否则这个上限就成了**比协议闸门
+更紧的刹车**，在途填不满窗口，高 BDP 链路上掉速。实测（16 KB 消息、回环、12s）：
+
+| WAITSND | 吞吐 | 应用被拒次数 | verify |
+|---|---|---|---|
+| 256 | 310 MB | 0 | OK |
+| **64** | 292 MB | 0 | OK |
+| 32 | 309 MB | 24 | OK |
+| 16 | 265 MB | 2911 | OK（调用方重试）|
+
+⚠️ 回环 RTT 极小 ⇒ 32/16 也只掉 15%，**测不出高 BDP 上的问题**，别拿回环当安全证据。另外注意：接收侧
+乱序暂存是另一个旋钮 `FFRDP_RECV_QUEUE_MAX`（默认 256，不随 WAITSND 变）。
+
+最后一条实测观察：这个旋钮会让**仿真 e2e(丢包/抖动) 场景的统计量变化**（`rto_floor`、白费重传计数，
+26 行里 12 行不同），因为应用能排进来的量变了；测试本身仍 rc=0、FAIL 0、PASS 4。以后拿 e2e 统计当基线
+比较时，要么固定这个旋钮，要么把断言写成负载无关的。
+
+### 23.6 `test.c` 的 `-O2` 编译问题
+
+`strncpy(dst, src, sizeof dst)` 在源串更长时会把 32 字节**填满而不留结尾的 0**，`-O2` 下 gcc 的
+`-Wstringop-truncation` 就会把它当错误拦下（`build.sh` 不加 `-O2`，所以平时不暴露）。两处（`server_bind_ip`、
+`client_cnnt_ip`）改成 `snprintf(dst, sizeof dst, "%s", src)`：截断行为不变，但一定以 0 结尾。
+
+判据：`-O2 -Wall -Werror` 与 `-O2 -Wall -Wextra -Werror` 都零告警；把改前的 `test.c` 放回去，同一命令 rc=1
+（对照成立）。
+
+### 23.7 文档：`ffrdp-protocol.md` 新增第三部分
+
+第一/二部分是 v1.0.0 / v1.1.0 的**版本快照**，保持原样；当前版本的可配参数与内存占用集中写在新增的
+"第三部分"里：§11.1 派生链（一个旋钮 `FFRDP_LOWLEVEL_FRAME_MAX` 决定 `recv_buff`、`app_tx` 默认值与
+socket 缓冲；只有 `recv_buff` 是协议可见量）、§11.2 常量表、§11.3 把 `FFRDP_APP_TX_SIZE` 配小、
+§11.4 两条受理判据、§11.5 把 `FFRDP_MAX_WAITSND` 配小、§12 每端内存账（含帧节点与栈上缓冲，
+以及四个 FRAME_MAX 取值下的合计）。只追加：文档里原有的纯 LF 行仍是 41 行。

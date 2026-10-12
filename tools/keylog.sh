@@ -16,7 +16,7 @@ set -u
 BLOCKSTEP="${BLOCKSTEP:-5}"
 
 # 只留这些行。想更窄就删几个字段；想更全就把 counter_ 那段放宽（例如改成 counter_）。
-KEY='^(build|elapsed|total_send|rtt_min|swnd|wait_snd|inflight|in-flight limit|probe trigger|probe rtt|queue test|confirmed rate|update period|rto_floor|counter_(recv_ooo|ooo_d|ooo_64reach|ooo_128reach|mack_bits|resend_|ack_(mack|hole|dup)|recv_dup|timeout_evt|send_1sttime|send_failed|reach_maxrto|probe|giveback))'
+KEY='^(build|elapsed|total_send|rtt_min|swnd|wait_snd|inflight|in-flight limit|probe trigger|probe rtt|queue test|confirmed rate|lap period|rto_floor|counter_(recv_ooo|ooo_d|ooo_64reach|ooo_128reach|mack_bits|resend_|ack_(mack|hole|dup)|recv_dup|timeout_evt|send_1sttime|send_failed|reach_maxrto|probe|giveback))'
 
 summarize() {   # $1 = key 文件
     awk -v step="$BLOCKSTEP" '

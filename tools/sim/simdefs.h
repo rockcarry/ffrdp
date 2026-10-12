@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-uint32_t sim_tick(void);             // the virtual clock, replaces get_tick_count()
+uint32_t sim_tick(void);             // the virtual clock: run.sh rewrites utils.c's timestamp into this
 
 void *sim_calloc(size_t n, size_t s);
 void  sim_free(void *p);
