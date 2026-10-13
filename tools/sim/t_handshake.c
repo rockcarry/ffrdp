@@ -93,6 +93,9 @@ int main(void)
     check(srv->nconn == 3, "服务端连接表：主连接 + 两条（nconn=3）");
     check(r1 > 4096 && r2 > 4096 && bad1 == 0 && bad2 == 0, "两条连接各收到自己的数据、不串台");
     check(sent1 > 0 && sent2 > 0, "两个客户端都确实发出去了数据");
+    // isdead 现在按句柄问（v2 ✓）：失联是**每连接**的状态 ✓
+    check(ffrdp_isdead(srv, g_h1) == 0 && ffrdp_isdead(srv, g_h2) == 0, "按句柄问：两条连接都活着（0）");
+    check(ffrdp_isdead(srv, FFRDP_MAXCONN) == -1, "句柄越界 ⇒ -1（参数错）");
 
     /* ── 阶段 1b：FIN ⇒ DISCONN + 释放那条连接 ──────────────────────────── */
     printf("── 阶段 1b：客户端 1 那一侧发 FIN\n");
@@ -102,6 +105,7 @@ int main(void)
         sim_begin(0); sim_ll_run(0, p_srv);
         check(g_disconn == 1, "服务端收到 FIN ⇒ 报了 DISCONN");
         check(srv->table[h1] == NULL, "那条连接被放掉（表槽清空）");
+        check(ffrdp_isdead(srv, h1) == 1, "那条连接被放掉 ⇒ 按句柄问是**死**（1）");
         check(srv->nconn == 3, "水位不回收（索引永不复用 ✓）");
     }
     ffrdp_exit(p_c1); ffrdp_exit(p_c2); ffrdp_exit(p_srv);

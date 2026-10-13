@@ -163,7 +163,7 @@ static int msg_parse(TEST_VERIFY *v, const char *name, const char *peer, const u
 // 两侧用同一个判据（历史上只有客户端有"看多久没收到数据"这一半）。
 static int peer_is_lost(void *ffrdp, uint32_t tick_recv)
 {
-    if (ffrdp_isdead(ffrdp)) return 1;
+    if (ffrdp_isdead(ffrdp, 0)) return 1;   // 老程序只有一条连接 ⇒ 句柄 0（= 主连接 ✓）
     return (int32_t)get_timestamp32_ms() - (int32_t)tick_recv > TEST_PEER_SILENCE_MS;
 }
 

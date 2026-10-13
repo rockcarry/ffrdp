@@ -98,7 +98,7 @@ ffrdps://0.0.0.0:8000,maxconn:16,handshake_ms:10000,idle_ms:5000,mss:1024,fec:0,
 | `FFRDP_ACCEPT` / `CONNECT` / `DISCONN` | ✅ 已接线 ✓ |
 | `FFRDP_ENCRYPT` / `FFRDP_DECRYPT` | ✅ 已接线 ✓（协议**原样**交付载荷 ✓，长度不改 ✓；两条出口都挂 ✓，`t_crypto` 验收 ✓）|
 | `FFRDP_RECVDATA` | ✅ 已接线 ✓（`t_recvdata` 验收 ✓）——`FFRDP_CONSUMED` ⇒ 应用在回调里取走、协议不留 ✓；`NOT_CONSUMED` ⇒ 照旧留在缓冲里等 `ffrdp_recv` ✓ |
-| `ffrdp_isdead` | ⚠️ 仍是 v1 形状 ✓（无句柄 ✗ —— 多连接下该按句柄问 ✓，待并进 v2 签名）|
+| `ffrdp_isdead` | ✅ 已按句柄收口 ✓：`ffrdp_isdead(ctxt, conn)` ✓（1 = 失联（句柄指向已关闭的连接也算 ✓）/ 0 = 活着 / -1 = 参数错或句柄越界 ✓）|
 
 ## 七、怎么验
 

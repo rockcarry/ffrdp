@@ -69,6 +69,7 @@ int   ffrdp_recv (void *ctxt, int conn, char *buf, int len, int timeout_ms);
 void  ffrdp_flush(void *ctxt, int conn);                    // 把还没攒满的那一帧立刻发出去
 void  ffrdp_dump (void *ctxt, int conn, int clearhistory);  // conn < 0 = 总状态；conn >= 0 = 该连接的详细状态
 
-int   ffrdp_isdead(void *ctxt);       // 诊断用：对端是否已被判定失联（v2 保留；不在设计稿的接口清单里）
+int   ffrdp_isdead(void *ctxt, int conn);  // 诊断用：**这条连接**是否已被判定失联 ✓
+                                           //   1 = 失联（句柄指向已关闭的连接也算 ✓）/ 0 = 活着 / -1 = 参数错
 
 #endif

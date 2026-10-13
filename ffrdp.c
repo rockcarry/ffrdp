@@ -1022,16 +1022,18 @@ int ffrdp_recv(void *ctxt, int conn, char *buf, int len, int timeout_ms)
     }
 }
 
-int ffrdp_isdead(void *ctxt)
+// v2：失联是**每连接**的状态 ⇒ 按句柄问 ✓（v1 只有一个上下文，没法表达"哪条" ✗）。
+// 返回：1 = 这条连接已被判定失联（含"句柄指向一条已关闭的连接" ✓ —— 无连接可问，就当死 ✓）
+//       0 = 还活着；-1 = 参数错 / 句柄越界（与 send/recv 的 FFRDP_EINVAL 同值 ✓）
+int ffrdp_isdead(void *ctxt, int conn)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
+    FFRDPCONN *c;
     int ret;
-    if (!ctxt) return -1;
+    if (!ctxt || conn < 0 || conn >= FFRDP_MAXCONN) return -1;
     pthread_mutex_lock(&ffrdp->lock);
-    // 这个接口没有句柄参数 ⇒ 只看主连接（v2 里 conn 的失联由事件与 send/recv 的返回来表达）。
-    {   FFRDPCONN *c = ffrdp->table[0];
-        ret = c ? ffrdp_isdead_locked(ffrdp, c) : 0;
-    }
+    c = ffrdp->table[conn];
+    ret = c ? ffrdp_isdead_locked(ffrdp, c) : 1;
     pthread_mutex_unlock(&ffrdp->lock);
     return ret;
 }
