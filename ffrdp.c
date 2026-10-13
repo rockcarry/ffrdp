@@ -287,15 +287,29 @@ static int ffrdp_recv_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame)
     fecrdc = frame->data[0];
     if (fecseq / fecrdc != ffrdp->fec_rxseq / fecrdc || ffrdp->fec_rxredundancy != fecrdc) { // group changed or fec_rxredundancy changed
         memcpy(ffrdp->fec_rxbuf, frame->data, frame->size);
-        ffrdp->fec_rxseq = fecseq; ffrdp->fec_rxmask = 1 << (fecseq % fecrdc); ffrdp->fec_rxcnt = 1; ffrdp->fec_rxredundancy = fecrdc;
-        return fecseq % fecrdc != fecrdc - 1 ? 0 : -1;
+        ffrdp->fec_rxseq = fecseq; ffrdp->fec_rxredundancy = fecrdc;
+        if (fecseq % fecrdc == fecrdc - 1) {
+            // ⚠️ 这一帧**就是冗余帧** ⇒ 它不能算成"收到一个数据帧" ✗：此刻组里收到的数据是 0 个 ✓。
+            //    旧写法把它记成 rxcnt = 1 并直接 return -1 ⇒ 组里只剩一个数据帧时（rdc == 2 ✓）
+            //    那一帧永远补不回来 ✗（实测：fec:2 的冗余等于白搭 ✓，由 t_fec 阶段 C 钉住 ✓）。
+            ffrdp->fec_rxmask = 0;
+            ffrdp->fec_rxcnt  = 0;
+        } else {
+            ffrdp->fec_rxmask = 1 << (fecseq % fecrdc);
+            ffrdp->fec_rxcnt  = 1;
+        }
+        // 这里**不再 return**：接着走下面的"冗余帧恢复 / 数据帧累积" ✓（rdc == 2 正是靠这条才恢复 ✓）
     } else ffrdp->fec_rxseq = fecseq; // group not changed
     if (fecseq % fecrdc == fecrdc - 1) { // it's redundance frame
         if (ffrdp->fec_rxcnt == fecrdc - 1) return -1;
         if (ffrdp->fec_rxcnt != fecrdc - 2) { ffrdp->counter_fec_failed++; return -1; }
         type = frame->data[0];
-        psrc = (uint32_t*)ffrdp->fec_rxbuf; pdst = (uint32_t*)frame->data;
-        for (i = 0; i < (frame->size - 2) / sizeof(uint32_t); i++) *pdst++ ^= *psrc++;
+        // rxcnt == 0（只有 rdc == 2 到得了这儿 ✓）：组里一个数据帧都没收到 ⇒ 冗余帧**本身就是**
+        // 那一帧 ✓（异或空集 = 原样 ✓）⇒ 不能再拿它跟自己异或一遍（那是全 0 ✗）。
+        if (ffrdp->fec_rxcnt > 0) {
+            psrc = (uint32_t*)ffrdp->fec_rxbuf; pdst = (uint32_t*)frame->data;
+            for (i = 0; i < (frame->size - 2) / sizeof(uint32_t); i++) *pdst++ ^= *psrc++;
+        }
         frame->data[0] = type;
         ffrdp->counter_fec_ok++;
     } else if (!(ffrdp->fec_rxmask & (1 << (fecseq % fecrdc)))) { // update fec_rxbuf
