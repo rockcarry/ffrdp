@@ -50,10 +50,12 @@ ffrdps://0.0.0.0:8000,maxconn:16,handshake_ms:10000,idle_ms:5000,mss:1024,fec:0,
 | `FFRDP_DISCONN` | 连接断开 ✓（也可由 send/recv 的返回值得知 ✓）| — |
 | `FFRDP_ENCRYPT` | 发帧**定稿**时 ✓ | `buf`/`len` = 帧载荷 ✓ |
 | `FFRDP_DECRYPT` | 收到帧、**即将交付给应用**时 ✓ | `buf`/`len` = 帧载荷 ✓ |
-| `FFRDP_RECVDATA` | ⚠️ **尚未接线** ✗（设计已定 ✓：异步通知 + 返回值决定留不留 ✓）| — |
+| `FFRDP_RECVDATA` | 收到应用数据（异步通知 ✓）：**入接收缓冲之前**报一次 | `buf`/`len` = 本次交付的数据 ✓ |
 
 - **回调持着协议锁**被调用 ✓ ⇒ 回调里**不许**再调 `ffrdp_*` ✗（会自锁 ✗）。记状态/做原地变换可以 ✓。
 - 返回值**只对 `FFRDP_RECVDATA` 有意义** ✓（`FFRDP_CONSUMED` / `FFRDP_NOT_CONSUMED` ✓）；
+- `FFRDP_RECVDATA` 的两个返回值都会**照常确认这一帧** ✓（`recv_seq` 推进、ack 照发 ✓）⇒
+  "取走"只影响**这段字节归谁保管** ✓，不影响传输 ✓（不然发送侧就会卡住 ✗）。
   其余事件忽略返回值 ✓。
 
 ### 4.1 加密回调（`FFRDP_ENCRYPT` / `FFRDP_DECRYPT`）
@@ -95,7 +97,7 @@ ffrdps://0.0.0.0:8000,maxconn:16,handshake_ms:10000,idle_ms:5000,mss:1024,fec:0,
 | `ffrdp_flush` / `ffrdp_dump`（`conn < 0` = 全局 ✓）| ✅ 已落地 ✓ |
 | `FFRDP_ACCEPT` / `CONNECT` / `DISCONN` | ✅ 已接线 ✓ |
 | `FFRDP_ENCRYPT` / `FFRDP_DECRYPT` | ✅ 已接线 ✓（协议**原样**交付载荷 ✓，长度不改 ✓；两条出口都挂 ✓，`t_crypto` 验收 ✓）|
-| `FFRDP_RECVDATA` | ⚠️ 设计已定、**尚未接线** ✗ |
+| `FFRDP_RECVDATA` | ✅ 已接线 ✓（`t_recvdata` 验收 ✓）——`FFRDP_CONSUMED` ⇒ 应用在回调里取走、协议不留 ✓；`NOT_CONSUMED` ⇒ 照旧留在缓冲里等 `ffrdp_recv` ✓ |
 | `ffrdp_isdead` | ⚠️ 仍是 v1 形状 ✓（无句柄 ✗ —— 多连接下该按句柄问 ✓，待并进 v2 签名）|
 
 ## 七、怎么验
