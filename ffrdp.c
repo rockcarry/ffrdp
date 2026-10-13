@@ -593,15 +593,29 @@ static int ffrdp_recv_data_frame(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_FRAME_
     fecrdc = frame->data[0];
     if (fecseq / fecrdc != c->fec_rxseq / fecrdc || c->fec_rxredundancy != fecrdc) { // group changed or fec_rxredundancy changed
         memcpy(c->fec_rxbuf, frame->data, frame->size);
-        c->fec_rxseq = fecseq; c->fec_rxmask = 1 << (fecseq % fecrdc); c->fec_rxcnt = 1; c->fec_rxredundancy = fecrdc;
-        return fecseq % fecrdc != fecrdc - 1 ? 0 : -1;
+        c->fec_rxseq = fecseq; c->fec_rxredundancy = fecrdc;
+        if (fecseq % fecrdc == fecrdc - 1) {
+            // ⚠️ 这一帧**就是冗余帧** ⇒ 它不能算成"收到一个数据帧" ✗：此刻组里收到的数据是 0 个 ✓。
+            //    旧写法把它记成 rxcnt = 1 并直接 return -1 ⇒ 组里只剩一个数据帧时（rdc == 2 ✓）
+            //    那一帧永远补不回来 ✗（实测：fec:2 的冗余等于白搭 ✓，现在由 t_fec 阶段 C 钉住 ✓）。
+            c->fec_rxmask = 0;
+            c->fec_rxcnt  = 0;
+        } else {
+            c->fec_rxmask = 1 << (fecseq % fecrdc);
+            c->fec_rxcnt  = 1;
+        }
+        // 这里**不再 return**：接着走下面的"冗余帧恢复 / 数据帧累积" ✓（rdc == 2 正是靠这条才恢复 ✓）
     } else c->fec_rxseq = fecseq; // group not changed
     if (fecseq % fecrdc == fecrdc - 1) { // it's redundance frame
         if (c->fec_rxcnt == fecrdc - 1) return -1;
         if (c->fec_rxcnt != fecrdc - 2) { c->counter_fec_failed++; return -1; }
         type = frame->data[0];
-        psrc = (uint32_t*)c->fec_rxbuf; pdst = (uint32_t*)frame->data;
-        for (i = 0; i < (frame->size - 2) / sizeof(uint32_t); i++) *pdst++ ^= *psrc++;
+        // rxcnt == 0（只有 rdc == 2 到得了这儿 ✓）：组里一个数据帧都没收到 ⇒ 冗余帧**本身就是**
+        // 那一帧 ✓（异或空集 = 原样 ✓）⇒ 不能再拿它跟自己异或一遍（那是全 0 ✗）。
+        if (c->fec_rxcnt > 0) {
+            psrc = (uint32_t*)c->fec_rxbuf; pdst = (uint32_t*)frame->data;
+            for (i = 0; i < (frame->size - 2) / sizeof(uint32_t); i++) *pdst++ ^= *psrc++;
+        }
         frame->data[0] = type;
         c->counter_fec_ok++;
     } else if (!(c->fec_rxmask & (1 << (fecseq % fecrdc)))) { // update fec_rxbuf

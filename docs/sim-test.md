@@ -83,7 +83,7 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 | `t_keepalive` | **keep-alive（v2：`idle_ms` 接线）**：空闲×活着 ⇒ 跑 5×`idle_ms` 双方都不被误杀 ✓、且探活 QUERY 真的在发（`counter_send_query` 在涨 ✓）；空闲×对端哑掉 ⇒ `idle_ms` 后双方 `DISCONN` ✓、服务端收摊（表槽清空 ✓）、`isdead`=1 ✓、`recv` 报 `CLOSED` ✓（v2-only ✓）|
 | `t_init` | **参数解析（v2）**：`ffrdp_init` 的**全部校验分支**（params 为 NULL / scheme 不认识 / 键缺冒号 / 未知键 / `maxconn` 越界 ✓）与键边界（`maxconn:1` 与 `= FFRDP_MAXCONN` ✓、`mss:8` ✓、`handshake_ms:0` / `idle_ms:0` 这类"没校验但后果大"的键 ✓、`fec` 的 0..32 钳制 ✓）；纯负面用例 ✓（v2-only ✓）|
 | `t_dump` | **`ffrdp_dump` 的边界（v2）**：`conn < 0` / `0` / accept 句柄 / 空槽 / 越界 / **已放掉的槽** / `clearhistory` / **`ctxt == NULL`** ✓ —— 都不许崩 ✓（v2-only ✓）|
-| `t_fec` | **FEC 丢帧恢复（v2）**：`fec:3` 丢 1 个数据帧 ⇒ **恢复**（`counter_fec_ok=1` ✓，且逐字节正确、顺序不乱 ✓，并用 `resend_rto==0` 排除"其实是 ARQ 补的" ✗）；`fec:4` 丢 2 个 ⇒ `counter_fec_failed=1` ✓ 且**有序交付**（应用此刻拿不到 ✓），随后 ARQ 兜底补齐 ✓；`fec:2` ⇒ ⚠️ 现状**等于没有冗余** ✗（钉住已知行为 ✓）（v2-only ✓）|
+| `t_fec` | **FEC 丢帧恢复（v2）**：`fec:3` 丢 1 个数据帧 ⇒ **恢复**（`counter_fec_ok=1` ✓，且逐字节正确、顺序不乱 ✓，并用 `resend_rto==0` 排除"其实是 ARQ 补的" ✗）；`fec:4` 丢 2 个 ⇒ `counter_fec_failed=1` ✓ 且**有序交付**（应用此刻拿不到 ✓），随后 ARQ 兜底补齐 ✓；`fec:2` ⇒ **也恢复** ✓（每组只剩 1 个数据帧时，冗余帧本身就是那一帧 ✓；这是回归判据 ✓）（v2-only ✓）|
 | `t_fuzz` | **敌意输入**：398 个畸形片段（长度扫过每种帧类型 × 3 种载荷 + 定种子随机），**每个片段 fork 一个子进程**喂进解析器；另做洞上方洪泛的内存有界检查 | 没有片段能杀死子进程（`all N fragments survived`）**且**洪泛内存有界（`-> bounded`）✓ 见下 |
 
 ### 多对端：夹具 API（P0 新增）
