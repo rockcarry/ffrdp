@@ -218,7 +218,7 @@ static void* peer_thread(void *param)
                 const char *hs = getenv("FFRDP_HS");
                 snprintf(params, sizeof(params), "%s://%s,mss:1280,fec:0%s",
                          peer->is_server ? "ffrdps" : "ffrdpc", addr,
-                         hs ? (atoi(hs) ? ",hs:1" : ",hs:0") : "");
+                         (hs && *hs) ? (atoi(hs) ? ",hs:1" : ",hs:0") : "");
                 printf("%s ffrdp_init: %s\n", peer->name, params);   // 排查用：实际配置进日志 ✓
                 fflush(stdout);
                 ffrdp = ffrdp_init(params, on_event, NULL);
