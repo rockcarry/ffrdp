@@ -2,7 +2,7 @@
 
 ffrdp 是一个基于 **UDP + ARQ + FEC** 的快速可靠传输协议。目标是 **低延迟** + **弱网下带宽稳定**。
 
-单文件实现（`ffrdp.c`）+ 约 200 行测试程序（`test.c`），除 `pthread` 外**无第三方依赖**，
+单文件实现（`ffrdp.c`）+ 一个测试程序（`test.c`），除 `pthread` 外**无第三方依赖**，
 不需要内核改动，也不改变 UDP 语义。
 
 ---
@@ -19,24 +19,29 @@ ffrdp 是一个基于 **UDP + ARQ + FEC** 的快速可靠传输协议。目标�
 | 对端证据驱动 | RTO 下限、快重传等待时长都由"对端重复上报"决定 —— 这是链路上唯一不会被本端计数污染的判据 |
 | 诊断友好 | `ffrdp_dump()` 输出延迟三分量、在途量、重传、白费比例等；`build :` 行自证二进制版本，避免"跑错二进制" |
 
-规模参考：`ffrdp.c` 当前约 **1080 行**；v1.0.0 是 **671 行**。
-多出来的部分几乎全部是针对缓冲膨胀链路的优化（并发控制与延迟探测），**不是协议本身变复杂了**
-（帧格式只多了一个可选字节，见下）。
+与 v1.0.0 相比增长的部分，几乎全部是针对缓冲膨胀链路的优化（并发控制与延迟探测），**不是协议本身变复杂了**
+（帧格式只多了一个可选字节，见下）。**规模参考**（`ffrdp.c`，协议核心）：v1.0.0 **670 行** ✓、v1.1.0 **1316 行** ✓；
+v1.2.0 起传输层独立成文件（`lowlevel-udp.c` 约 380 行，另加 `socket.c` / `utils.c` 若干 ✓）。
 
 ---
 
 ## 二、协议版本
 
-| 版本 | 范围 | 帧格式 | 内容 |
+| 版本 | **分支** | 帧格式 | 内容 |
 |---|---|---|---|
-| **v1.0.0** | 提交 `55ead4a` 及之前 | 4 字节帧头；ACK 8 字节 | 基础 ARQ（选择重传/快重传/UNA+MACK/rwnd）+ FEC |
-| **v1.1.0** | `55ead4a` 之后（`58167b3` 起）到现在 | **未变** ✓ | 协议**逻辑**优化：ACK 回传白费计数（唯一新增的可选字节）、对端证据驱动的 RTO 下限、快重传等待纪律、在途量闸门 + 延迟探测 |
+| **v1.0.0** | `v1.0.x` | 4 字节帧头；ACK 8 字节 | 基础 ARQ（选择重传/快重传/UNA+MACK/rwnd）+ FEC |
+| **v1.1.0** | `v1.1.x` | **未变** ✓ | 协议**逻辑**优化：ACK 回传白费计数（唯一新增的可选字节）、对端证据驱动的 RTO 下限、快重传等待纪律、在途量闸门 + 延迟探测 |
+| **v1.2.0**（当前）| `v1.2.x` | **未变** ✓ | **传输层重构**（`lowlevel` 接口 + 工作线程驱动）与随后的协议修正（唤醒判据、当圈回 ack、窗口定标）；参数与规范见 [`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) §3.1 |
+
+**怎么认版本** ✓：看 dump 里的 `build : … compiled <日期>` 行，再对上编译时的 commit ✓。
+（`version : v1.2.0` 这一行是**当前工作树**才有的 —— `ffrdp.h` 的 `FFRDP_VERSION` ✓；
+三个分支提交与更早编出来的二进制都**没有**这一行 ✗。）
 
 **帧格式兼容性结论**：v1.1.0 **没有引入新帧类型、没有改动任何既有字段的宽度与含义**，
-唯一变化是 ACK 帧尾部多了一个**可选**字节（`dups`，仅在"有内容可报"时发送）。
+唯一变化是 ACK 帧尾部多了一个**可选**字节（`dups`，仅在"有内容可报"时发送）。**v1.2.0 同样未改动帧格式与 ACK 语义** ✓，但 **`ffrdp.h` 的 API 有三处签名变化** ✗（见 §3.1.6 ✓）：`ffrdp_init()` 改收地址字符串、`send` / `recv` 各多一个 `timeout_ms`、`ffrdp_update()` 删除。
 
 ⇒ 新老两端可以互相对接（双向兼容，推理与代码证据见
-[`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) 第 8 节）。
+[`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) §2.1 与 §3.1）。
 
 ---
 
@@ -118,8 +123,7 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
   1KB/s、20KB/s、500KB/s 同样贴合 ✓）。
   实现是令牌桶：每 1 秒补满 1 秒的额度，并按剩余额度**选**这一条消息的大小
   （消息是原子的，不能裁剪 ✓）；不想限速就传 `0` 或不传 ✓；
-- **不限速时的速率由测试程序自己决定**：本机回环约 **90~100MB/s** ✓
-  （framing + crc32 + 伪随机填充的 CPU 开销 ✓），远高于真实链路 ✓；
+- **不限速时的速率由测试程序自己决定**（framing + crc32 + 伪随机填充的 CPU 开销 ✓），远高于真实链路 ✓；
 - 不带任何参数时只打印用法，然后退出；
 - **退出请用 `quit` / `exit`** ✓ —— 只有这种方式会**先打印上面的 `verify:` 汇总**再退出 ✓；
 - 内部固定 `ffrdp_init(addr, NULL, NULL, server, 1280, 0)`，`addr` 由 `peer->ip` + `*peer->port` 拼成
@@ -128,15 +132,15 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
 
 ### lowlevel 一致性测试（`tools/test-lowlevel-udp.sh`）
 
-v2.0.0 起协议层与 socket 解耦，底座是 `lowlevel.h` 定义的传输端点（发 + 收 + 定时器，
+v1.2.0 起协议层与 socket 解耦，底座是 `lowlevel.h` 定义的传输端点（发 + 收 + 定时器，
 自带工作线程）。这一层有自己的契约测试，只走 127.0.0.1、端口按 pid 取，不需要网络与配置：
 
 ```bash
-bash tools/test-lowlevel-udp.sh            # 普通构建（-Wall -Wextra -Werror），约 12 秒
-ASAN=1 bash tools/test-lowlevel-udp.sh     # 打开地址消毒器（含泄漏检测），约 8 秒
+bash tools/test-lowlevel-udp.sh            # 普通构建（-Wall -Wextra -Werror）
+ASAN=1 bash tools/test-lowlevel-udp.sh     # 打开地址消毒器（含泄漏检测）
 ```
 
-十节，250 项断言：参数解析 ✓、收包消息与来源地址 ✓、回发（含回调内 `send` 与主线程 `send`）✓、
+逐节覆盖：参数解析 ✓、收包消息与来源地址 ✓、回发（含回调内 `send` 与主线程 `send`）✓、
 载荷边界（含 1500 截断）✓、节流与突发负载 ✓、双端点与并发 ✓、生命周期（70 次 init/exit 的
 fd/线程零泄漏 ✓、无期限时 `exit` 及时返回 ✓）、定时器（期限精度 / 已过即立刻 / 覆盖式 /
 回调内重设 / 跨线程催发 / `RECV` 与 `TIMER` 不交错 / 回调不嵌套）✓。
@@ -149,9 +153,9 @@ fd/线程零泄漏 ✓、无期限时 `exit` 及时返回 ✓）、定时器（�
 ```
 .
 ├── ffrdp.c                 协议实现（单文件：ARQ + FEC + 流控/并发控制 + 诊断）
-├── ffrdp.h                 对外 API（init/free/send/recv/update/flush/isdead/dump）
-├── lowlevel.h              v2.0.0 分层：lowlevel 接口（tx + rx + timer，自带工作线程）
-├── lowlevel-udp.c          lowlevel 的 UDP 实现（绑定 + 收发 + timer + 唤醒管道）
+├── ffrdp.h                 对外 API（7 个函数，见下；v1.2.0 有三处签名变化）
+├── lowlevel.h              lowlevel 接口（tx + rx + timer，自带工作线程）—— v1.2.0 起
+├── lowlevel-udp.c          lowlevel 的 UDP 实现（绑定 + 收发 + timer + 唤醒 socket）
 ├── socket.c / socket.h     socket 薄封装（初始化、选项、超时、非阻塞）
 ├── utils.c / utils.h       时间戳、线程 setname/getname、模块线程状态机
 ├── test.c                  测试程序（服务端/客户端共用一个参数化的对等端循环 + 每 10 秒 dump）
@@ -159,19 +163,17 @@ fd/线程零泄漏 ✓、无期限时 `exit` 及时返回 ✓）、定时器（�
 ├── readme.md               本文件：概述、版本、编译、测试、目录
 ├── LICENSE
 ├── docs/
-│   ├── ffrdp-protocol.md   协议说明：v1.0.0 帧格式与基本协议 + v1.1.0 优化（原理/证据/被否路线）
+│   ├── ffrdp-protocol.md   协议说明：v1.0.0 / v1.1.0 / v1.2.0 三部分（帧格式、参数、改动与依据）
 │   ├── sim-test.md         差分仿真工具（tools/sim）使用说明
 │   └── notes.md            开发与调试记录（按时间顺序，含每次上机的原始 log）
-└── tools/
-    ├── sim/                差分仿真：虚拟时钟 + 假 socket，把两版代码放在同一条确定假链路上 A/B
-    ├── ffrdp-fuzz.c        端口侧敌意输入：以不讲协议的对端身份打监听端口，判进程是否存活
-    ├── inflight-sweep.sh   在途上限扫描：钉住上限并关掉探测，量出在途 ->（延迟, 速率）
-    ├── test-lowlevel-udp.sh  lowlevel 一致性测试的构建与运行（普通 / ASAN=1）
-    ├── test-lowlevel-udp.c   它的测试主体：参数、收发包与地址、载荷边界、负载、多端点、生命周期、timer
-    └── keylog.sh           从 test_ffrdp 的输出里只留关键行，并打印"最后一块汇总 + 逐块趋势"
+└── tools/                  辅助工具（不逐个列 ✓：差分仿真 `tools/sim/`、敌意输入、在途上限扫描、lowlevel 契约测试、日志提取 —— 以目录实际内容为准 ✓）
 ```
 
-### 对外 API（`ffrdp.h`）
+### 对外 API（`ffrdp.h`）—— **v1.2.0** ✓
+
+⚠️ **下面是 v1.2.0 的签名** ✓；相对 v1.0.0 / v1.1.0 **有三处变化** ✗（`ffrdp_init` 改收地址字符串、
+`send` / `recv` 多一个 `timeout_ms`、`ffrdp_update` 删除）⇒ 细节与理由见
+[`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) §3.1.6 ✓。
 
 ```c
 void* ffrdp_init  (char *addr, char *txkey, char *rxkey, int server, int smss, int sfec);   // addr = "ip:port" / "ip"（端口默认 8000）
@@ -183,10 +185,11 @@ void  ffrdp_flush (void *ctxt);                       // 把未填满的帧立�
 void  ffrdp_dump  (void *ctxt, int clearhistory);     // 打印诊断
 ```
 
-> `timeout_ms`：**0 = 不等待**（旧行为，既有调用方加一个 `, 0` 即完全等价）；`>0` = 最多等这么多毫秒，
-> 等待期间协议照常跑；`<0` = 等到有数据 / 能接受为止。`ffrdp_recv` 有数据就立刻返回，不为凑满 `len` 而等。
-> `ffrdp_update()` 已经删掉（C2）：协议跑在 lowlevel 的工作线程上，应用侧只等 `ffrdp_recv` 的 timeout。
-> `addr` 的写法与解析（`utils.h` 的共享约定）见 `docs/notes.md` 第 21、22 节。
+- **`timeout_ms`** ✓：**`0` = 不等待** ✓（旧行为 —— 既有调用方加一个 `, 0` 即完全等价 ✓）；
+  **`> 0` = 最多等这么多毫秒** ✓（等待期间协议照常跑 ✓）；**`< 0` = 等到有数据 / 能接受为止** ✓。
+- **`ffrdp_recv`** ✓：有数据就立刻返回 ✓，不为凑满 `len` 而等 ✓。
+- **`ffrdp_update()` 已删除** ✓：协议跑在 lowlevel 的工作线程上 ✓，应用侧只等 `ffrdp_recv` 的 timeout ✓。
+- **`addr` 的写法与解析** ✓（`utils.h` 的共享约定）：见 `docs/notes.md` 第 21、22 节 ✓。
 
 ---
 
@@ -195,7 +198,6 @@ void  ffrdp_dump  (void *ctxt, int clearhistory);     // 打印诊断
 | 想了解 | 看这里 |
 |---|---|
 | 帧格式、mack、FEC、RTO 计算、通信流程 | [`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) 第一部分（v1.0.0）|
-| 缓冲膨胀、"这 200ms"、v1.1.0 改了什么、为什么这么改 | 同一份文档第二部分（v1.1.0）|
 | 每个改动的动机、被否掉的路线、当时的上机原始 log | [`docs/notes.md`](docs/notes.md) |
 | 没有真机时怎么验证"没有回归" | [`docs/sim-test.md`](docs/sim-test.md) |
 

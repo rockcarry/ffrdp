@@ -1,6 +1,7 @@
 # 差分仿真工具（`tools/sim`）使用说明
 
-工具本体在仓库的 `tools/sim/`（`run.sh`、`simnet.c`、`e2e.c`、`t_rto.c`、`t_ack.c`），
+工具本体在仓库的 `tools/sim/`：`run.sh`（构建 + A/B 驱动）、`simnet.c`（假网络）、
+`simll.c`（**假 lowlevel** ✓）、`simdefs.h`（两侧共享声明），以及四个测试 `e2e.c` / `t_rto.c` / `t_ack.c` / `t_fuzz.c` ✓。
 本文是它的使用说明。所有命令都在**仓库根目录**执行。
 
 相关文档：[`../readme.md`](../readme.md)（概述/编译）、[`ffrdp-protocol.md`](ffrdp-protocol.md)（协议与优化）、
@@ -18,7 +19,7 @@
 ## 怎么跑
 
 ```bash
-bash tools/sim/run.sh                    # 跑全部（t_rto + t_ack + e2e）
+bash tools/sim/run.sh                    # 跑全部（t_rto + t_ack + t_fuzz + e2e）
 TESTS="e2e"  bash tools/sim/run.sh       # 只跑端到端
 TESTS="t_rto" bash tools/sim/run.sh      # 只跑 RTO 放大测试
 REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而用指定文件
@@ -28,6 +29,9 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 |---|---|---|
 | `TESTS` | 要跑哪些测试（可多选，空格分隔）| `t_rto t_ack t_fuzz e2e` |
 | `REF` | **基线**源码路径 | `git show HEAD:ffrdp.c` |
+| `ASAN=1` | 打开地址消毒器（并自动加上 `halt_on_error=1` 与 `setarch -R` ✓）| 关 |
+| `SIM_LL_DEADLINE=1` | 假 lowlevel 换**忠实模型**（只在"有帧到"或"期限到"时唤醒 ✓）| 关 ⇒ 用旧模型（每步无条件一次 TIMER ✗）|
+| `SIMLOG` | 逐行日志写到哪个文件 | `/tmp/ffrdp-sim-harness.log` |
 
 **被测版本恒为工作区当前 `ffrdp.c`** ✓ —— 所以典型用法是：改完代码直接 `bash tools/sim/run.sh`，
 看"对比 HEAD 有没有变化" ✓。
@@ -37,19 +41,26 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 
 ## 它是怎么做到的（读代码前的 30 秒）
 
-1. **时钟虚拟化**：`run.sh` 把 `ffrdp.c` 里 `get_tick_count()` 的真实时钟实现
-   （匹配 `ts.tv_nsec` 的那行）替换成 `return sim_tick();` ✓ ⇒ 时间由
-   `sim_setstep()` 驱动，**1 步 = 1 ms** ✓（不依赖真实时间 ⇒ 跑多快都一样 ✓）。
+1. **时钟虚拟化**：`run.sh` 把 `utils.c` 里**整条**
+   `uint32_t ms = ((uint32_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);` 换成 `uint32_t ms = sim_tick();`
+   （生成 `utils_sim.c` ✓，并断言替换成功 ✓）⇒ 时间由 `sim_tick()` 驱动，**1 步 = 1 ms** ✓。
+   ⚠️ 必须按**整条形状**匹配 ✓：只认 `ts.tv_nsec` 的松匹配曾经改掉一条注释、把裸语句留在文件作用域 ✗。
 2. **两台实例**：`e2e.c` 起两个 `ffrdp` 上下文（side 0 / side 1），形状与 `test.c` 相同 ——
-   每步各自投喂一个 1..`maxchunk` 字节的随机块并 `update()` ✓。
+   每步各自投喂一个 1..`maxchunk` 字节的随机块 ✓；**"驱动一步"按被测版本分两种** ✓：HEAD 侧调 `ffrdp_update()` ✓，
+   工作区侧**由假 lowlevel 驱动**（`sim_ll_run()`：先把已排队的包逐个走 RECV ✓，再走一次 TIMER ✓）——
+   与真传输的一圈同形 ✓。开关 `SIM_LL_DEADLINE=1` 换成忠实模型：只在"有帧到 / 期限到"时唤醒 ✓（默认模型每步无条件 TIMER ✗ ⇒
+   判"唤醒是否正常"必须打开这个开关 ✗）。
 3. **假网络**（`simnet.c`）：两个内存队列，提供丢包、连丢、延迟、抖动、
    **共享限速器（shaper）**、**令牌桶（policer）**、**重尾尖峰（spike）** ✓。
 4. **内存记账**：`calloc/free` 被计数 ⇒ 输出里的 `leaked=` 是**真正的泄漏** ✓（应当恒为 0 ✓）。
-5. **计数器自动适配**：`run.sh` 会探测源码里有没有 `counter_ack_recv` / `counter_recv_ooo` /
-   `counter_recv_dup` / `inflight` 等，自动加 `-DNEW_COUNTERS` 之类的开关 ✓
-   ⇒ **同一份测试能同时编译老源码和新源码** ✓（这是能做 A/B 的关键 ✓）。
+5. **两侧各一份头文件 + 按形状决定开关** ✓：两侧各自生成 `ffrdp_base.h` / `ffrdp_new.h` 与
+   `lowlevel_base.h` / `lowlevel_new.h` ✓（API 与 vtable 正在变 ✗ ⇒ 两侧不能共用一个头 ✓）。
+   开关也**按源码形状**判 ✓：`counter_ack_recv` / `counter_recv_ooo` / `counter_recv_dup` / `counter_rto_spurious` /
+   `counter_ooo_d1_24` … ⇒ `-DNEW_COUNTERS` / `-DRECV_OOO` / `-DDUP_REPORT` / `-DSPUR` / `-DOOO_HIST` / `-DHAVE_INFLIGHT` ✓；
+   还有 API 形状（`timeout_ms` / `addr` 形式的 `ffrdp_init` ⇒ `-DFFRDP_API_HAS_TIMEOUT` / `_HAS_ADDR` ✓）
+   与**是否由 lowlevel 驱动**（`-DFFRDP_LL_DRIVEN` ✓）⇒ **同一份测试能同时编译老源码和新源码** ✓（这是能做 A/B 的关键 ✓）。
 
-> 生成的中间文件（`ffrdp_base.c`、`ffrdp_new.c`、`*_base`、`*_new`、`simnet.o`）
+> 生成的中间文件（`ffrdp_base.c`、`ffrdp_new.c`、`ffrdp_*.h`、`lowlevel_*.h`、`utils_sim.c`、`*_base`、`*_new`、`*.o`）
 > 都在 `.gitignore` 里 ✓ —— 它们不是源码，每次 `run.sh` 都会重写 ✓。
 
 ## 四个测试
@@ -90,6 +101,10 @@ ASAN=1 TESTS="t_fuzz" bash run.sh   # 地址消毒器：不崩但越界读也要
 无限刷。实测：默认选项下 90 秒产出 **1.5GB / 5100 万行 DEADLYSIGNAL**（17MB/s ✗）—— 与一次
 "无截断重定向到文件"攒下的 **19GB** 完全吻合；同一跑法加上 `halt_on_error=1` 后只有 **469 字节** ✓
 （打脆弱版本时 81KB、并正常报出 8 个崩溃 ✓）。
+
+⚠️ **sanitizer 二进制必须关 ASLR** ✓：本机内核上 sanitizer 有时在启动时放不下 shadow memory ✗
+（实测：加 ASAN 的 `t_rto` 跑 20 次死 5 次 ✗；只关这一个进程的 ASLR 后 **20/20 干净** ✓）
+⇒ `run.sh` 在 `ASAN=1` 时自动给每个 sanitizer 二进制加 `setarch -R` ✓（不需要特权 ✓）。
 
 ⚠️ 两条纪律仍然成立：**跑崩溃侧时不要把输出直接重定向到文件**（用 `| head` 或 `timeout`）✗；
 **不要加 `handle_segv=0` 这类"看起来更彻底"的开关** ✗ —— 实测它们会让整跑在第一个崩溃处直接
@@ -221,7 +236,7 @@ c1 recv=  1.88MB resend= 3.44% maxrto=0 leaked=0
    - **乱序相关**（本仿真没有乱序模型 ⇒ 快重传纪律只能在真机验证 ✓）；
    - **收窄在途量**（仿真的 ACK 粒度比真机粗 ⇒ 小窗口在仿真里会直接断流 ✗ ⇒ 只能看真机 ✓）。
 4. **判据的顺序**：仿真判"**没有回归**" ⇒ 真机判"**确实有收益**" ✓ ——
-   两者缺一不可，任何一步不过就不要上机 ✗（`ffrdp-protocol.md` 10.4 里的 step27 就是仿真不过而放弃的例子 ✓）。
+   两者缺一不可，任何一步不过就不要上机 ✗（`ffrdp-protocol.md` §2.3.4 里的 step27 就是仿真不过而放弃的例子 ✓）。
 
 ## 局限（诚实列出）
 
