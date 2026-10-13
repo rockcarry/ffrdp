@@ -54,6 +54,7 @@
 #define HS_SYN_SENT 1   // 客户端发了 SYN，等 SYN-ACK
 #define HS_SYN_RCVD 2   // 服务端发了 SYN-ACK（半开），等 ACK
 #define HS_UP       3   // 已建立
+#define HS_FIN_WAIT 4   // 我方已发 FIN，等对端的 FIN（v2 主动关 ✓）
 #define HS_FAILED   5   // 握手超时（客户端）：此后 send/recv 一律按"已断"处理
                                   // 2026-10-12 真机 A/B：这个上限与 FFRDP_INFLIGHT_MAX 一起从 64 抬到
                                   // 128 后，两侧吞吐同时 ×3（客户端 2.5->7.1 MB/s，服务端 3.8->11.4），
@@ -370,6 +371,7 @@ typedef struct {
     uint32_t counter_to_hadack;   // 超时时：收到过 ack，但没有覆盖这一帧
     uint32_t counter_to_age_max;  // 超时时"距首发"的最大毫秒数
     uint32_t hs_state;            // 握手状态（HS_*；0 = 不走握手）—— 放 reserved 之后 ⇒ 不动清零跨度 ✓
+    uint32_t tick_last_recv;      // 最后一次**听到对端**（任意帧 ✓）—— keepalive 判活用（同样放 reserved 之后 ✓）
     uint32_t hs_tick;             // 上次发握手帧的时刻（重传计时）
     uint32_t hs_start;            // 本次握手开始（或上次重传）的时刻：与 handshake_ms 比就是超时
     uint32_t hs_retry;            // 已重传次数
@@ -977,6 +979,9 @@ static int ffrdp_frame_message(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, uint32_t head,
 static int ffrdp_isdead_locked(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 {
     if (c->hs_state == HS_FAILED) return 1;   // 握手超时：对端从未连上 ⇒ 就是"已断"
+    // keepalive：UP 且整整 idle_ms 没听到对端 ⇒ 判死（这是 v2 才有的"空闲也能判死" ✓）。
+    if (ffrdp->hs_enable && c->hs_state == HS_UP &&
+        (int32_t)(get_timestamp32_ms() - c->tick_last_recv) > ffrdp->idle_ms) return 1;
     if (!c->send_list_head) return 0;
     if (c->send_list_head->flags & FLAG_FIRST_SEND) {
         return (int32_t)get_timestamp32_ms() - (int32_t)c->send_list_head->tick_1sts > FFRDP_DEAD_TIMEOUT;
@@ -1029,6 +1034,31 @@ int ffrdp_recv(void *ctxt, int conn, char *buf, int len, int timeout_ms)
 // v2：失联是**每连接**的状态 ⇒ 按句柄问 ✓（v1 只有一个上下文，没法表达"哪条" ✗）。
 // 返回：1 = 这条连接已被判定失联（含"句柄指向一条已关闭的连接" ✓ —— 无连接可问，就当死 ✓）
 //       0 = 还活着；-1 = 参数错 / 句柄越界（与 send/recv 的 FFRDP_EINVAL 同值 ✓）
+// 主动关一条连接（v2）：走 FIN 挥手（对端回 FIN 才真完 ✓）；hs:0 时只做本地拆除 ✓。
+int ffrdp_close(void *ctxt, int conn)
+{
+    FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
+    FFRDPCONN    *c;
+    if (!ctxt || conn < 0 || conn >= FFRDP_MAXCONN) return -1;
+    pthread_mutex_lock(&ffrdp->lock);
+    c = ffrdp->table[conn];
+    if (!c) { pthread_mutex_unlock(&ffrdp->lock); return -1; }      // 已经关掉了 ⇒ 无效句柄 ✓
+    if (ffrdp->hs_enable && c->hs_state == HS_UP) {
+        // 正常路径：发 FIN，进 FIN_WAIT（重传与超时由 hs_* 那套接管 ✓）；
+        // 等对端的 FIN 到了才 DISCONN + 收摊 ✓（那种情况在 ffrdp_hs_rx 里处理 ✓）。
+        c->hs_state = HS_FIN_WAIT;
+        c->hs_start = get_timestamp32_ms();
+        ffrdp_hs_send(ffrdp, c, FFRDP_HS_FIN);
+        ffrdp_arm_timer(ffrdp);
+    } else {
+        // 还没 UP（握手中/已失败）、或老路径（没有 FIN 这东西 ✗）⇒ 本地拆除 + 报 DISCONN ✓。
+        ffrdp_emit(ffrdp, FFRDP_DISCONN, conn, c->peer_addr, NULL, 0);
+        ffrdp_conn_free(ffrdp, c);
+    }
+    pthread_mutex_unlock(&ffrdp->lock);
+    return 0;
+}
+
 int ffrdp_isdead(void *ctxt, int conn)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
@@ -1439,8 +1469,14 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     // ⚠️ 少了它，真 lowlevel 在"没有期限"时是**永久 select** ✓ ⇒ 没人来重传 ⇒ SYN 发不出去就永远发不出去 ✗
     //    （客户端建 lowlevel 用 "none"，socket 由它自己的工作线程懒建 ⇒ ffrdp_init 里第一发很可能
     //     撞上 sockfd < 0 ⇒ 静默失败 ✓）—— 仿真里假 lowlevel 没有这层懒建，所以永远看不见 ✗。
-    if (c->hs_state == HS_SYN_SENT || c->hs_state == HS_SYN_RCVD) {
+    if (c->hs_state == HS_SYN_SENT || c->hs_state == HS_SYN_RCVD || c->hs_state == HS_FIN_WAIT) {
         x = c->hs_tick + FFRDP_HS_RETRY_MS;
+        if (!due || (int32_t)(x - due) < 0) due = x;
+    }
+    // keepalive：UP 的连接也要有人来叫醒（否则真 lowlevel 会一直睡到下次有数据 ✗）——
+    // 半程探一次（周期跟 idle_ms 走 ⇒ 不会出现"探测周期比超时还长"的自相矛盾组合 ✓）。
+    if (c->hs_state == HS_UP) {
+        x = c->tick_last_recv + (uint32_t)(ffrdp->idle_ms / 2);
         if (!due || (int32_t)(x - due) < 0) due = x;
     }
     if (c->tick_send_query) { x = c->tick_send_query + FFRDP_QUERY_CYCLE; if (!due || (int32_t)(x - due) < 0) due = x; }
@@ -1509,6 +1545,27 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     uint8_t   data[8];
     // 先取应用排进来的消息并成帧：它们在上一轮 ffrdp_send 时只是被放进了队列。
     ffrdp_drain_tx(ffrdp, c);
+    // ── keepalive（v2：idle_ms 终于接上了 ✓）────────────────────────────────
+    // 空闲 = 半程没听到对端 ⇒ 主动发一个 QUERY 去敲它（对端的 ack 回来我们就续命 ✓）。
+    // 超过整整 idle_ms 还是没声 ⇒ 判死：报 DISCONN 并收摊（服务端）/ 置 HS_FAILED（客户端的
+    // 主连接不能从表里摘掉 ✗ —— 表槽永不回收 ✓，后续 send/recv 按"已断"报 CLOSED ✓）。
+    if (ffrdp->hs_enable && c->hs_state == HS_UP) {
+        uint32_t now2 = get_timestamp32_ms();
+        if ((int32_t)(now2 - c->tick_last_recv) >= ffrdp->idle_ms) {
+            c->hs_state = HS_FAILED;
+            ffrdp_emit(ffrdp, FFRDP_DISCONN, ffrdp_conn_handle(ffrdp, c), c->peer_addr, NULL, 0);
+            if (c != &ffrdp->conn) ffrdp_conn_free(ffrdp, c);
+            return;
+        }
+        if ((int32_t)(now2 - c->tick_last_recv) >= ffrdp->idle_ms / 2 &&
+            (c->tick_send_query == 0 || (int32_t)(now2 - c->tick_send_query) >= ffrdp->idle_ms / 2)) {
+            uint8_t q[1];
+            q[0] = FFRDP_FRAME_TYPE_QUERY;
+            if (ffrdp->lowlevel->send(ffrdp->lowlevel, c->peer_addr, q, 1) != 0) c->counter_send_err++;
+            c->tick_send_query = now2;
+            c->counter_send_query++;
+        }
+    }
     // how fast the work thread comes round: a starved lap delays acks and retransmits exactly
     // like a congested network does, and the two need to be told apart.
     c->counter_upd_cnt++;
@@ -1849,9 +1906,11 @@ static void ffrdp_hs_rx(FFRDPCONTEXT *ffrdp, uint64_t addr, uint8_t sub)
             // 陌生地址：只认 SYN ⇒ 建一条**半开**连接（方案 A：按需分配 ✓）。
             // 半开必须计时 + 封顶（见 tick）：否则伪造源地址的 SYN 能一路吃内存。
             if (sub != FFRDP_HS_SYN) return;
+        // 新连接（半开）：先盖上"刚听到"的时间戳 ✓ —— 否则 keepalive 会把它当"已经静了很久" ✓✗。
             c = ffrdp_conn_new(ffrdp, addr, &handle);
             if (!c) { ffrdp->table[0]->counter_hs_refused++; return; }   // 表满/内存不足 ⇒ 丢弃（不静默 ✓）
             c->hs_state = HS_SYN_RCVD;
+            c->tick_last_recv = get_timestamp32_ms();       // 半开也算听到了 ✓
             c->hs_start = get_timestamp32_ms();
             ffrdp_hs_send(ffrdp, c, FFRDP_HS_SYN_ACK);
             return;
@@ -1862,11 +1921,15 @@ static void ffrdp_hs_rx(FFRDPCONTEXT *ffrdp, uint64_t addr, uint8_t sub)
         }
         if (sub == FFRDP_HS_ACK && c->hs_state == HS_SYN_RCVD) {          // 握手完成
             c->hs_state = HS_UP;
+            c->tick_last_recv = get_timestamp32_ms();   // keepalive 计时从这里起 ✓（刚听到对端 ✓）
             c->flags   |= FLAG_CONNECTED;
             ffrdp_emit(ffrdp, FFRDP_ACCEPT, ffrdp_conn_handle(ffrdp, c), addr, NULL, 0);
             return;
         }
         if (sub == FFRDP_HS_FIN) {                                        // 对端要关
+            // 四次挥手：我方还没发过 FIN ⇒ **回一个** ✓（否则对端永远不知道我们收到了 ✗）；
+            // 然后本地收摊 ✓（不做半关 ✓）。
+            if (c->hs_state != HS_FIN_WAIT) ffrdp_hs_send(ffrdp, c, FFRDP_HS_FIN);
             ffrdp_emit(ffrdp, FFRDP_DISCONN, ffrdp_conn_handle(ffrdp, c), c->peer_addr, NULL, 0);
             ffrdp_conn_free(ffrdp, c);
             return;
@@ -1879,6 +1942,7 @@ static void ffrdp_hs_rx(FFRDPCONTEXT *ffrdp, uint64_t addr, uint8_t sub)
     if (!c) return;
     if (sub == FFRDP_HS_SYN_ACK && c->hs_state == HS_SYN_SENT) {
         c->hs_state = HS_UP;
+        c->tick_last_recv = get_timestamp32_ms();       // 同上 ✓
         c->flags   |= FLAG_CONNECTED;
         ffrdp_hs_send(ffrdp, c, FFRDP_HS_ACK);
         ffrdp_emit(ffrdp, FFRDP_CONNECT, 0, c->peer_addr, NULL, 0);
@@ -1897,6 +1961,10 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
     if (!c) { ret = -1; goto out; }
     if (type == FFRDP_LOWLEVEL_TYPE_RECV) {
         FFRDP_LOWLEVEL_MSG *msg = (FFRDP_LOWLEVEL_MSG*)buf;
+        // ⚠️ keepalive 的"听到对端"**不能刷在这里** ✗：这里的 `c` 是 `table[0]`（主连接）✓，
+        //    而真正收数据的是下面 `ffrdp_conn_by_addr()` 解出来的 `cc` ✓ —— 刷错连接的话，
+        //    服务端那条 accept 连接会一直"没听到" ✓✗ ⇒ 到 idle_ms 被误判死（实测每个 e2e 场景
+        //    都在 5012ms 被杀 ✓）。所以刷新放到底下 `cc` 那一句之后 ✓。
         if (len != (int)sizeof(FFRDP_LOWLEVEL_MSG) || !msg->buf || msg->len <= 0) ret = -1;
         else if (ffrdp->hs_enable && msg->len >= 2
                  && ((uint8_t*)msg->buf)[0] == FFRDP_FRAME_TYPE_HANDSHAKE) {
@@ -1913,6 +1981,9 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
             // "连上之后，别人的包不理"这句以前只是注释 ✗ —— 现在由查表真正执行 ✓：
             // 来源地址不是本连接对端的帧，一律丢弃并计数（不静默 ✓）。这就是 v2 的按地址分发。
             cc = ffrdp_conn_by_addr(ffrdp, msg->addr);
+            // keepalive：**这条连接**刚有帧进来 ⇒ 续命 ✓（不管是数据帧还是半开期的帧 ✓ ——
+            // "听到对端"本身就是事实 ✓；刷不刷得上跟"这帧最后收不收"是两件事 ✓）。
+            if (cc && ffrdp->hs_enable) cc->tick_last_recv = get_timestamp32_ms();
             if (!cc) {
                 c->counter_rx_foreign++;
             } else if (ffrdp->hs_enable && cc->hs_state != HS_UP) {
@@ -1953,10 +2024,12 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
             FFRDPCONN *cc = ffrdp->table[i];
             uint32_t   d;
             if (!cc) continue;
-            if (ffrdp->hs_enable && (cc->hs_state == HS_SYN_SENT || cc->hs_state == HS_SYN_RCVD)) {
+            if (ffrdp->hs_enable && (cc->hs_state == HS_SYN_SENT || cc->hs_state == HS_SYN_RCVD ||
+                                     cc->hs_state == HS_FIN_WAIT)) {
                 uint32_t now = get_timestamp32_ms();
                 if ((int32_t)(now - cc->hs_tick) >= FFRDP_HS_RETRY_MS)
-                    ffrdp_hs_send(ffrdp, cc, cc->hs_state == HS_SYN_SENT ? FFRDP_HS_SYN : FFRDP_HS_SYN_ACK);
+                    ffrdp_hs_send(ffrdp, cc, cc->hs_state == HS_SYN_SENT ? FFRDP_HS_SYN :
+                                                cc->hs_state == HS_SYN_RCVD ? FFRDP_HS_SYN_ACK : FFRDP_HS_FIN);
                 if ((int32_t)(now - cc->hs_start) >= (int32_t)ffrdp->handshake_ms) {
                     if (ffrdp->is_server) {
                         // 半开连接计时封顶：没人来完成握手就把这条连接放掉（表槽不回收 ✓）。

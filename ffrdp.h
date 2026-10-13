@@ -102,6 +102,15 @@ void  ffrdp_flush(void *ctxt, int conn);                    // 把还没攒满�
 void  ffrdp_dump (void *ctxt, int conn, int clearhistory);  // conn < 0 = 总状态；conn >= 0 = 该连接的详细状态
 
 int   ffrdp_isdead(void *ctxt, int conn);  // 诊断用：**这条连接**是否已被判定失联 ✓
+
+/* ffrdp_close：**主动**关一条连接（v2 新增 ✓）。
+ *   返回：0 = 已开始关闭 ✓；-1 = 参数错 / 句柄无效（含已经关掉的 ✓）。
+ *   走 FIN 挥手：我方发 FIN ⇒ 对端回 FIN ⇒ 双方才认为断开（期间对方先发 FIN 也认 ✓）。
+ *   ⚠️ `hs:0`（老路径）没有 FIN 这东西 ⇒ 只做**本地**拆除 + 报 FFRDP_DISCONN ✓
+ *      （对端不会收到任何通知 ✗ —— 这是老路径的固有限制 ✓）。
+ *   ⚠️ 不做半关 ✓：收到 FIN 即整条结束（与 v1 一致 ✓）。
+ */
+int   ffrdp_close(void *ctxt, int conn);
                                            //   1 = 失联（句柄指向已关闭的连接也算 ✓）/ 0 = 活着 / -1 = 参数错
 
 #endif

@@ -212,6 +212,42 @@ int main(void)
     check(sc->nconn == 2 && sc->table[2] == NULL, "没有建出第三条连接");
     ffrdp_exit(p_sc);
 
+    /* ── 阶段 6：主动关闭（ffrdp_close）—— 四次挥手里"我方发起"的那一半 ──── */
+    // 要验的三件事：① close 受理后进 FIN_WAIT、**先不报** DISCONN（还没等到对方 ✓）；
+    //               ② 收到对端的 FIN 才报 DISCONN 并收摊；③ 期间连接一直都在（不做半关 ✗）。
+    // 手法照这个文件的习惯：直接注入握手帧驱动服务端 ✓（不需要真路由 ✓）。
+    printf("── 阶段 6：ffrdp_close（主动关：我方发 FIN，等对端 FIN 才断）\n");
+    g_connect = g_accept = g_disconn = 0;
+    sim_reset();
+    p_srv = ffrdp_init("ffrdps://127.0.0.1:8001,mss:1024,fec:0,hs:1", on_event, NULL);
+    check(p_srv != NULL, "服务端建起来了");
+    if (p_srv) {
+        FFRDPCONTEXT *s6 = (FFRDPCONTEXT*)p_srv;
+        int           st = 0;
+
+        sim_setstep(st++); sim_begin(0); sim_send_from(0, A_X, hsbuf, hs_frame(hsbuf, FFRDP_HS_SYN));
+        sim_begin(0); sim_ll_run(0, p_srv);
+        sim_setstep(st++); sim_begin(0); sim_send_from(0, A_X, hsbuf, hs_frame(hsbuf, FFRDP_HS_ACK));
+        sim_begin(0); sim_ll_run(0, p_srv);
+        check(g_accept == 1 && s6->table[1] != NULL && s6->table[1]->hs_state == HS_UP,
+              "先握手成功（连接 UP ✓，ACCEPT ×1）");
+
+        check(ffrdp_close(p_srv, 1) == 0, "ffrdp_close(服务端, accept 句柄) 受理 ✓");
+        check(s6->table[1] != NULL && s6->table[1]->hs_state == HS_FIN_WAIT,
+              "进入 FIN_WAIT（FIN 已发、等对端 ✓）");
+        check(g_disconn == 0, "还没等到对端 FIN ⇒ **先不报** DISCONN ✓");
+        check(s6->table[1] != NULL, "连接仍在（不做半关，但也没提前拆 ✗）");
+
+        sim_setstep(st++); sim_begin(0); sim_send_from(0, A_X, hsbuf, hs_frame(hsbuf, FFRDP_HS_FIN));
+        sim_begin(0); sim_ll_run(0, p_srv);
+        check(g_disconn == 1, "收到对端 FIN ⇒ 报 DISCONN ✓");
+        check(s6->table[1] == NULL, "连接被收掉（表槽清空 ✓）");
+        check(ffrdp_isdead(p_srv, 1) == 1, "按句柄问 ⇒ 已死（1 ✓）");
+        check(ffrdp_close(p_srv, 1) == -1, "对已关掉的句柄再 close ⇒ -1（无效句柄 ✓）");
+        check(s6->nconn == 2, "水位不回收（索引永不复用 ✓）");
+        ffrdp_exit(p_srv);
+    }
+
     check(sim_alloc() == sim_freed(), "全部还回去：sim_alloc == sim_freed（无泄漏）");
     printf("── 结果：%s\n", g_fail ? "FAIL" : "OK");
     printf("── verdict -> %s\n", g_fail ? "FAIL" : "OK");
