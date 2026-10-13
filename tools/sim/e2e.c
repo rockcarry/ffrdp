@@ -73,9 +73,12 @@ struct e2e_app { int conn; };
 static void *TEST_INIT_CB(const char *ip, int port, int server, int mss, void *cbctx)
 {
     char params[128];
-    // E2E_HS=1 ⇒ 这一轮跑"带三次握手"的路径（默认仍是关 ⇒ 老场景的判据不动 ✓）。
+    // E2E_HS=1 ⇒ 强制握手；E2E_HS=0 ⇒ 强制老路径（用来钉"老路径一字未变" ✓）；
+    // 不设 ⇒ 跟随协议默认（v2 起默认就是握手 ✓）。
+    const char *hs = getenv("E2E_HS");
     snprintf(params, sizeof(params), "%s://%s:%d,mss:%d,fec:0%s",
-             server ? "ffrdps" : "ffrdpc", ip, port, mss, getenv("E2E_HS") ? ",hs:1" : "");
+             server ? "ffrdps" : "ffrdpc", ip, port, mss,
+             hs ? (atoi(hs) ? ",hs:1" : ",hs:0") : "");
     return ffrdp_init(params, e2e_event, cbctx);
 }
 #elif defined(FFRDP_API_HAS_ADDR)
@@ -238,11 +241,11 @@ int main(int argc, char *argv[])
         check(l10 >= loss * 100.0 - 10.0 && l10 <= loss * 100.0 + 10.0, "observed loss c1->c0 far from the configured rate");
     }
     // 3) 交付上界：收到的不可能比发出的多（两边都发，所以用各自的对端）
-    //    走握手的那一轮另加一条：**必须真的传过数据** ✓ —— 普通场景故意不看统计量
-    //    （调参不该被判失败 ✓），但 hs 组的存在意义就是"accept 之后收发都能用" ✓，
-    //    recv=0 必须算失败 ✗（曾经因为没有这条，一个字节没传也判 OK ✗）。
-    if (getenv("E2E_HS")) {
-        check(r1 > 0 && r0 > 0, "E2E_HS: no application data got through after the handshake");
+    //    **握上手了**就必须真的传过数据 ✓：判据用"服务端拿到了 accept 句柄"（app1.conn != 0）
+    //    来界定 ⇒ 老路径（不下发 accept）与连不上的一轮都不适用 ✓，不靠环境变量猜 ✓。
+    //    （曾经没有这条：一个字节没传也判 OK ✗。）
+    if (app1.conn != 0) {
+        check(r1 > 0 && r0 > 0, "handshake completed but no application data got through");
     }
     check(r1 >= 0 && r0 >= 0, "negative byte count");
     printf("       verdict -> %s\n", g_fail ? "FAIL" : "OK");

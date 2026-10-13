@@ -51,7 +51,9 @@
 static void *TEST_INIT(const char *ip, int port, int server, int mss)
 {
     char params[128];
-    snprintf(params, sizeof(params), "%s://%s:%d,mss:%d,fec:0",
+    // hs:0：这几个测试跑的是"单连接 + 裸帧"的老路径，不经过握手 ✓
+    // （v2 起默认就是握手 ⇒ 想要老路径必须显式关掉 ✓）。
+    snprintf(params, sizeof(params), "%s://%s:%d,mss:%d,fec:0,hs:0",
              server ? "ffrdps" : "ffrdpc", ip, port, mss);
     return ffrdp_init(params, NULL, NULL);
 }

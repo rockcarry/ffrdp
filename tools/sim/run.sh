@@ -100,7 +100,7 @@ gcc -O1 -w $HAVE_B -DSIMLL_BASE -c simll.c -o simll_base.o
 # utils.c lives one level up (run.sh works from tools/sim).
 # -I../..: the copy sits here, so its quoted includes ("utils.h") need the repo root on the path.
 gcc -O1 -w -I../.. -c utils_sim.c -o utils.o
-TESTS="${TESTS:-t_rto t_ack t_fuzz t_peer t_handshake hs-e2e e2e}"
+TESTS="${TESTS:-t_rto t_ack t_fuzz t_peer t_handshake t_crypto hs-e2e e2e-raw e2e}"
 
 # 每一侧的输出同时进终端与一份日志：末尾的"判定汇总"从日志里读，免得靠人眼看统计数字。
 # 统计行（resend%、rto_floor、ooo 直方图……）随负载与旋钮变化，不是判据。
@@ -110,8 +110,8 @@ run() { "$@" 2>&1 | tee -a "$SIMLOG" || true; }
 for t in $TESTS; do
     # v2-only 的测试（接口只有工作区那份才有）⇒ 不编 HEAD 那一份 ✗
     # 有的 TESTS 项只是"派发用的场景组"，复用别的测试的二进制（hs-e2e ⇒ e2e ✓）
-    BUILD_T=$t; case $t in hs-e2e) BUILD_T=e2e ;; esac
-    V2ONLY=""; case $BUILD_T in t_handshake) V2ONLY=1 ;; esac
+    BUILD_T=$t; case $t in hs-e2e|e2e-raw) BUILD_T=e2e ;; esac
+    V2ONLY=""; case $BUILD_T in t_handshake|t_crypto) V2ONLY=1 ;; esac
     for v in base new; do
         if [ -n "$V2ONLY" ] && [ "$v" = base ]; then continue; fi
         sed "s|#include \"../../ffrdp.c\"|#include \"ffrdp_$v.c\"|; s|#include \"../../ffrdp.h\"|#include \"ffrdp_$v.h\"|" ${BUILD_T}.c > ${BUILD_T}_$v.c
@@ -169,20 +169,36 @@ for t in $TESTS; do
         echo
         echo "===== t_peer: multi-peer routing by addr (fake lowlevel) ====="
         echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_peer_new ;;
+    t_crypto)
+        # 加密回调：协议层把帧载荷交给应用（原地改、长度不变 ⇒ 对 send/recv 透明 ✓）
+        # 两条出口（攒满 smss / 超时短帧）都必须挂上，否则一种帧明文出去 ✗。
+        echo
+        echo "===== t_crypto: 加密回调（两条出口 + 不强制加密的对照）====="
+        echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_crypto_new ;;
     t_handshake)
         # 握手 + 多连接：一个服务端 + 两个客户端，验 ACCEPT/CONNECT 与"不串台" ✓
         echo
         echo "===== t_handshake: 三次握手 + 多连接（两个对端不串台）====="
         echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_handshake_new ;;
     hs-e2e)
-        # 端到端 + 三次握手（v2 的新路径）。单独一组：上面那 17 个场景是"握手关"的判据，
-        # 不能混进来（否则旧判据就废了 ✓）。这里看的是 work 侧能不能**建连 + 传数据 + 判据 OK** ✓。
+        # 端到端**走握手**（v2 起就是默认路径 ✓，这里不再设 E2E_HS）。
+        # 一小撮场景的快速组；完整的 17 个场景在 e2e 组（现在也是握手路径 ✓）。
         echo
         echo "===== hs-e2e: end to end over the handshake (hs:1) ====="
         for cfg in "0.0 0 4 0 4000 16384" "0.05 0 4 0 4000 16384" "0.0 0 40 0 4000 16384" "0.0 0 4 1 4000 16384 1200 200"; do
             echo "-- $cfg --"
-            printf "  HEAD " | tee -a "$SIMLOG"; run env E2E_HS=1 $RUN ./e2e_base $cfg
-            printf "  work " | tee -a "$SIMLOG"; run env E2E_HS=1 $RUN ./e2e_new  $cfg
+            printf "  HEAD " | tee -a "$SIMLOG"; run $RUN ./e2e_base $cfg
+            printf "  work " | tee -a "$SIMLOG"; run $RUN ./e2e_new  $cfg
+        done ;;
+    e2e-raw)
+        # 老路径（hs:0 = 不下发握手，与 v1 线上行为一致 ✓）。这一组是"老路径一字未变"的
+        # 回归网：它的输出应当和**翻默认之前**逐字相同 ✓（翻默认只该动握手那条路 ✓）。
+        echo
+        echo "===== e2e-raw: same scenarios, handshake switched OFF (hs:0) ====="
+        for cfg in "0.0 0 4 0 4000 16384" "0.05 0 4 0 4000 16384" "0.0 0 40 0 4000 16384" "0.0 0 4 1 4000 16384 1200 200"; do
+            echo "-- $cfg --"
+            printf "  HEAD " | tee -a "$SIMLOG"; run env E2E_HS=0 $RUN ./e2e_base $cfg
+            printf "  work " | tee -a "$SIMLOG"; run env E2E_HS=0 $RUN ./e2e_new  $cfg
         done ;;
     e2e)
         echo

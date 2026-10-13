@@ -422,7 +422,8 @@ typedef struct {
     int               maxconn;       // 配置：最大连接数（"maxconn:N"，默认 FFRDP_MAXCONN）
     int               handshake_ms;  // 配置：握手超时（"handshake:N"，默认 10000）
     int               idle_ms;       // 配置：空闲判死超时（"idle:N"，默认 5000）
-    int               hs_enable;     // 配置：是否走三次握手（"hs:1"，默认 0 ⇒ 线上行为与 v1 一致 ✓）
+    int               hs_enable;     // 配置：是否走三次握手（"hs:1" 开 / "hs:0" 关，**默认 1** ✓；
+                                     // hs:0 才是与 v1 线上行为一致的那条路 ✓）
     int               is_server;     // 角色（v1 的 FLAG_SERVER 搬到进程级：它是"这个进程"的属性，不是连接的 ✗）
     int               next_slot;     // 连接表里下一个可用的下标（**永不复用** ✓，见 ffrdp-v2.h）
     pthread_mutex_t   lock;          // 保护 app_tx_* / recv_buff+recv_size/head/tail / peer_addr / flags / 上列几个
@@ -615,6 +616,8 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int clearhistory)
 static int  ffrdp_hs_send(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, uint8_t sub);   // 握手：定义在 lowlevel 回调之前
 static void ffrdp_hs_rx(FFRDPCONTEXT *ffrdp, uint64_t addr, uint8_t sub);
 static int  ffrdp_conn_handle(FFRDPCONTEXT *ffrdp, FFRDPCONN *c);
+static long ffrdp_emit(FFRDPCONTEXT *ffrdp, int type, int conn, uint64_t addr, void *buf, int len); // 事件出口
+static void ffrdp_frame_encrypt(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_FRAME_NODE *node);          // 加密回调
 // 全文件唯一的一条函数前置声明：ffrdp_init（在上面）要把这个回调**当值**交给传输层，而它的定义
 // 在协议那一大段的后面。想连它一起消掉，只能把 ffrdp_init 也挪到最后 —— 那会让这个文件的入口
 // 跑到末尾。原来这里还有另外五条声明，已经靠调整函数位置消掉了。
@@ -672,7 +675,7 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
     char         buf[192];
     char        *text, *addr, *key;
     int          server = 0, smss = FFRDP_MAX_MSS, sfec = 0;
-    int          maxconn = FFRDP_MAXCONN, handshake_ms = 10000, idle_ms = 5000, hs_enable = 0;
+    int          maxconn = FFRDP_MAXCONN, handshake_ms = 10000, idle_ms = 5000, hs_enable = 1;
 
     if (!params) { printf("ffrdp_init: params is NULL\n"); return NULL; }
     snprintf(buf, sizeof(buf), "%s", (char*)params);
@@ -699,7 +702,7 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
         else if (!strcmp(key, "idle_ms"))      idle_ms      = val;
         else if (!strcmp(key, "mss"))       smss         = val;
         else if (!strcmp(key, "fec"))       sfec         = val;
-        else if (!strcmp(key, "hs"))        hs_enable    = val;   // 三次握手开关（默认关 ✓）
+        else if (!strcmp(key, "hs"))        hs_enable    = val;   // 三次握手开关（**默认开** ✓；hs:0 关掉 ⇒ v1 行为 ✓）
         else { printf("ffrdp_init: unknown option \"%s\"\n", key); return NULL; }
         key = next;
     }
@@ -906,6 +909,22 @@ out:
 // 数据来自应用队列的环形缓冲：head 是负载起点，逐段用 ringbuf_read 拷进帧里 —— 这里只读不推进
 // 队列状态，推进由调用方在成帧成功之后做（见 ffrdp_drain_tx）。
 // 帧数上限（FFRDP_MAX_WAITSND）不在这里判：它在 ffrdp_send 的受理判据里判（注释修正之二）。
+// ── 加密回调（v2）────────────────────────────────────────────────────────────
+// 帧**定稿**时把载荷交给应用（FFRDP_ENCRYPT ✓）：原地改、长度不变 ⇒ 对 send/recv 完全透明 ✓。
+// ⚠️ 帧有**两条**出口，每一处定稿都必须调它 ✓✗：
+//      ① 攒满一个 smss（ffrdp_frame_message ✓）
+//      ② 超时 / flush 的**短帧**（ffrdp_drain_tx ✓）
+//    只挂一处 ⇒ 另一种帧明文出去 ✗，对端却按密文解 ⇒ 数据直接坏掉 ✗
+//    （v1 那版 AES 就只挂在 ① 上 ✗；本仓库没编它，所以那个坑一直没暴露 ✓）。
+// 只做一次：帧节点之后会被**原样重传** ✓ ⇒ 重传的是同一份密文 ✓
+//    （重传再加密一次，对带状态/随机 IV 的密码就是解不开 ✗）。
+static void ffrdp_frame_encrypt(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_FRAME_NODE *node)
+{
+    if (!node || !ffrdp->app_cb) return;   // 没挂回调 = 不加密 ✓（线上原样 ✓）
+    ffrdp_emit(ffrdp, FFRDP_ENCRYPT, ffrdp_conn_handle(ffrdp, c),
+               c->peer_addr, node->data + 4, frame_payload_size(node));
+}
+
 static int ffrdp_frame_message(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, uint32_t head, int len)
 {
     FFRDP_FRAME_NODE *spare = NULL, *node;
@@ -940,9 +959,7 @@ static int ffrdp_frame_message(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, uint32_t head,
                             c->cur_new_node->data + 4 + c->cur_new_size, (uint32_t)size);
         c->cur_new_size += size; n -= size;
         if (c->cur_new_size == c->smss) {
-#ifdef CONFIG_ENABLE_AES256
-            if ((c->flags & FLAG_TX_AES256)) frame_node_encrypt(c->cur_new_node, &c->aes_encrypt_key, AES_ENCRYPT);
-#endif
+            ffrdp_frame_encrypt(ffrdp, c, c->cur_new_node);   // 出口 ①：攒满 smss ✓
             list_enqueue(&c->send_list_head, &c->send_list_tail, c->cur_new_node);
             c->send_seq++; c->wait_snd++;
             c->cur_new_node = NULL;
@@ -1042,9 +1059,11 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         // a frame in (see ffrdp_recv_data_frame), and this keeps a future path from doing it silently.
         if (dist == 0 && (size = frame_payload_size(c->recv_list_head)) > 0 &&
             size <= (int)(sizeof(c->recv_buff) - c->recv_size)) {
-#ifdef CONFIG_ENABLE_AES256
-            if ((c->flags & FLAG_RX_AES256)) frame_node_encrypt(c->recv_list_head, &c->aes_decrypt_key, AES_DECRYPT);
-#endif
+            // 收侧：位置与 v1 的 AES 一致 ✓ —— 就在把载荷写进应用缓冲之前，
+            // 而且只在这一帧**真的要交付**时解一次 ✓（乱序 / 重复帧在那之前就已经丢掉 ✓）。
+            if (ffrdp->app_cb)
+                ffrdp_emit(ffrdp, FFRDP_DECRYPT, ffrdp_conn_handle(ffrdp, c),
+                           c->peer_addr, c->recv_list_head->data + 4, size);
             c->recv_tail = ringbuf_write(c->recv_buff, sizeof(c->recv_buff), c->recv_tail, c->recv_list_head->data + 4, size);
             c->recv_size+= size;
             c->recv_seq++; c->recv_seq &= 0xFFFFFF;
@@ -1462,6 +1481,7 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     if (c->cur_new_node && ((int32_t)get_timestamp32_ms() - (int32_t)c->cur_new_tick > FFRDP_FLUSH_TIMEOUT || c->flags & FLAG_FLUSH)) {
         c->cur_new_node->data[0] = FFRDP_FRAME_TYPE_SHORT;
         c->cur_new_node->size    = 4 + c->cur_new_size;
+        ffrdp_frame_encrypt(ffrdp, c, c->cur_new_node);   // 出口 ②：超时/flush 的短帧 ✓
         list_enqueue(&c->send_list_head, &c->send_list_tail, c->cur_new_node);
         c->send_seq++; c->wait_snd++;
         c->cur_new_node = NULL;
