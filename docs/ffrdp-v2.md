@@ -25,7 +25,7 @@ ffrdps://0.0.0.0:8000,maxconn:16,handshake_ms:10000,idle_ms:5000,mss:1024,fec:0,
 | `maxconn` | 连接表上限（服务端；含内嵌的主连接 ✓）| 16 |
 | `hs` | 三次握手开关：`1` 走握手 / `0` 走 v1 那条老路 | **1** |
 | `handshake_ms` | 等 SYN-ACK 的时限（握手重传间隔同此）| 10000 |
-| `idle_ms` | 空闲判死 / keep-alive 超时 | 5000 |
+| `idle_ms` | keep-alive：**半程**（`idle_ms/2`）没听到对端就发一个 QUERY 去确权 ✓；整整 `idle_ms` 没听到 ⇒ 判死（报 `DISCONN` 并收摊 ✓）。只在 `hs:1` 下生效 ✓ | 5000 |
 | `mss` | 单帧最大载荷 | 由对端学习 + 上限 |
 | `fec` | FEC 冗余 | 0 |
 
@@ -86,7 +86,14 @@ ffrdps://0.0.0.0:8000,maxconn:16,handshake_ms:10000,idle_ms:5000,mss:1024,fec:0,
 - 构造方式照抄 QUERY ✓（不走 `frame_node_new` ✗ ⇒ 绕开"type > SHORT 就多 2 字节 FEC 尾巴"的规则 ✓）；
   **不进数据 ARQ** ✓ —— 它有自己的重传计时器（就是 `handshake_ms` ✓）。
 - 半开连接有**上限** ✓（`handshake_ms` 计时 + 计数封顶 ✓）⇒ 伪造源地址的 SYN 不能一路吃内存 ✓。
-- 收到 **FIN** ⇒ 报 `FFRDP_DISCONN` 并放掉那条连接 ✓（表槽清空 ✓、水位不回收 ✓）。
+- 收到 **FIN** ⇒ 先**回一个** FIN（我方还没发过的话 ✓），再报 `FFRDP_DISCONN` ✓；
+  服务端把那条连接放掉 ✓（表槽清空 ✓、水位不回收 ✓）；客户端只有主连接 ⇒ **不摘表** ✗，
+  而是置 `HS_FAILED` ✓（`isdead` 报 1 ✓、`send`/`recv` 报 `CLOSED` ✓）。
+- 主动关：**`ffrdp_close(ctxt, conn)`** ✓（v2 新增 ✓）⇒ 发 FIN、进 `FIN_WAIT` ✓ ⇒ 等对端的 FIN
+  才 `DISCONN` + 收摊 ✓；FIN 也走重传（与 SYN 同一套计时器 ✓），实在等不到就按 `handshake_ms` 收尾 ✓。
+  ⚠️ `hs:0` 下没有 FIN 这东西 ✗ ⇒ `ffrdp_close` 只做**本地拆除** + 报 `DISCONN` ✓。
+- 空闲探活（`idle_ms`）与 FIN 是**两件事** ✓：前者是"对端还在不在"的确认（QUERY + ack ✓），
+  后者是"我要走了"的通知 ✓ —— 空闲但活着的连接**不会被误杀** ✓（`t_keepalive` 钉住 ✓）。
 - v1 收到 v2 的握手帧会**静默丢弃** ✓（正好符合"不互通、但能识别并丢弃" ✓）。
 
 ## 六、接口清单与接线状态
@@ -100,12 +107,15 @@ ffrdps://0.0.0.0:8000,maxconn:16,handshake_ms:10000,idle_ms:5000,mss:1024,fec:0,
 | `FFRDP_ENCRYPT` / `FFRDP_DECRYPT` | ✅ 已接线 ✓（协议**原样**交付载荷 ✓，长度不改 ✓；两条出口都挂 ✓，`t_crypto` 验收 ✓）|
 | `FFRDP_RECVDATA` | ✅ 已接线 ✓（`t_recvdata` 验收 ✓）——`FFRDP_CONSUMED` ⇒ 应用在回调里取走、协议不留 ✓；`NOT_CONSUMED` ⇒ 照旧留在缓冲里等 `ffrdp_recv` ✓ |
 | `ffrdp_isdead` | ✅ 已按句柄收口 ✓：`ffrdp_isdead(ctxt, conn)` ✓（1 = 失联（句柄指向已关闭的连接也算 ✓）/ 0 = 活着 / -1 = 参数错或句柄越界 ✓）|
+| `ffrdp_close` | ✅ 已落地 ✓（`t_handshake` 阶段 6/7 验收 ✓）——`0` = 受理 ✓ / `-1` = 无效句柄 ✓；走 FIN 挥手（`hs:1`）或本地拆除（`hs:0`）✓ |
+| `idle_ms`（keep-alive）| ✅ 已接线 ✓（`t_keepalive` 验收 ✓）——探活用 QUERY ✓；判死时服务端收摊 ✓、客户端置 `HS_FAILED` ✓ |
+| 句柄失效后的 `send`/`recv` | ✅ 已明确 ✓：**对端 FIN / keepalive 判死之后**，旧句柄上 `send`/`recv` 返回 `FFRDP_CONN_INVALID`（-1 ✓，表槽已清）/ `FFRDP_CLOSED`（0 ✓，正是"等的时候断的"）⇒ **不会崩** ✓（真机上这里曾经是空指针/释放后使用 ⇒ SIGSEGV ✗，已修 ✓）|
 
 ## 七、怎么验
 
 ```
 bash build.sh                 # 真机侧（ffrdp.c + lowlevel-udp.c + socket.c + utils.c + test.c）
-bash tools/sim/run.sh         # 仿真侧：7 个测试 + 场景组（详见 docs/sim-test.md）
+bash tools/sim/run.sh         # 仿真侧：9 个测试 + 场景组（详见 docs/sim-test.md）
 ```
 
 - `tools/sim/run.sh` 会把每个测试编两份：**HEAD 那份**与**工作区那份** ✓ ⇒ 新旧行为可直接逐字对照 ✓。
