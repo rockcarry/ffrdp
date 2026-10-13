@@ -22,6 +22,13 @@
 #     CLEAN=1        跑完删掉远端 /tmp 里的二进制与日志
 #     DRY=1          只打印将要做什么，不碰网络（用来检查参数/语法）
 #
+#   互通自检模式（**本地**跑，不走 ssh ✓）：
+#     V1_REF=<v1 二进制>   自动跑一轮"v2 ↔ v1.2.x"互通矩阵，把兼容性变成例行判据 ✓：
+#                          ① v1 服务端 ← v2 客户端（两侧 hs:0）⇒ 必须通 ✓
+#                          ② v2 服务端 ← v1 客户端（两侧 hs:0）⇒ 必须通 ✓
+#                          ③ v2 服务端默认(hs:1) ← v1 客户端 ⇒ 必须**不通**（这就是"默认不互通" ✓）
+#                          用法: V1_REF=/tmp/v1wt/test_ffrdp ./test.sh dist/test_ffrdp_v2fix x 2>/dev/null
+#
 #   依赖: ssh / scp（必需）、nc、md5sum、timeout、stdbuf；sshpass 与 column 可选；
 #         远端需要 pgrep / pkill / wc。
 set -u
@@ -40,6 +47,57 @@ usage() {
     exit 2
 }
 [ -n "$BIN" ] || usage
+
+# ══ V1_REF：本地互通自检（三条判据 ✓）══════════════════════════════════════════
+# 为什么要有它：hs:0 是"与 v1.x 互通"的唯一开关 ✓（默认 hs:1 不互通 ✓，见 docs/ffrdp-v2.md §八）。
+# 兼容性靠"读代码觉得一样"是不够的 ✗ —— 这里把它变成可执行的判据 ✓：谁把老路径改坏了，这里立刻红 ✓。
+if [ -n "${V1_REF:-}" ]; then
+    V1="$V1_REF"; V2="$BIN"
+    [ -x "$V1" ] || { echo "✗ V1_REF 不是可执行文件：$V1"; exit 2; }
+    [ -x "$V2" ] || { echo "✗ 第 1 个参数（v2 二进制）不是可执行文件：$V2"; exit 2; }
+    DUR="${DUR:-20}"; PORT="${PORT:-8111}"
+    mkdir -p "$LOGDIR"
+    FAILN=0
+
+    # 跑一格：$1=标签 $2=服务端 $3=客户端 $4=两侧 env $5=期望(通/不通) $6=端口
+    v1_pair() {
+        local tag="$1" sb="$2" cb="$3" envs="${4:-}" want="$5" P="$6" ok=1
+        pkill -f "test_ffrdp --server=127.0.0.1:$P" 2>/dev/null
+        ( sleep $((DUR+4)); echo quit ) | timeout $((DUR+25)) env $envs stdbuf -oL "$sb" --server=127.0.0.1:$P \
+            > "$LOGDIR/${STAMP}_v1ref_${tag}_server.log" 2>&1 &
+        local sp=$!
+        sleep 1
+        ( sleep "$DUR"; echo quit ) | timeout $((DUR+20)) env $envs stdbuf -oL "$cb" --client=127.0.0.1:$P \
+            > "$LOGDIR/${STAMP}_v1ref_${tag}_client.log" 2>&1
+        wait $sp 2>/dev/null
+        local cs ss cn
+        cs="$(grep -c 'verify: OK' "$LOGDIR/${STAMP}_v1ref_${tag}_client.log" 2>/dev/null || true)"
+        ss="$(grep -c 'verify: OK' "$LOGDIR/${STAMP}_v1ref_${tag}_server.log" 2>/dev/null || true)"
+        cn="$(grep -o 'recv [0-9]* msgs' "$LOGDIR/${STAMP}_v1ref_${tag}_client.log" 2>/dev/null | head -1 | awk '{print $2}')"
+        cn="${cn:-0}"
+        if [ "$want" = "通" ]; then
+            [ "$cs" = 1 ] && [ "$ss" = 1 ] && [ "$cn" -gt 0 ] || ok=0
+        else
+            [ "$cs" = 0 ] && [ "$ss" = 0 ] || ok=0     # 期望不通：两侧都不该有 verify: OK ✓
+        fi
+        printf '  %-44s 期望%-4s cli_OK=%s srv_OK=%s 客户端实收 %-6s 条  %s\n' \
+            "$tag" "$want" "$cs" "$ss" "$cn" "$([ "$ok" = 1 ] && echo '✅' || echo '✗')"
+        [ "$ok" = 1 ] || FAILN=$((FAILN+1))
+        return 0
+    }
+
+    echo "互通自检（v2 $V2 ↔ v1 $V1，各 ${DUR}s，本地两进程 ✓）"
+    v1_pair "① v1(srv) ← v2(cli)  hs:0" "$V1" "$V2" "FFRDP_HS=0" "通" "$PORT"
+    v1_pair "② v2(srv) ← v1(cli)  hs:0" "$V2" "$V1" "FFRDP_HS=0" "通" "$((PORT+1))"
+    v1_pair "③ v2(srv) 默认hs:1 ← v1(cli)" "$V2" "$V1" ""           "不通" "$((PORT+2))"
+    echo
+    if [ "$FAILN" = 0 ]; then
+        echo "✅ 互通自检通过：hs:0 两条方向都通 ✓、默认 hs:1 仍然不互通 ✓（日志在 $LOGDIR/${STAMP}_v1ref_*.log）"
+        exit 0
+    fi
+    echo "✗ 互通自检失败 $FAILN 项（看 $LOGDIR/${STAMP}_v1ref_*.log）"
+    exit 1
+fi
 [ -n "$TARGET" ] || usage
 [ -f "$BIN" ] || { echo "✗ 找不到文件: $BIN"; exit 2; }
 [ -x "$BIN" ] || { echo "✗ 没有可执行权限: $BIN  （chmod +x 一下）"; exit 2; }
