@@ -856,6 +856,18 @@ int ffrdp_send(void *ctxt, int conn, char *buf, int len, int timeout_ms)
     if (conn < 0 || conn >= ffrdp->nconn || !ffrdp->table[conn]) return FFRDP_CONN_INVALID;
     pthread_mutex_lock(&ffrdp->lock);
     {   FFRDPCONN *c = ffrdp->table[conn];   // 这句就是"句柄 ⇒ 连接"的查表（v2 的分发入口之一）
+    // ⚠️ 锁外那次判空**不够** ✗：上面到这里的几行之间没拿锁 ✓，协议线程可能正好在收 FIN /
+    //    keepalive 判死时把这条连接收掉（表槽清空 + free ✓）⇒ 这里再读就是 NULL ✓。
+    //    真机上这就是空指针解引用 ⇒ SIGSEGV（对端主动关连接后，应用照旧 send/recv 就会踩到 ✓）。
+    if (!c) { rc = FFRDP_CONN_INVALID; goto out; }
+    // ⚠️ 锁外那次判空**不够** ✗：上面到这里的几行之间没拿锁 ✓，协议线程可能正好在收 FIN /
+    //    keepalive 判死时把这条连接收掉（表槽清空 + free ✓）⇒ 这里再读就是 NULL ✓。
+    //    真机上这就是空指针解引用 ⇒ SIGSEGV（对端主动关连接后，应用照旧 send/recv 就会踩到 ✓）。
+    if (!c) { rc = FFRDP_CONN_INVALID; goto out; }
+    // ⚠️ 锁外那次判空**不够** ✗：上面到这里的几行之间没拿锁 ✓，协议线程可能正好在收 FIN /
+    //    keepalive 判死时把这条连接收掉（表槽清空 + free ✓）⇒ 这里再读就是 NULL ✓。
+    //    真机上这就是空指针解引用 ⇒ SIGSEGV（对端主动关连接后，应用照旧 send/recv 就会踩到 ✓）。
+    if (!c) { rc = FFRDP_CONN_INVALID; goto out; }
     // 受理判据与旧版逐字相同：帧数上限（在途 + 这一条要占的帧）算在这里，不在出队时算。区别只在
     // "这个在途帧数从哪来"：协议跑在工作线程里，应用不再读协议自己的 wait_snd，而读它发布的镜像
     // （pub_wait_snd，每个回调结束时刷新）—— 值与时序都和旧版一致，但不再越过线程边界。
@@ -899,6 +911,12 @@ int ffrdp_send(void *ctxt, int conn, char *buf, int len, int timeout_ms)
             if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
             pthread_cond_timedwait(&ffrdp->cond, &ffrdp->lock, &ts);
         }
+            // ⚠️ 等的时候锁是**放开**的 ✓：协议线程可能正在这时把这条连接收掉
+            //    （对端 FIN / keepalive 判死 ⇒ 表槽清空 + free ✓）⇒ 醒来必须**重新查表** ✗✓，
+            //    不能续用旧指针 ✗（真机上这是 use-after-free ⇒ SIGSEGV：对端关连接时就踩到 ✓）。
+        c = ffrdp->table[conn];
+        // 连接没了 ⇒ 直接解锁返回（不能走 out: —— 那里要用 c 记计数 ✓）
+        if (!c) { pthread_mutex_unlock(&ffrdp->lock); return FFRDP_CLOSED; }
     }
 out:
     // 计数口径与旧版一致：只要这条消息没被接受就记一次（现在 rc 有 0 / -1 / -2 三种，
@@ -1002,6 +1020,15 @@ int ffrdp_recv(void *ctxt, int conn, char *buf, int len, int timeout_ms)
     if (conn < 0 || conn >= ffrdp->nconn || !ffrdp->table[conn]) return FFRDP_CONN_INVALID;
     pthread_mutex_lock(&ffrdp->lock);
     {   FFRDPCONN *c = ffrdp->table[conn];   // 句柄 ⇒ 连接
+    // ⚠️ 与 ffrdp_send 同一个坑 ✗：锁外判过空，锁内这次查询仍可能是 NULL ✓
+    //    （两次查表之间协议线程收了 FIN / 判了死 ✓）⇒ 必须再判一次，不能直接解引用 ✓。
+    if (!c) { pthread_mutex_unlock(&ffrdp->lock); return FFRDP_CONN_INVALID; }
+    // ⚠️ 与 ffrdp_send 同一个坑 ✗：锁外判过空，锁内这次查询仍可能是 NULL ✓
+    //    （两次查表之间协议线程收了 FIN / 判了死 ✓）⇒ 必须再判一次，不能直接解引用 ✓。
+    if (!c) { pthread_mutex_unlock(&ffrdp->lock); return FFRDP_CONN_INVALID; }
+    // ⚠️ 与 ffrdp_send 同一个坑 ✗：锁外判过空，锁内这次查询仍可能是 NULL ✓
+    //    （两次查表之间协议线程收了 FIN / 判了死 ✓）⇒ 必须再判一次，不能直接解引用 ✓。
+    if (!c) { pthread_mutex_unlock(&ffrdp->lock); return FFRDP_CONN_INVALID; }
     t0 = get_timestamp32_ms();
     for (;;) {
         ret = MIN(len, c->recv_size);
@@ -1025,6 +1052,11 @@ int ffrdp_recv(void *ctxt, int conn, char *buf, int len, int timeout_ms)
             if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
             pthread_cond_timedwait(&ffrdp->cond, &ffrdp->lock, &ts);
         }
+            // ⚠️ 等的时候锁是**放开**的 ✓：协议线程可能正在这时把这条连接收掉
+            //    （对端 FIN / keepalive 判死 ⇒ 表槽清空 + free ✓）⇒ 醒来必须**重新查表** ✗✓，
+            //    不能续用旧指针 ✗（真机上这是 use-after-free ⇒ SIGSEGV：对端关连接时就踩到 ✓）。
+        c = ffrdp->table[conn];
+        if (!c) { ret = FFRDP_CLOSED; break; }   // 等的时候连接没了 ⇒ 按"已断"报 ✓（与上面判死同一个口径 ✓）
     }
     pthread_mutex_unlock(&ffrdp->lock);
     return ret;
@@ -1940,6 +1972,16 @@ static void ffrdp_hs_rx(FFRDPCONTEXT *ffrdp, uint64_t addr, uint8_t sub)
     // 客户端：只有主连接，等 SYN-ACK。
     c = ffrdp->table[0];
     if (!c) return;
+    // ⚠️ 客户端也要认 FIN ✗✓：对端主动关时，回 FIN 是**两边**都要做的事 ✓。
+    //    缺这一段的话，我方 close 之后永远等不到对端的 FIN（真机实测：客户端一直报
+    //    "没等到对端 FIN" ✓，只能等自己的 keepalive 超时才发现 ✗）。
+    if (sub == FFRDP_HS_FIN) {
+        if (c->hs_state != HS_FIN_WAIT) ffrdp_hs_send(ffrdp, c, FFRDP_HS_FIN);  // 对端先关 ⇒ 回一个 ✓
+        ffrdp_emit(ffrdp, FFRDP_DISCONN, ffrdp_conn_handle(ffrdp, c), c->peer_addr, NULL, 0);
+        // 主连接**不能**从表里摘掉 ✗（表槽永不回收 ✓；send/recv 靠 HS_FAILED 报 CLOSED ✓）
+        c->hs_state = HS_FAILED;
+        return;
+    }
     if (sub == FFRDP_HS_SYN_ACK && c->hs_state == HS_SYN_SENT) {
         c->hs_state = HS_UP;
         c->tick_last_recv = get_timestamp32_ms();       // 同上 ✓

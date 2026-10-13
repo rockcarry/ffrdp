@@ -244,8 +244,57 @@ int main(void)
         check(s6->table[1] == NULL, "连接被收掉（表槽清空 ✓）");
         check(ffrdp_isdead(p_srv, 1) == 1, "按句柄问 ⇒ 已死（1 ✓）");
         check(ffrdp_close(p_srv, 1) == -1, "对已关掉的句柄再 close ⇒ -1（无效句柄 ✓）");
+        // 已放掉的句柄上 send/recv：**必须报错，不能崩** ✓
+        //（真机上这里原本是空指针解引用 ⇒ SIGSEGV：对端主动关连接后应用照旧 recv 就踩到 ✓）
+        check(ffrdp_recv(p_srv, 1, rbuf, sizeof(rbuf), 0) == FFRDP_CONN_INVALID,
+              "对已放掉的句柄 recv ⇒ CONN_INVALID（不崩 ✓）");
+        check(ffrdp_send(p_srv, 1, rbuf, 1, 0) == FFRDP_CONN_INVALID,
+              "对已放掉的句柄 send ⇒ CONN_INVALID（不崩 ✓）");
+        // 已放掉的句柄上 send/recv：**必须报错，不能崩** ✓
+        //（真机上这里原本是空指针解引用 ⇒ SIGSEGV：对端主动关连接后应用照旧 recv 就踩到 ✓）
+        check(ffrdp_recv(p_srv, 1, rbuf, sizeof(rbuf), 0) == FFRDP_CONN_INVALID,
+              "对已放掉的句柄 recv ⇒ CONN_INVALID（不崩 ✓）");
+        check(ffrdp_send(p_srv, 1, rbuf, 1, 0) == FFRDP_CONN_INVALID,
+              "对已放掉的句柄 send ⇒ CONN_INVALID（不崩 ✓）");
+        // 已放掉的句柄上 send/recv：**必须报错，不能崩** ✓
+        //（真机上这里原本是空指针解引用 ⇒ SIGSEGV：对端主动关连接后应用照旧 recv 就踩到 ✓）
+        check(ffrdp_recv(p_srv, 1, rbuf, sizeof(rbuf), 0) == FFRDP_CONN_INVALID,
+              "对已放掉的句柄 recv ⇒ CONN_INVALID（不崩 ✓）");
+        check(ffrdp_send(p_srv, 1, rbuf, 1, 0) == FFRDP_CONN_INVALID,
+              "对已放掉的句柄 send ⇒ CONN_INVALID（不崩 ✓）");
         check(s6->nconn == 2, "水位不回收（索引永不复用 ✓）");
         ffrdp_exit(p_srv);
+    }
+
+    /* ── 阶段 7：客户端侧收到对端 FIN（四次挥手的另一半）────────────────── */
+    // 服务端那条路阶段 6 验过了；客户端这条**不能少** ✗：对端先关时，回 FIN 是两边都要做的事 ✓。
+    // 与阶段 6 的区别：客户端只有主连接 ⇒ 收 FIN 后**不能摘表** ✗（表槽永不回收 ✓），
+    // 而是置 HS_FAILED ⇒ isdead 报 1 ✓、send/recv 报 CLOSED(0) ✓。
+    printf("── 阶段 7：客户端收到对端 FIN\n");
+    g_connect = g_accept = g_disconn = 0;
+    sim_reset();
+    p_c1 = ffrdp_init("ffrdpc://127.0.0.1:8001,mss:1024,fec:0,hs:1", on_event, NULL);
+    check(p_c1 != NULL, "客户端建起来了");
+    if (p_c1) {
+        FFRDPCONTEXT *c7 = (FFRDPCONTEXT*)p_c1;
+        int           st = 0;
+        uint64_t      srv_addr = 0;
+
+        sim_setstep(st++); sim_begin(0); sim_ll_run(0, p_c1);          // 把 init 时那个 SYN 发出去/丢掉
+        srv_addr = c7->table[0] ? c7->table[0]->peer_addr : 0;         // 对端地址就用它自己的 peer_addr ✓
+        sim_setstep(st++); sim_begin(0); sim_send_from(0, srv_addr, hsbuf, hs_frame(hsbuf, FFRDP_HS_SYN_ACK));
+        sim_begin(0); sim_ll_run(0, p_c1);
+        check(g_connect == 1 && c7->table[0] && c7->table[0]->hs_state == HS_UP,
+              "先握手成功（客户端 UP ✓）");
+
+        sim_setstep(st++); sim_begin(0); sim_send_from(0, srv_addr, hsbuf, hs_frame(hsbuf, FFRDP_HS_FIN));
+        sim_begin(0); sim_ll_run(0, p_c1);
+        check(g_disconn == 1, "对端 FIN ⇒ 报 DISCONN ✓");
+        check(c7->table[0] != NULL, "主连接**仍在表里**（表槽永不回收 ✓，不像服务端那样摘掉 ✗）");
+        check(ffrdp_isdead(p_c1, 0) == 1, "客户端主连接 ⇒ 已死（isdead = 1 ✓）");
+        check(ffrdp_recv(p_c1, 0, rbuf, sizeof(rbuf), 0) == FFRDP_CLOSED, "此后 recv ⇒ CLOSED(0) ✓");
+        check(ffrdp_send(p_c1, 0, rbuf, 1, 0) == FFRDP_CLOSED, "此后 send ⇒ CLOSED(0) ✓");
+        ffrdp_exit(p_c1);
     }
 
     check(sim_alloc() == sim_freed(), "全部还回去：sim_alloc == sim_freed（无泄漏）");
