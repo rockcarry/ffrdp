@@ -1064,8 +1064,15 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             if (ffrdp->app_cb)
                 ffrdp_emit(ffrdp, FFRDP_DECRYPT, ffrdp_conn_handle(ffrdp, c),
                            c->peer_addr, c->recv_list_head->data + 4, size);
-            c->recv_tail = ringbuf_write(c->recv_buff, sizeof(c->recv_buff), c->recv_tail, c->recv_list_head->data + 4, size);
-            c->recv_size+= size;
+            // RECVDATA（异步通知 ✓）：解密之后、入缓冲之前报一次 ✓ —— 应用可以在回调里直接取走。
+            //   返回 FFRDP_CONSUMED ⇒ 协议**不再留着** ✓（这帧仍然算已交付：recv_seq 照常推进、ack 照常发 ✓
+            //   ⇒ 发送侧不会卡住 ✓）；否则数据照旧进接收缓冲，等应用 ffrdp_recv 取 ✓。
+            // ⚠️ 回调返回后这块内存就还给协议了 ⇒ 要留就**在回调里搬走** ✓（拷贝或自行接管 ✓）。
+            if (ffrdp_emit(ffrdp, FFRDP_RECVDATA, ffrdp_conn_handle(ffrdp, c),
+                           c->peer_addr, c->recv_list_head->data + 4, size) != FFRDP_CONSUMED) {
+                c->recv_tail = ringbuf_write(c->recv_buff, sizeof(c->recv_buff), c->recv_tail, c->recv_list_head->data + 4, size);
+                c->recv_size+= size;
+            }
             c->recv_seq++; c->recv_seq &= 0xFFFFFF;
             list_remove(&c->recv_list_head, &c->recv_list_tail, c->recv_list_head);
         } else break;

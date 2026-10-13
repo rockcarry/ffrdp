@@ -100,7 +100,7 @@ gcc -O1 -w $HAVE_B -DSIMLL_BASE -c simll.c -o simll_base.o
 # utils.c lives one level up (run.sh works from tools/sim).
 # -I../..: the copy sits here, so its quoted includes ("utils.h") need the repo root on the path.
 gcc -O1 -w -I../.. -c utils_sim.c -o utils.o
-TESTS="${TESTS:-t_rto t_ack t_fuzz t_peer t_handshake t_crypto hs-e2e e2e-raw e2e}"
+TESTS="${TESTS:-t_rto t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata hs-e2e e2e-raw e2e}"
 
 # 每一侧的输出同时进终端与一份日志：末尾的"判定汇总"从日志里读，免得靠人眼看统计数字。
 # 统计行（resend%、rto_floor、ooo 直方图……）随负载与旋钮变化，不是判据。
@@ -111,7 +111,7 @@ for t in $TESTS; do
     # v2-only 的测试（接口只有工作区那份才有）⇒ 不编 HEAD 那一份 ✗
     # 有的 TESTS 项只是"派发用的场景组"，复用别的测试的二进制（hs-e2e ⇒ e2e ✓）
     BUILD_T=$t; case $t in hs-e2e|e2e-raw) BUILD_T=e2e ;; esac
-    V2ONLY=""; case $BUILD_T in t_handshake|t_crypto) V2ONLY=1 ;; esac
+    V2ONLY=""; case $BUILD_T in t_handshake|t_crypto|t_recvdata) V2ONLY=1 ;; esac
     for v in base new; do
         if [ -n "$V2ONLY" ] && [ "$v" = base ]; then continue; fi
         sed "s|#include \"../../ffrdp.c\"|#include \"ffrdp_$v.c\"|; s|#include \"../../ffrdp.h\"|#include \"ffrdp_$v.h\"|" ${BUILD_T}.c > ${BUILD_T}_$v.c
@@ -169,6 +169,11 @@ for t in $TESTS; do
         echo
         echo "===== t_peer: multi-peer routing by addr (fake lowlevel) ====="
         echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_peer_new ;;
+    t_recvdata)
+        # RECVDATA：交付前异步通知；CONSUMED ⇒ 协议不留（但帧照常确认 ⇒ 传输不受影响 ✓）
+        echo
+        echo "===== t_recvdata: FFRDP_RECVDATA（NOT_CONSUMED / CONSUMED 两条路）====="
+        echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_recvdata_new ;;
     t_crypto)
         # 加密回调：协议层把帧载荷交给应用（原地改、长度不变 ⇒ 对 send/recv 透明 ✓）
         # 两条出口（攒满 smss / 超时短帧）都必须挂上，否则一种帧明文出去 ✗。
