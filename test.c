@@ -59,6 +59,18 @@ static TEST_PEER g_peers[] = {
 
 static uint32_t g_crc_table[256];
 
+// 应用句柄与事件回调（v2）：持着协议锁被调用 ⇒ 只记句柄，绝不回调 ffrdp_* ✓
+static int g_app_conn;
+static long on_event(void *cbctx, const FFRDP_EVENT *ev)
+{
+    (void)cbctx;
+    if (ev->type == FFRDP_ACCEPT) {
+        g_app_conn = ev->conn;
+        printf("accept ok: handle %d\n", ev->conn); fflush(stdout);
+    }
+    return FFRDP_NOT_CONSUMED;
+}
+
 static void crc32_init(void) // CRC-32 (IEEE 802.3)，查表，只在 main 里调用一次
 {
     uint32_t i, j, c;
@@ -163,7 +175,7 @@ static int msg_parse(TEST_VERIFY *v, const char *name, const char *peer, const u
 // 两侧用同一个判据（历史上只有客户端有"看多久没收到数据"这一半）。
 static int peer_is_lost(void *ffrdp, uint32_t tick_recv)
 {
-    if (ffrdp_isdead(ffrdp, 0)) return 1;   // 老程序只有一条连接 ⇒ 句柄 0（= 主连接 ✓）
+    if (ffrdp_isdead(ffrdp, g_app_conn)) return 1;   // 老程序只有一条连接 ⇒ 句柄 0（= 主连接 ✓）
     return (int32_t)get_timestamp32_ms() - (int32_t)tick_recv > TEST_PEER_SILENCE_MS;
 }
 
@@ -189,6 +201,9 @@ static void* peer_thread(void *param)
     }
 
     tick_dump  = get_timestamp32_ms();
+    // 应用句柄：客户端就是 0 号主连接 ✓；服务端要等 FFRDP_ACCEPT 报出那条新连接的句柄 ✓
+    // 才有地方收发 ✓（写死 0 的话，服务端在握手模式下收发全落空 ✗ —— 仿真里 e2e 踩过同一个坑 ✓）。
+    g_app_conn = 0;
     tick_speed = tick_dump;
     tokens     = quota;   // 一开跑就有一个周期的额度，否则头 1 秒发不出去、平均速率会偏低
     while (!g_exit) {
@@ -197,10 +212,16 @@ static void* peer_thread(void *param)
             snprintf(addr, sizeof(addr), "%s:%d", peer->ip, *peer->port);
             {
                 // v2 接口：角色进 scheme，smss/sfec 进配置串（v1 是位置参数）。
+                // FFRDP_HS（真机排查/A-B 用）：0 ⇒ 强制老路径 hs:0；1 ⇒ 强制握手；
+                // 不设 ⇒ 跟随协议默认（v2 起默认就是握手）。远端的 v1 二进制不认这个键 ⇒ 只影响本侧 ✓。
                 char params[128];
-                snprintf(params, sizeof(params), "%s://%s,mss:1280,fec:0",
-                         peer->is_server ? "ffrdps" : "ffrdpc", addr);
-                ffrdp = ffrdp_init(params, NULL, NULL);
+                const char *hs = getenv("FFRDP_HS");
+                snprintf(params, sizeof(params), "%s://%s,mss:1280,fec:0%s",
+                         peer->is_server ? "ffrdps" : "ffrdpc", addr,
+                         hs ? (atoi(hs) ? ",hs:1" : ",hs:0") : "");
+                printf("%s ffrdp_init: %s\n", peer->name, params);   // 排查用：实际配置进日志 ✓
+                fflush(stdout);
+                ffrdp = ffrdp_init(params, on_event, NULL);
             }
             if (!ffrdp) { usleep(100 * 1000); continue; }
         }
@@ -231,7 +252,7 @@ static void* peer_thread(void *param)
             // 传 0（不等待）：这个测试的背压方式就是"队列满就下一轮原样重试这一条"，重试的节拍由下面
             // 那次带超时的 ffrdp_recv 提供。协议跑在自己的线程上之后，等待不再等于"让协议停一会儿"，
             // 所以这里的 0 只是这个测试自己的选择，不再是必须。
-            ret = ffrdp_send(ffrdp, 0, (char*)sendbuf, msg_len, 0);
+            ret = ffrdp_send(ffrdp, g_app_conn, (char*)sendbuf, msg_len, 0);
             if (ret == msg_len) {                       // 整条被接受
                 v.sent_msgs++; v.sent_bytes += (uint32_t)msg_len;
                 if (quota) tokens -= (uint32_t)msg_len;
@@ -250,7 +271,7 @@ static void* peer_thread(void *param)
             // 这里就是应用侧唯一的等待点：一有数据立刻返回，没有数据最多等 TEST_RECV_WAIT_MS。协议由
             // lowlevel 的工作线程驱动，所以这个等待是真的在"等数据"，不再顺便决定协议的节拍 —— 这正是
             // 旧版传 >0 会掉吞吐（55 -> 13 MB/s）的原因，那时"等"同时是协议的 nap。
-            ret = ffrdp_recv(ffrdp, 0, (char*)stream + stream_len, TEST_STREAM_MAX - stream_len, TEST_RECV_WAIT_MS);
+            ret = ffrdp_recv(ffrdp, g_app_conn, (char*)stream + stream_len, TEST_STREAM_MAX - stream_len, TEST_RECV_WAIT_MS);
             if (ret > 0) {
                 stream_len += ret;
                 if (connected == 0) {
@@ -280,6 +301,8 @@ static void* peer_thread(void *param)
         // （收包走 RECV 回调、到期走 TIMER 回调），应用不再需要、也没有这个函数可调了。
         if (connected && peer_is_lost(ffrdp, tick_recv)) {
             printf("%s lost !\n", peer->peer);
+            // 真机排查用：退出前把协议状态打一遍（连接数 / 握手状态 / 各计数器 ✓）。
+            if (ffrdp) { printf("%s --- dump ---\n", peer->name); fflush(stdout); ffrdp_dump(ffrdp, -1, 0); }
             ffrdp_exit(ffrdp); ffrdp = NULL;
             connected = 0;
             stream_len = 0; v.seq_have = 0;   // 重新建连 ⇒ 对端从新的流开始，基准要重新取

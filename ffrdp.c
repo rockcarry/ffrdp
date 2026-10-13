@@ -614,6 +614,7 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len);   // l
 static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c);              // 按连接的一圈；ffrdp_tick 逐连接调用它
 static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int clearhistory); // 按连接 dump；ffrdp_dump_locked 逐连接调用
 static int  ffrdp_hs_send(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, uint8_t sub);   // 握手：定义在 lowlevel 回调之前
+static void ffrdp_arm_timer(FFRDPCONTEXT *ffrdp);                             // 定义在协议后段（init 里要用 ✓）
 static void ffrdp_hs_rx(FFRDPCONTEXT *ffrdp, uint64_t addr, uint8_t sub);
 static int  ffrdp_conn_handle(FFRDPCONTEXT *ffrdp, FFRDPCONN *c);
 static long ffrdp_emit(FFRDPCONTEXT *ffrdp, int type, int conn, uint64_t addr, void *buf, int len); // 事件出口
@@ -774,6 +775,9 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
         c->hs_state = HS_SYN_SENT;
         c->hs_start = get_timestamp32_ms();
         ffrdp_hs_send(ffrdp, c, FFRDP_HS_SYN);
+        // 第一发很可能是失败的（lowlevel 的 socket 还没建好 ✓）⇒ 必须自己把定时器挂上，
+        // 否则真 lowlevel"没有期限就永久 select" ⇒ 连重传的机会都没有 ✗。
+        ffrdp_arm_timer(ffrdp);
         pthread_mutex_unlock(&ffrdp->lock);
     }
 
@@ -1431,6 +1435,14 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     }
     if (c->cur_new_node) { x = c->cur_new_tick + FFRDP_FLUSH_TIMEOUT; if (!due || (int32_t)(x - due) < 0) due = x; }
     x = c->rate_tick + 1000;                          if (!due || (int32_t)(x - due) < 0) due = x;
+    // 握手期的重传期限（与 tick 里那条重传判据同一个值 ✓）。
+    // ⚠️ 少了它，真 lowlevel 在"没有期限"时是**永久 select** ✓ ⇒ 没人来重传 ⇒ SYN 发不出去就永远发不出去 ✗
+    //    （客户端建 lowlevel 用 "none"，socket 由它自己的工作线程懒建 ⇒ ffrdp_init 里第一发很可能
+    //     撞上 sockfd < 0 ⇒ 静默失败 ✓）—— 仿真里假 lowlevel 没有这层懒建，所以永远看不见 ✗。
+    if (c->hs_state == HS_SYN_SENT || c->hs_state == HS_SYN_RCVD) {
+        x = c->hs_tick + FFRDP_HS_RETRY_MS;
+        if (!due || (int32_t)(x - due) < 0) due = x;
+    }
     if (c->tick_send_query) { x = c->tick_send_query + FFRDP_QUERY_CYCLE; if (!due || (int32_t)(x - due) < 0) due = x; }
     if (c->probe_next)      { x = c->probe_next;                          if (!due || (int32_t)(x - due) < 0) due = x; }
     // 还差一条最容易漏、也最贵的：**现在就有发得出去的东西**（应用排了队，或者发送表里有还没首发的帧），
@@ -1814,11 +1826,11 @@ static int ffrdp_hs_send(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, uint8_t sub)
     if (!ffrdp->lowlevel || !c || !c->peer_addr) return -1;
     data[0] = FFRDP_FRAME_TYPE_HANDSHAKE;
     data[1] = sub;
+    c->hs_tick = get_timestamp32_ms();   // 成败都记：失败也要按 FFRDP_HS_RETRY_MS 的节奏再试 ✓
     if (ffrdp->lowlevel->send(ffrdp->lowlevel, c->peer_addr, data, 2) != 0) {
         c->counter_send_err++;
         return -1;
     }
-    c->hs_tick = get_timestamp32_ms();
     c->hs_retry++;
     return 0;
 }
