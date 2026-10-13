@@ -810,15 +810,11 @@ failed:
 void ffrdp_exit(void *ctxt)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
-    FFRDPCONN *c = &ffrdp->conn;   // 主连接
-    // 先放掉按需分配的那些连接（主连接是内嵌的 ⇒ 由下面的原有代码负责 ✓）。
-    {   int i;
-        for (i = 0; i < ffrdp->nconn; i++) {
-            if (ffrdp->table[i] && ffrdp->table[i] != &ffrdp->conn) ffrdp_conn_free(ffrdp, ffrdp->table[i]);
-        }
-    }
+    FFRDPCONN    *c;
     FFRDP_LOWLEVEL *ll;
-    if (!ctxt) return;
+    int           i;
+    if (!ctxt) return;                       // 判空**必须**在最前：下面每句都要用 ctxt ✓
+    c = &ffrdp->conn;                        // 主连接（内嵌 ✓，由末尾那几行负责 ✓）
     // 顺序是有讲究的：先让等待中的应用线程醒过来（它们看到 closing 就返回），再停工作线程。反过来的话，
     // 一个卡在 cond 上的应用线程会等一个再也不会有人推进的队列，而 exit 又 join 工作线程 —— 两边互等。
     // exit 必须在锁外调用：它要 join 的正是那个每次回调都要拿这把锁的线程。
@@ -833,6 +829,17 @@ void ffrdp_exit(void *ctxt)
     if (ll) ll->exit(ll);
     pthread_mutex_lock(&ffrdp->lock);
     ffrdp->lowlevel = NULL; // 线程已停、handle 也已被它自己释放 ⇒ 现在摘掉才安全
+    // ⚠️ 按需分配的连接**必须等在这里**再放 ✗✓：工作线程刚刚可能正跑在
+    //    `ffrdp_tick → ffrdp_send_data_frame` 里（手里攥着某条连接 ✓）。
+    //    旧顺序（在入口处、锁外就把它们 free 掉）实测让**服务端收尾 6/6 段错误** ✓，
+    //    栈是 `ffrdp_send_data_frame ← ffrdp_tick_conn ← ffrdp_lowlevel_cb ✓` ——
+    //    下面那段"顺序是有讲究的"注释讲的是同一件事，只是漏了连接这一半 ✓。
+    for (i = 0; i < ffrdp->nconn; i++) {
+        if (ffrdp->table[i] && ffrdp->table[i] != &ffrdp->conn) {
+            ffrdp_conn_free(ffrdp, ffrdp->table[i]);
+            ffrdp->table[i] = NULL;          // 表槽不回收的老规矩不变 ✓（这里只是清指针 ✓）
+        }
+    }
     pthread_mutex_unlock(&ffrdp->lock);
     if (c->cur_new_node) free(c->cur_new_node);
     list_free(&c->send_list_head, &c->send_list_tail);

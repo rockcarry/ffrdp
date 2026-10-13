@@ -16,6 +16,7 @@
 #     FFRDP_HS=0/1   透传给**两侧**（v2 二进制用它强制老路径/握手；v1 二进制不认 ⇒ 无影响）
 #     FFRDP_IDLE=1   空闲验收：应用**一个字节都不发**，看 keepalive 会不会误杀（本地继承 / 远端 ssh 显式传 ✓）
 #     FFRDP_CLOSE=1  退出前 ffrdp_close ⇒ 走一遍四次挥手（FIN 往返 ⇒ 两侧各自 DISCONN ✓）
+#     CLIENTS=N      本地起 N 个客户端打同一个服务端（默认 1 ✓；上限 = 服务端 maxconn - 1 ✓）
 #     CPUWATCH=1     同时采样本地客户端进程的 CPU（单核百分比），写进 *.cpu
 #     KEEP_MUX=1     跑完不关 SSH 复用连接（连跑多个二进制时少输几次密码）
 #     CLEAN=1        跑完删掉远端 /tmp 里的二进制与日志
@@ -143,6 +144,20 @@ echo " 日志   : $LOGDIR"
 echo " 认证   : $AUTH"
 echo "──────────────────────────────────────────────────────────"
 
+# ── 多客户端支持：CLIENTS=N（默认 1 ⇒ 与以前完全一样 ✓）──────────────────────
+# test.c 的**服务端**现在一条 accept 连接起一个 link 线程 ⇒ 可以同时服务 N 个客户端 ✓
+# （协议侧本来就支持：maxconn 默认 16，句柄 = 下标 ✓）。
+# ⚠️ N 的上限是服务端 maxconn 减一（内嵌主连接占一个槽 ✓）。
+CLIENTS="${CLIENTS:-1}"
+case "$CLIENTS" in *[!0-9]*|"") echo "✗ CLIENTS 必须是正整数（现在是 "$CLIENTS"）"; exit 2;; esac
+[ "$CLIENTS" -ge 1 ] || { echo "✗ CLIENTS 必须 ≥ 1"; exit 2; }
+client_log()  {   # $1 = 客户端序号 ⇒ 第 1 个保持老日志名 ✓（脚本/习惯都不用改 ✓）
+    if [ "$1" = 1 ]; then echo "$LOCAL_LOG"; else echo "${LOCAL_LOG%.log}_c$1.log"; fi
+}
+client_logs_hint() {
+    if [ "$CLIENTS" = 1 ]; then echo "$LOCAL_LOG"; else echo "${LOCAL_LOG%.log}_c1..c$CLIENTS.log"; fi
+}
+
 say "[1/6] 探路 $HOST:22"
 if [ "$DRY" = 1 ]; then
     say "      (DRY) 跳过"
@@ -182,19 +197,29 @@ if [ "$DRY" != 1 ]; then
     esac
 fi
 
-say "[4/6] 本地起客户端（${DUR}s）"
+say "[4/6] 本地起客户端（${DUR}s × ${CLIENTS} 个）"
 CPUF="$LOGDIR/${TAG}_client_${STAMP}.cpu"
 if [ "$DRY" = 1 ]; then
-    say "      (DRY) ( sleep $DUR; echo quit ) | stdbuf -oL $BIN --client=$HOST:$PORT > $LOCAL_LOG"
+    say "      (DRY) ( sleep $DUR; echo quit ) | stdbuf -oL $BIN --client=$HOST:$PORT > $LOCAL_LOG   ×${CLIENTS}"
 else
-    ( sleep "$DUR"; echo quit ) | timeout $((DUR+15)) stdbuf -oL "$BIN" --client="$HOST:$PORT" > "$LOCAL_LOG" 2>&1 &
-    TPID=$!
+    CPIDS=""
+    c=1
+    while [ "$c" -le "$CLIENTS" ]; do
+        LOG_C="$(client_log "$c")"
+        ( sleep "$DUR"; echo quit ) | timeout $((DUR+15)) stdbuf -oL "$BIN" --client="$HOST:$PORT" > "$LOG_C" 2>&1 &
+        CPIDS="$CPIDS $!"
+        [ "$c" = 1 ] && TPID=$!
+        sleep 0.4          # 让它们依次连上（也免得 N 个 SYN 挤在同一毫秒 ✓）
+        c=$((c+1))
+    done
     if [ "${CPUWATCH:-0}" = 1 ]; then
         cpu_watch "$TPID" "$CPUF" &
     fi
-    wait "$TPID" 2>/dev/null
-    RC=$?
-    say "      客户端结束（退出码 $RC）→ $LOCAL_LOG"
+    RC=0
+    for p in $CPIDS; do
+        wait "$p" 2>/dev/null || RC=$?
+    done
+    say "      ${CLIENTS} 个客户端都结束（最后一个退出码 $RC）→ $(client_logs_hint)"
 fi
 
 say "[5/6] 等服务端收尾，把日志取回本地"
@@ -257,7 +282,12 @@ report() {   # $1=日志 $2=角色
         "${res%\%}" "${waste%\%}" "${rtts:-}" "${spd:-}" >> "$LOGDIR/summary.csv"
 }
 [ -f "$LOGDIR/summary.csv" ] || echo 'stamp,tag,role,resend_pct,waste_pct,rtts_ms,send_recv_MBps' > "$LOGDIR/summary.csv"
-report "$LOCAL_LOG" client
+c=1
+while [ "$c" -le "$CLIENTS" ]; do
+    if [ "$CLIENTS" = 1 ]; then report "$(client_log "$c")" client
+    else                      report "$(client_log "$c")" "client$c"; fi
+    c=$((c+1))
+done
 report "$LOCAL_SRV_LOG" server
 
 if command -v column >/dev/null 2>&1; then
