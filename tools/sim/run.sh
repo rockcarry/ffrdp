@@ -100,7 +100,7 @@ gcc -O1 -w $HAVE_B -DSIMLL_BASE -c simll.c -o simll_base.o
 # utils.c lives one level up (run.sh works from tools/sim).
 # -I../..: the copy sits here, so its quoted includes ("utils.h") need the repo root on the path.
 gcc -O1 -w -I../.. -c utils_sim.c -o utils.o
-TESTS="${TESTS:-t_rto t_ack t_fuzz t_peer e2e}"
+TESTS="${TESTS:-t_rto t_ack t_fuzz t_peer t_handshake e2e}"
 
 # 每一侧的输出同时进终端与一份日志：末尾的"判定汇总"从日志里读，免得靠人眼看统计数字。
 # 统计行（resend%、rto_floor、ooo 直方图……）随负载与旋钮变化，不是判据。
@@ -108,7 +108,10 @@ SIMLOG="${SIMLOG:-/tmp/ffrdp-sim-harness.log}"
 : > "$SIMLOG"
 run() { "$@" 2>&1 | tee -a "$SIMLOG" || true; }
 for t in $TESTS; do
+    # v2-only 的测试（接口只有工作区那份才有）⇒ 不编 HEAD 那一份 ✗
+    V2ONLY=""; case $t in t_handshake) V2ONLY=1 ;; esac
     for v in base new; do
+        if [ -n "$V2ONLY" ] && [ "$v" = base ]; then continue; fi
         sed "s|#include \"../../ffrdp.c\"|#include \"ffrdp_$v.c\"|; s|#include \"../../ffrdp.h\"|#include \"ffrdp_$v.h\"|" $t.c > ${t}_$v.c
         EXTRA=""; grep -q counter_ack_recv ffrdp_$v.c && EXTRA="$EXTRA -DNEW_COUNTERS"
         grep -q counter_recv_ooo ffrdp_$v.c && EXTRA="$EXTRA -DRECV_OOO"
@@ -164,6 +167,11 @@ for t in $TESTS; do
         echo
         echo "===== t_peer: multi-peer routing by addr (fake lowlevel) ====="
         echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_peer_new ;;
+    t_handshake)
+        # 握手 + 多连接：一个服务端 + 两个客户端，验 ACCEPT/CONNECT 与"不串台" ✓
+        echo
+        echo "===== t_handshake: 三次握手 + 多连接（两个对端不串台）====="
+        echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_handshake_new ;;
     e2e)
         echo
         echo "===== e2e: loss burst delay jitter ====="
