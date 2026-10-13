@@ -634,6 +634,8 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     secs = ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_ffrdp_dump) / 1000;
     secs = secs ? secs : 1;
     printf("rttm: %u, rtts: %u, rttd: %u, rto: %u\n", ffrdp->rttm, ffrdp->rtts, ffrdp->rttd, ffrdp->rto);
+    // 版本在 dump 的第一行，一次就看清（参数与实现细节见后面几行）。
+    printf("version               : %s\n", FFRDP_VERSION);
     printf("total_send, total_recv: %.2fMB, %.2fMB\n"    , ffrdp->counter_send_bytes / (1024.0 * 1024), ffrdp->counter_recv_bytes / (1024.0 * 1024));
     printf("averg_send, averg_recv: %.2fKB/s, %.2fKB/s\n", ffrdp->counter_send_bytes / (1024.0 * secs), ffrdp->counter_recv_bytes / (1024.0 * secs));
     printf("recv_size           : %d\n"  , ffrdp->recv_size           );
