@@ -374,6 +374,7 @@ typedef struct {
     uint32_t hs_start;            // 本次握手开始（或上次重传）的时刻：与 handshake_ms 比就是超时
     uint32_t hs_retry;            // 已重传次数
     uint32_t counter_rx_foreign;  // 来源地址不是本连接对端的帧：按地址分发后应当只有"别人的包"
+    uint32_t counter_hs_refused;  // 握手 SYN 没能建连接（表满/内存不足）：设计稿要求"不静默"✓
                                   // （P2 第二步新增 ⇒ 放在 reserved 之后：不参与 dump 的清零跨度、也不打印 ⇒ 输出不变 ✓）
     uint32_t reserved;            // ffrdp_dump clears everything up to here: nothing that must outlive a
                                   // dump, and nothing a decision depends on, may sit above this line
@@ -1788,7 +1789,7 @@ static void ffrdp_hs_rx(FFRDPCONTEXT *ffrdp, uint64_t addr, uint8_t sub)
             // 半开必须计时 + 封顶（见 tick）：否则伪造源地址的 SYN 能一路吃内存。
             if (sub != FFRDP_HS_SYN) return;
             c = ffrdp_conn_new(ffrdp, addr, &handle);
-            if (!c) { ffrdp->table[0]->counter_rx_foreign++; return; }   // 表满/内存不足 ⇒ 丢弃（不静默 ✓）
+            if (!c) { ffrdp->table[0]->counter_hs_refused++; return; }   // 表满/内存不足 ⇒ 丢弃（不静默 ✓）
             c->hs_state = HS_SYN_RCVD;
             c->hs_start = get_timestamp32_ms();
             ffrdp_hs_send(ffrdp, c, FFRDP_HS_SYN_ACK);

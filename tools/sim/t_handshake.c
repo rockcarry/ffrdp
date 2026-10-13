@@ -22,6 +22,8 @@
 #define A_SRV MKADDR(8001)   // 服务端地址 = 客户端 dial 的那个
 #define A_C1  MKADDR(40001)  // 客户端 1 自己的地址（服务端从它的 SYN 里看到）
 #define A_C2  MKADDR(40002)
+#define A_X   MKADDR(40010)  // 阶段 4/5 里"只会发 SYN 的裸对端"
+#define A_Y   MKADDR(40011)
 
 static int g_fail;
 static void check(int ok, const char *what) { printf("  %s %s\n", ok ? "✓" : "✗", what); if (!ok) g_fail++; }
@@ -52,7 +54,7 @@ int main(void)
     FFRDPCONTEXT *srv, *c1, *c2, *sc, *cc;
     void *p_srv, *p_c1, *p_c2, *p_sc, *p_cc;
     FFRDP_LOWLEVEL *ll_srv, *ll_c1, *ll_c2, *ll_sc, *ll_cc;
-    char  sbuf[64], rbuf[512], fin[2], drop[2048];
+    char  sbuf[64], rbuf[512], fin[2], hsbuf[2], drop[2048];
     int   i, n, r1 = 0, r2 = 0, bad1 = 0, bad2 = 0, sent1 = 0, sent2 = 0;
 
     /* ── 阶段 1：正常握手 + 多连接不串台 ─────────────────────────────────── */
@@ -150,6 +152,61 @@ int main(void)
     check(ffrdp_send(cc, 0, sbuf, 16, 0) == FFRDP_CLOSED, "此后 send ⇒ CLOSED(0)");
     check(ffrdp_recv(cc, 0, rbuf, sizeof(rbuf), 0) == FFRDP_CLOSED, "此后 recv(timeout=0) ⇒ CLOSED(0)（判死排在等不等之前 ✓）");
     ffrdp_exit(p_cc); ffrdp_exit(p_sc);
+
+    /* ── 阶段 4：服务端半开连接：计时封顶 + 半开期间的数据一律丢 ───────────── */
+    printf("── 阶段 4：服务端收到 SYN、却没人完成握手（handshake_ms:1000）\n");
+    g_connect = g_accept = g_disconn = 0;
+    sim_reset();
+    p_sc = ffrdp_init("ffrdps://127.0.0.1:8001,mss:1024,fec:0,hs:1,handshake_ms:1000,maxconn:8", on_event, NULL);
+    check(p_sc != NULL, "服务端建起来了");
+    if (!p_sc) { printf("── 结果：FAIL\n"); return 1; }
+    sc = (FFRDPCONTEXT*)p_sc;
+
+    sim_setstep(0);
+    sim_begin(0); sim_send_from(0, A_X, hsbuf, hs_frame(hsbuf, FFRDP_HS_SYN));   // 裸 SYN：对面没有协议栈
+    sim_begin(0); sim_ll_run(0, p_sc);
+    check(sc->nconn == 2, "为这个 SYN 建了一条半开连接（nconn=2）");
+    check(sc->table[1] && sc->table[1]->peer_addr == A_X, "记着 SYN 的来源地址");
+    check(sc->table[1] && sc->table[1]->hs_state == HS_SYN_RCVD, "状态 = HS_SYN_RCVD（半开）");
+    check(g_accept == 0, "半开**不算** ACCEPT（对端还没完成握手）");
+
+    {   // 半开期间来的数据帧必须丢（设计稿：未握手一律丢弃）
+        int before = sc->table[1]->counter_rx_foreign;
+        sim_begin(0); sim_send_from(0, A_X, "hello", 5);
+        sim_begin(0); sim_ll_run(0, p_sc);
+        check(sc->table[1] && sc->table[1]->counter_rx_foreign >= before + 1, "半开连接上的数据帧被丢掉（计数 +1）");
+        check(ffrdp_recv(sc, 1, rbuf, sizeof(rbuf), 0) == FFRDP_EAGAIN, "半开连接上读不到数据（丢掉而不是排队）");
+    }
+
+    for (i = 1; i < 1400; i++) { sim_setstep(i); sim_begin(0); sim_ll_run(0, p_sc); }
+    check(sc->table[1] == NULL, "超过 handshake_ms ⇒ 半开放掉（表槽清空）");
+    check(sc->nconn == 2, "水位不回收");
+    check(g_disconn == 1 && g_accept == 0, "报了 DISCONN、且始终没有 ACCEPT");
+
+    sim_setstep(2000);
+    sim_begin(0); sim_send_from(0, A_Y, hsbuf, hs_frame(hsbuf, FFRDP_HS_SYN));
+    sim_begin(0); sim_ll_run(0, p_sc);
+    check(sc->table[2] && sc->table[2]->peer_addr == A_Y, "新 SYN 拿 2 号（1 号没被回收 ✓ 索引永不复用）");
+    ffrdp_exit(p_sc);
+
+    /* ── 阶段 5：maxconn 满了就不再接（设计稿接受的取舍）────────────────── */
+    printf("── 阶段 5：maxconn:2 ⇒ 第二个 SYN 被拒\n");
+    g_connect = g_accept = g_disconn = 0;
+    sim_reset();
+    p_sc = ffrdp_init("ffrdps://127.0.0.1:8001,mss:1024,fec:0,hs:1,maxconn:2", on_event, NULL);
+    check(p_sc != NULL, "服务端建起来了（maxconn:2 ⇒ 除主连接外只多接一条）");
+    if (!p_sc) { printf("── 结果：FAIL\n"); return 1; }
+    sc = (FFRDPCONTEXT*)p_sc;
+
+    sim_setstep(0);
+    sim_begin(0); sim_send_from(0, A_X, hsbuf, hs_frame(hsbuf, FFRDP_HS_SYN));
+    sim_begin(0); sim_ll_run(0, p_sc);
+    check(sc->nconn == 2 && sc->table[1] != NULL, "第一个 SYN 建了 1 号连接");
+    sim_begin(0); sim_send_from(0, A_Y, hsbuf, hs_frame(hsbuf, FFRDP_HS_SYN));
+    sim_begin(0); sim_ll_run(0, p_sc);
+    check(sc->table[0]->counter_hs_refused == 1, "第二个 SYN 被拒、并计入 counter_hs_refused（不静默 ✓）");
+    check(sc->nconn == 2 && sc->table[2] == NULL, "没有建出第三条连接");
+    ffrdp_exit(p_sc);
 
     check(sim_alloc() == sim_freed(), "全部还回去：sim_alloc == sim_freed（无泄漏）");
     printf("── 结果：%s\n", g_fail ? "FAIL" : "OK");
