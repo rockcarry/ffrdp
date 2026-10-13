@@ -9,6 +9,14 @@
 #include "simdefs.h"
 #include "../../ffrdp.c"
 
+// ── 结构拆分（P1）之后，连接级字段挂在 ctxt->conn 下 ──────────────────────────
+// HEAD 侧没有这一层 ⇒ 用这个宏把两侧写成同一句话 ✓（与 TEST_SEND / TEST_RUN 同一套路 ✓）。
+#ifdef CONN_SPLIT
+#define CONN(c) (&(c)->conn)
+#else
+#define CONN(c) (c)
+#endif
+
 // The harness builds this test twice: once against HEAD's ffrdp.c, once against the working tree's. HEAD
 // has no timeout argument on send/recv and the working tree does, so the test calls these wrappers -- both
 // sides compile, and both sides mean "do not wait", which is exactly what HEAD does. run.sh defines
@@ -68,16 +76,16 @@ int main(void)
 
 #ifdef NEW_COUNTERS
     printf("  ack_recv=%u ack_mack=%u ack_hole=%u (expect 3/2/1) -> %s\n",
-           c->counter_ack_recv, c->counter_ack_mack, c->counter_ack_hole,
-           (c->counter_ack_recv == 3 && c->counter_ack_mack == 2 && c->counter_ack_hole == 1) ? "PASS" : "FAIL");
+           CONN(c)->counter_ack_recv, CONN(c)->counter_ack_mack, CONN(c)->counter_ack_hole,
+           (CONN(c)->counter_ack_recv == 3 && CONN(c)->counter_ack_mack == 2 && CONN(c)->counter_ack_hole == 1) ? "PASS" : "FAIL");
 #ifdef OOO_HIST
     // the masked bytes are counted by population, not by frame: 0x07 has three bits set, 0x0a has two,
     // so a sender that counted what it actually received has to read five.
     printf("  mack_bits_recv=%u (expect 5 = 3 from 0x07 + 2 from 0x0a) -> %s\n",
-           c->counter_mack_bits_recv, c->counter_mack_bits_recv == 5 ? "PASS" : "FAIL");
-    if (c->counter_mack_bits_recv != 5) return 1;
+           CONN(c)->counter_mack_bits_recv, CONN(c)->counter_mack_bits_recv == 5 ? "PASS" : "FAIL");
+    if (CONN(c)->counter_mack_bits_recv != 5) return 1;
 #endif
-    return (c->counter_ack_recv == 3 && c->counter_ack_mack == 2 && c->counter_ack_hole == 1) ? 0 : 1;
+    return (CONN(c)->counter_ack_recv == 3 && CONN(c)->counter_ack_mack == 2 && CONN(c)->counter_ack_hole == 1) ? 0 : 1;
 #else
     printf("  counter_ack_* does not exist in this build\n");
     return 0;

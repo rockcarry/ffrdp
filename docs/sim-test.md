@@ -58,7 +58,9 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
    开关也**按源码形状**判 ✓：`counter_ack_recv` / `counter_recv_ooo` / `counter_recv_dup` / `counter_rto_spurious` /
    `counter_ooo_d1_24` … ⇒ `-DNEW_COUNTERS` / `-DRECV_OOO` / `-DDUP_REPORT` / `-DSPUR` / `-DOOO_HIST` / `-DHAVE_INFLIGHT` ✓；
    还有 API 形状（`timeout_ms` / `addr` 形式的 `ffrdp_init` ⇒ `-DFFRDP_API_HAS_TIMEOUT` / `_HAS_ADDR` ✓）
-   与**是否由 lowlevel 驱动**（`-DFFRDP_LL_DRIVEN` ✓）⇒ **同一份测试能同时编译老源码和新源码** ✓（这是能做 A/B 的关键 ✓）。
+   与**是否由 lowlevel 驱动**（`-DFFRDP_LL_DRIVEN` ✓），以及**结构是否已拆出每连接层**
+   （`FFRDPCONN` ⇒ `-DCONN_SPLIT` ✓ —— 拆分后连接级字段挂在 `ctxt->conn` 下 ✓，测试统一写成 `CONN(c)->字段` ✓，
+   两侧都能编 ✓）⇒ **同一份测试能同时编译老源码和新源码** ✓（这是能做 A/B 的关键 ✓）。
 
 > 生成的中间文件（`ffrdp_base.c`、`ffrdp_new.c`、`ffrdp_*.h`、`lowlevel_*.h`、`utils_sim.c`、`*_base`、`*_new`、`*.o`）
 > 都在 `.gitignore` 里 ✓ —— 它们不是源码，每次 `run.sh` 都会重写 ✓。

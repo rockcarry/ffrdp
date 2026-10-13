@@ -11,6 +11,14 @@
 #include "simdefs.h"
 #include "../../ffrdp.c"
 
+// ── 结构拆分（P1）之后，连接级字段挂在 ctxt->conn 下 ──────────────────────────
+// HEAD 侧没有这一层 ⇒ 用这个宏把两侧写成同一句话 ✓（与 TEST_SEND / TEST_RUN 同一套路 ✓）。
+#ifdef CONN_SPLIT
+#define CONN(c) (&(c)->conn)
+#else
+#define CONN(c) (c)
+#endif
+
 // The harness builds this test twice: once against HEAD's ffrdp.c, once against the working tree's. HEAD
 // has no timeout argument on send/recv and the working tree does, so the test calls these wrappers -- both
 // sides compile, and both sides mean "do not wait", which is exactly what HEAD does. run.sh defines
@@ -73,12 +81,12 @@ int main(void)
         make_ack(ack, i + 1, 0, 255);       // peer confirms the head, exposing the next expired frame
         sim_inject(0, ack, 8);
         TEST_RUN(c, 0);                     // one expired head is retransmitted here
-        printf(" %u", c->rto);
+        printf(" %u", CONN(c)->rto);
     }
-    printf("\n  retransmits=%u reach_maxrto=%u\n", c->counter_resend_rto, c->counter_reach_maxrto);
+    printf("\n  retransmits=%u reach_maxrto=%u\n", CONN(c)->counter_resend_rto, CONN(c)->counter_reach_maxrto);
 #ifdef NEW_COUNTERS
     printf("  timeout_evt=%u rto_backoff=%u (12 timeouts, but the rto only backs off once)\n",
-           c->counter_timeout_evt, c->counter_rto_backoff);
+           CONN(c)->counter_timeout_evt, CONN(c)->counter_rto_backoff);
 #endif
     return 0;
 }

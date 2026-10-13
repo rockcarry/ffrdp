@@ -123,6 +123,8 @@ for t in $TESTS; do
         grep -q 'int timeout_ms)' ffrdp_$v.c && EXTRA="$EXTRA -DFFRDP_API_HAS_TIMEOUT"
         # ffrdp_init 的 (ip, port) 收敛成了单个 addr 字符串：两侧形状不同，测试用 TEST_INIT 适配。
         grep -q 'void\* ffrdp_init(char \*addr' ffrdp_$v.c && EXTRA="$EXTRA -DFFRDP_API_HAS_ADDR"
+        # 结构拆分（P1）：连接级字段挂到 ctxt->conn 下之后，测试用 CONN() 适配 · 按形状探测 ✓
+        grep -q 'FFRDPCONN' ffrdp_$v.c && EXTRA="$EXTRA -DCONN_SPLIT"
         # A side that carries lowlevel (the working tree) is stepped by sim_ll_run() instead of
         # ffrdp_update(), and needs the fake lowlevel linked in; HEAD is still stepped by ffrdp_update().
         LL=""

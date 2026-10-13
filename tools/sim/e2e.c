@@ -7,6 +7,14 @@
 #include "simdefs.h"
 #include "../../ffrdp.c"
 
+// ── 结构拆分（P1）之后，连接级字段挂在 ctxt->conn 下 ──────────────────────────
+// HEAD 侧没有这一层 ⇒ 用这个宏把两侧写成同一句话 ✓（与 TEST_SEND / TEST_RUN 同一套路 ✓）。
+#ifdef CONN_SPLIT
+#define CONN(c) (&(c)->conn)
+#else
+#define CONN(c) (c)
+#endif
+
 // The harness builds this test twice: once against HEAD's ffrdp.c, once against the working tree's. HEAD
 // has no timeout argument on send/recv and the working tree does, so the test calls these wrappers -- both
 // sides compile, and both sides mean "do not wait", which is exactly what HEAD does. run.sh defines
@@ -95,24 +103,24 @@ int main(int argc, char *argv[])
         sim_begin(1); while ((ret = TEST_RECV(c1, (char*)rbuf, sizeof(rbuf))) > 0) r1 += ret;
         sim_begin(0); while ((ret = TEST_RECV(c0, (char*)rbuf, sizeof(rbuf))) > 0) r0 += ret;
     }
-    s0.rto = c0->counter_resend_rto; s0.fast = c0->counter_resend_fast; s0.first = c0->counter_send_1sttime;
-    s0.cwnd = c0->cwnd; s0.ssth = c0->ssthresh; s0.wait = c0->wait_snd; s0.fail = c0->counter_send_failed; s0.rttd = c0->rttd;
-    s1.rto = c1->counter_resend_rto; s1.fast = c1->counter_resend_fast; s1.first = c1->counter_send_1sttime;
-    s1.maxrto = c1->counter_reach_maxrto;
-    s0.tx = c0->counter_txfull; s0.rx = c1->counter_rxfull; // frames c0 sent vs frames c1 received: the real air loss
-    s1.tx = c1->counter_txfull; s1.rx = c0->counter_rxfull;
+    s0.rto = CONN(c0)->counter_resend_rto; s0.fast = CONN(c0)->counter_resend_fast; s0.first = CONN(c0)->counter_send_1sttime;
+    s0.cwnd = CONN(c0)->cwnd; s0.ssth = CONN(c0)->ssthresh; s0.wait = CONN(c0)->wait_snd; s0.fail = CONN(c0)->counter_send_failed; s0.rttd = CONN(c0)->rttd;
+    s1.rto = CONN(c1)->counter_resend_rto; s1.fast = CONN(c1)->counter_resend_fast; s1.first = CONN(c1)->counter_send_1sttime;
+    s1.maxrto = CONN(c1)->counter_reach_maxrto;
+    s0.tx = CONN(c0)->counter_txfull; s0.rx = CONN(c1)->counter_rxfull; // frames c0 sent vs frames c1 received: the real air loss
+    s1.tx = CONN(c1)->counter_txfull; s1.rx = CONN(c0)->counter_rxfull;
     s0.ooo = s0.far = s0.dup = s0.adup = s0.spur = s0.rfl = 0;
 #ifdef NEW_COUNTERS
-    s0.ack = c0->counter_ack_recv; s0.mack = c0->counter_ack_mack; s0.hole = c0->counter_ack_hole;
-    s0.tev = c0->counter_timeout_evt; s0.rbk = c0->counter_rto_backoff;
+    s0.ack = CONN(c0)->counter_ack_recv; s0.mack = CONN(c0)->counter_ack_mack; s0.hole = CONN(c0)->counter_ack_hole;
+    s0.tev = CONN(c0)->counter_timeout_evt; s0.rbk = CONN(c0)->counter_rto_backoff;
 #endif
 #ifdef RECV_OOO
-    s0.ooo = c1->counter_recv_ooo; s0.far = c1->counter_recv_far; // c1's view of what c0 sent
+    s0.ooo = CONN(c1)->counter_recv_ooo; s0.far = CONN(c1)->counter_recv_far; // c1's view of what c0 sent
 #endif
 #ifdef DUP_REPORT
-    s0.dup  = c1->counter_recv_dup; // what c1 actually received a second time
-    s0.adup = c0->counter_ack_dup;  // ... and what c0 was told about it
-    s0.flr  = c0->rto_floor;
+    s0.dup  = CONN(c1)->counter_recv_dup; // what c1 actually received a second time
+    s0.adup = CONN(c0)->counter_ack_dup;  // ... and what c0 was told about it
+    s0.flr  = CONN(c0)->rto_floor;
 #endif
 #ifdef DUP_REPORT
     printf("       rto_floor=%u ms (the peer called %u of our retransmits pointless)\n", s0.flr, s0.adup);
@@ -128,11 +136,11 @@ int main(int argc, char *argv[])
 #endif
 #ifdef OOO_HIST
     // read these before the contexts are returned: the summary below prints after they are gone
-    s0.d1 = c1->counter_ooo_d1_24; s0.d25 = c1->counter_ooo_d25_64; s0.dgt = c1->counter_ooo_dgt64;
+    s0.d1 = CONN(c1)->counter_ooo_d1_24; s0.d25 = CONN(c1)->counter_ooo_d25_64; s0.dgt = CONN(c1)->counter_ooo_dgt64;
 #ifdef OOO_HIST2
-    s0.d65 = c1->counter_ooo_d65_128; s0.d128 = c1->counter_ooo_dgt128;
+    s0.d65 = CONN(c1)->counter_ooo_d65_128; s0.d128 = CONN(c1)->counter_ooo_dgt128;
 #endif
-    s0.mbs = c1->counter_mack_bits_sent; s0.mbr = c0->counter_mack_bits_recv; // c1's reports, what c0 got
+    s0.mbs = CONN(c1)->counter_mack_bits_sent; s0.mbr = CONN(c0)->counter_mack_bits_recv; // c1's reports, what c0 got
 #endif
     ffrdp_free(c0); ffrdp_free(c1); // everything must be returned, so the residual is a leak
     printf("loss=%.3f burst=%d delay=%d jit=%d cap=%.0fKB/s q=%dKB pol=%.0fKB/s/%dKB spike=%d%%/%dms | "
