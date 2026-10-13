@@ -37,7 +37,7 @@
 #define FFRDP_MIN_CWND_SIZE  1
 #define FFRDP_DEF_CWND_SIZE  32
 #define FFRDP_MAX_CWND_SIZE  128
-// 连接表容量（v2：maxconn，默认 16 ✓）。句柄 = 下标 ✓、索引永不复用 ✓（见 ffrdp-v2.h）。
+// 连接表容量（v2：maxconn，默认 16 ✓）。句柄 = 下标 ✓、索引永不复用 ✓（见 ffrdp.h 的设计说明）。
 #define FFRDP_MAXCONN        16
 // ── 握手（v2）────────────────────────────────────────────────────────────
 // 只吃一个帧类型号，子类型放载荷第 1 字节（将来加字段只扩载荷，不再占类型号）。
@@ -425,7 +425,7 @@ typedef struct {
     int               hs_enable;     // 配置：是否走三次握手（"hs:1" 开 / "hs:0" 关，**默认 1** ✓；
                                      // hs:0 才是与 v1 线上行为一致的那条路 ✓）
     int               is_server;     // 角色（v1 的 FLAG_SERVER 搬到进程级：它是"这个进程"的属性，不是连接的 ✗）
-    int               next_slot;     // 连接表里下一个可用的下标（**永不复用** ✓，见 ffrdp-v2.h）
+    int               next_slot;     // 连接表里下一个可用的下标（**永不复用** ✓，见 ffrdp.h 的设计说明）
     pthread_mutex_t   lock;          // 保护 app_tx_* / recv_buff+recv_size/head/tail / peer_addr / flags / 上列几个
     pthread_cond_t    cond;          // 协议侧腾出空间或送来数据时叫醒应用侧
     uint32_t tick_ffrdp_dump;
@@ -622,7 +622,7 @@ static void ffrdp_frame_encrypt(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_FRAME_N
 // 在协议那一大段的后面。想连它一起消掉，只能把 ffrdp_init 也挪到最后 —— 那会让这个文件的入口
 // 跑到末尾。原来这里还有另外五条声明，已经靠调整函数位置消掉了。
 // 一条连接的默认值：主连接与"按需分配的新连接"共用同一套（方案 A：每连接一个 calloc ✓，
-// 每连接仍用固定大小缓冲 ✓ —— 与 ffrdp-v2.h 的"第一阶段不优化"一致 ✓）。
+// 每连接仍用固定大小缓冲 ✓ —— 与 ffrdp.h 的设计说明 的"第一阶段不优化"一致 ✓）。
 static void ffrdp_conn_init(FFRDPCONN *c, int smss, int sfec)
 {
     c->swnd     = FFRDP_DEF_CWND_SIZE;
@@ -635,7 +635,7 @@ static void ffrdp_conn_init(FFRDPCONN *c, int smss, int sfec)
     c->fec_txredundancy = MAX(0, MIN(sfec, FFRDP_FRAME_TYPE_FEC32));
 }
 
-// 按需分配一条新连接（方案 A）。句柄 = 表下标 ✓、**索引永不复用** ✓（见 ffrdp-v2.h）：
+// 按需分配一条新连接（方案 A）。句柄 = 表下标 ✓、**索引永不复用** ✓（见 ffrdp.h 的设计说明）：
 // 所以下标只从 next_slot 往后取，关掉的槽留在表里当 NULL，不再被借走 ✓。
 // 返回新连接；*handle 给句柄。表满（maxconn / FFRDP_MAXCONN）⇒ NULL。
 static FFRDPCONN *ffrdp_conn_new(FFRDPCONTEXT *ffrdp, uint64_t addr, int *handle)
@@ -1750,7 +1750,7 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 // lowlevel 的入口：它的工作线程在这里回到协议里。同一时刻只会有一路，锁保护整个回调，协议自己的状态
 // 因此仍然只被一个线程碰。
 // 按对端地址查连接（v2 的分发点：lowlevel 收到帧后用它决定流向哪条连接 ✓）。
-// 连接句柄 = 表下标 ✓（见 ffrdp-v2.h）；第一步 nconn 恒为 1 ✓，所以这里就是"是不是我们的对端"。
+// 连接句柄 = 表下标 ✓（见 ffrdp.h 的设计说明）；第一步 nconn 恒为 1 ✓，所以这里就是"是不是我们的对端"。
 static FFRDPCONN *ffrdp_conn_by_addr(FFRDPCONTEXT *ffrdp, uint64_t addr)
 {
     int i;
