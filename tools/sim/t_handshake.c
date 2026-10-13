@@ -197,7 +197,7 @@ int main(void)
     printf("── 阶段 5：maxconn:2 ⇒ 第二个 SYN 被拒\n");
     g_connect = g_accept = g_disconn = 0;
     sim_reset();
-    p_sc = ffrdp_init("ffrdps://127.0.0.1:8001,mss:1024,fec:0,hs:1,maxconn:2", on_event, NULL);
+    p_sc = ffrdp_init("ffrdps://127.0.0.1:8001,mss:1024,fec:0,hs:1,maxconn:2,handshake_ms:1000", on_event, NULL);
     check(p_sc != NULL, "服务端建起来了（maxconn:2 ⇒ 除主连接外只多接一条）");
     if (!p_sc) { printf("── 结果：FAIL\n"); return 1; }
     sc = (FFRDPCONTEXT*)p_sc;
@@ -210,6 +210,18 @@ int main(void)
     sim_begin(0); sim_ll_run(0, p_sc);
     check(sc->table[0]->counter_hs_refused == 1, "第二个 SYN 被拒、并计入 counter_hs_refused（不静默 ✓）");
     check(sc->nconn == 2 && sc->table[2] == NULL, "没有建出第三条连接");
+
+    // 5b：那个半开连接过了 handshake_ms 会被放掉 ⇒ **槽空着、但新 SYN 照样进不来** ✓
+    //（索引永不复用 ⇒ 水位已经到 maxconn ✓ —— 这是设计里明确的取舍，这里把它钉住 ✓）
+    {   int k;
+        for (k = 1; k < 1200; k++) { sim_setstep(k); sim_begin(0); sim_ll_run(0, p_sc); }
+        check(sc->table[1] == NULL, "半开连接超时被放掉（1 号槽空了 ✓）");
+        check(sc->nconn == 2, "水位不回收（仍是 2 ✓）");
+        sim_begin(0); sim_send_from(0, A_Y, hsbuf, hs_frame(hsbuf, FFRDP_HS_SYN));
+        sim_begin(0); sim_ll_run(0, p_sc);
+        check(sc->table[0]->counter_hs_refused == 2, "槽空着，新 SYN **仍然被拒**（索引不复用 ✓）并计数 ✓");
+        check(sc->nconn == 2 && sc->table[1] == NULL, "依然没建出连接（同一取舍 ✓）");
+    }
     ffrdp_exit(p_sc);
 
     /* ── 阶段 6：主动关闭（ffrdp_close）—— 四次挥手里"我方发起"的那一半 ──── */
@@ -295,6 +307,61 @@ int main(void)
         check(ffrdp_recv(p_c1, 0, rbuf, sizeof(rbuf), 0) == FFRDP_CLOSED, "此后 recv ⇒ CLOSED(0) ✓");
         check(ffrdp_send(p_c1, 0, rbuf, 1, 0) == FFRDP_CLOSED, "此后 send ⇒ CLOSED(0) ✓");
         ffrdp_exit(p_c1);
+    }
+
+    /* ── 阶段 8：**客户端主动** close（我方发 FIN，等对端 FIN）──────────────── */
+    // 阶段 6 验的是服务端那一侧的主动关；这里补客户端这一侧（两半都要对称 ✓）：
+    //   ① close 受理 ⇒ 进 FIN_WAIT、FIN 真的从低层发出去 ✓、**先不报** DISCONN ✓
+    //   ② 收到对端 FIN ⇒ 报 DISCONN ✓ + 主连接**不摘表**（置 HS_FAILED ✓）
+    printf("── 阶段 8：客户端主动 close（hs:1）\n");
+    g_connect = g_accept = g_disconn = 0;
+    sim_reset();
+    p_c1 = ffrdp_init("ffrdpc://127.0.0.1:8001,mss:1024,fec:0,hs:1", on_event, NULL);
+    check(p_c1 != NULL, "客户端建起来了");
+    if (p_c1) {
+        FFRDPCONTEXT *c8 = (FFRDPCONTEXT*)p_c1;
+        uint64_t      srv_addr;
+        int           st = 0, q0;
+        sim_setstep(st++); sim_begin(0); sim_ll_run(0, p_c1);
+        srv_addr = c8->table[0] ? c8->table[0]->peer_addr : 0;
+        sim_setstep(st++); sim_begin(0); sim_send_from(0, srv_addr, hsbuf, hs_frame(hsbuf, FFRDP_HS_SYN_ACK));
+        sim_begin(0); sim_ll_run(0, p_c1);
+        check(g_connect == 1 && c8->table[0] && c8->table[0]->hs_state == HS_UP, "先握手成功 ✓");
+
+        q0 = sim_queued(1);
+        check(ffrdp_close(p_c1, 0) == 0, "ffrdp_close(客户端, 0) 受理 ✓");
+        check(c8->table[0] && c8->table[0]->hs_state == HS_FIN_WAIT, "进入 FIN_WAIT ✓");
+        sim_setstep(st++); sim_begin(0); sim_ll_run(0, p_c1);
+        check(sim_queued(1) > q0, "FIN **真的发出去了**（对端 slot 队列增加 ✓）");
+        check(g_disconn == 0, "还没等到对端 FIN ⇒ 先不报 DISCONN ✓");
+
+        sim_setstep(st++); sim_begin(0); sim_send_from(0, srv_addr, hsbuf, hs_frame(hsbuf, FFRDP_HS_FIN));
+        sim_begin(0); sim_ll_run(0, p_c1);
+        check(g_disconn == 1, "收到对端 FIN ⇒ 报 DISCONN ✓");
+        check(c8->table[0] != NULL, "主连接**仍在表里**（不像服务端那样摘掉 ✗）");
+        check(ffrdp_isdead(p_c1, 0) == 1, "此后 isdead ⇒ 1 ✓");
+        check(ffrdp_recv(p_c1, 0, rbuf, sizeof(rbuf), 0) == FFRDP_CLOSED, "此后 recv ⇒ CLOSED(0) ✓");
+        ffrdp_exit(p_c1);
+    }
+
+    /* ── 阶段 9：`hs:0` 下的 ffrdp_close（没有 FIN 这东西 ⇒ 只做本地拆除 ✓）────── */
+    printf("── 阶段 9：hs:0 下的 ffrdp_close（本地拆除 ✓）\n");
+    g_connect = g_accept = g_disconn = 0;
+    sim_reset();
+    p_sc = ffrdp_init("ffrdps://127.0.0.1:8001,mss:1024,fec:0,hs:0", on_event, NULL);
+    check(p_sc != NULL, "服务端（hs:0）建起来了");
+    if (p_sc) {
+        sc = (FFRDPCONTEXT*)p_sc;
+        sim_setstep(0);
+        sim_begin(0); sim_send_from(0, A_X, "hello", 5);      // 老路径：第一帧就学会对端 ✓
+        sim_begin(0); sim_ll_run(0, p_sc);
+        check((sc->table[0]->flags & FLAG_CONNECTED) != 0, "老路径对端已学会（FLAG_CONNECTED ✓）");
+        check(ffrdp_close(p_sc, 0) == 0, "ffrdp_close 受理 ✓");
+        check(g_disconn == 1, "报了一次 DISCONN ✓（老路径没有 FIN 可发 ⇒ 就地拆除 ✓）");
+        check(sc->table[0] == NULL, "主连接被本地拆除（表槽清空 ✓）");
+        check(ffrdp_isdead(p_sc, 0) == 1, "此后按句柄问 ⇒ 已死（1 ✓）");
+        check(ffrdp_close(p_sc, 0) == -1, "重复 close ⇒ -1（无效句柄 ✓）");
+        ffrdp_exit(p_sc);
     }
 
     check(sim_alloc() == sim_freed(), "全部还回去：sim_alloc == sim_freed（无泄漏）");

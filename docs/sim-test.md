@@ -1,7 +1,7 @@
 # 差分仿真工具（`tools/sim`）使用说明
 
 工具本体在仓库的 `tools/sim/`：`run.sh`（构建 + A/B 驱动）、`simnet.c`（假网络）、
-`simll.c`（**假 lowlevel** ✓）、`simdefs.h`（两侧共享声明），以及九个测试 `e2e.c` / `t_rto.c` / `t_ack.c` / `t_fuzz.c` / `t_peer.c` / `t_handshake.c` / `t_crypto.c` / `t_recvdata.c` / `t_keepalive.c` ✓。
+`simll.c`（**假 lowlevel** ✓）、`simdefs.h`（两侧共享声明），以及十二个测试 `e2e.c` / `t_rto.c` / `t_ack.c` / `t_fuzz.c` / `t_peer.c` / `t_handshake.c` / `t_crypto.c` / `t_recvdata.c` / `t_keepalive.c` / `t_init.c` / `t_dump.c` / `t_fec.c` ✓。
 本文是它的使用说明。所有命令都在**仓库根目录**执行。
 
 相关文档：[`../readme.md`](../readme.md)（概述/编译）、[`ffrdp-v1.md`](ffrdp-v1.md)（协议与优化）、
@@ -20,6 +20,10 @@
 
 ```bash
 bash tools/sim/run.sh                    # 跑全部（9 个测试 + hs-e2e / e2e-raw / e2e 三个场景组）
+
+`ASAN=1 bash tools/sim/run.sh`         # 同一套判据再跑一遍：带地址消毒剂、并自动关 ASLR ✓
+                                     # 内存类 bug 只有这一遍才露 ✓（真机上踩到的三个都是这样抓出来的 ✓）；
+                                     # 现在它是**例行判据**的一部分 ✓ —— 改完必跑 ✓。
 TESTS="e2e"  bash tools/sim/run.sh       # 只跑端到端
 TESTS="t_rto" bash tools/sim/run.sh      # 只跑 RTO 放大测试
 REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而用指定文件
@@ -27,7 +31,7 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 
 | 环境变量 | 含义 | 默认 |
 |---|---|---|
-| `TESTS` | 要跑哪些测试 / 场景组（可多选，空格分隔）| `t_rto t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_keepalive hs-e2e e2e-raw e2e` |
+| `TESTS` | 要跑哪些测试 / 场景组（可多选，空格分隔）| `t_rto t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_keepalive t_init t_dump t_fec hs-e2e e2e-raw e2e` |
 | `REF` | **基线**源码路径 | `git show HEAD:ffrdp.c` |
 | `ASAN=1` | 打开地址消毒器（并自动加上 `halt_on_error=1` 与 `setarch -R` ✓）| 关 |
 | `SIM_LL_DEADLINE=1` | 假 lowlevel 换**忠实模型**（只在"有帧到"或"期限到"时唤醒 ✓）⚠️ 丢包场景下很贵 ✗，见下文的实测 | 关 ⇒ 用旧模型（每步无条件一次 TIMER ✗）|
@@ -65,7 +69,7 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 > 生成的中间文件（`ffrdp_base.c`、`ffrdp_new.c`、`ffrdp_*.h`、`lowlevel_*.h`、`utils_sim.c`、`*_base`、`*_new`、`*.o`）
 > 都在 `.gitignore` 里 ✓ —— 它们不是源码，每次 `run.sh` 都会重写 ✓。
 
-## 九个测试
+## 十二个测试
 
 | 测试 | 内容 | 判据 |
 |---|---|---|
@@ -77,6 +81,9 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 | `t_crypto` | **加密回调（v2）**：加/解密回调都被调到 ✓；**两条出口**（攒满 mss 的整帧 / 超时或 flush 的短帧）都验到 ✓；逐字节完好 ⇒ 线上确实是密文 ✓；另加"回调不改载荷"的对照段 ✓（v2-only ✓）|
 | `t_recvdata` | **异步交付（v2）**：回调返回 `NOT_CONSUMED` ⇒ 数据留在协议里、`ffrdp_recv` 取得到 ✓；返回 `CONSUMED` ⇒ 回调自己搬走、协议不留（`ffrdp_recv` 空 ✓）**但传输照常**（帧照常确认 ✓）（v2-only ✓）|
 | `t_keepalive` | **keep-alive（v2：`idle_ms` 接线）**：空闲×活着 ⇒ 跑 5×`idle_ms` 双方都不被误杀 ✓、且探活 QUERY 真的在发（`counter_send_query` 在涨 ✓）；空闲×对端哑掉 ⇒ `idle_ms` 后双方 `DISCONN` ✓、服务端收摊（表槽清空 ✓）、`isdead`=1 ✓、`recv` 报 `CLOSED` ✓（v2-only ✓）|
+| `t_init` | **参数解析（v2）**：`ffrdp_init` 的**全部校验分支**（params 为 NULL / scheme 不认识 / 键缺冒号 / 未知键 / `maxconn` 越界 ✓）与键边界（`maxconn:1` 与 `= FFRDP_MAXCONN` ✓、`mss:8` ✓、`handshake_ms:0` / `idle_ms:0` 这类"没校验但后果大"的键 ✓、`fec` 的 0..32 钳制 ✓）；纯负面用例 ✓（v2-only ✓）|
+| `t_dump` | **`ffrdp_dump` 的边界（v2）**：`conn < 0` / `0` / accept 句柄 / 空槽 / 越界 / **已放掉的槽** / `clearhistory` / **`ctxt == NULL`** ✓ —— 都不许崩 ✓（v2-only ✓）|
+| `t_fec` | **FEC 丢帧恢复（v2）**：`fec:3` 丢 1 个数据帧 ⇒ **恢复**（`counter_fec_ok=1` ✓，且逐字节正确、顺序不乱 ✓，并用 `resend_rto==0` 排除"其实是 ARQ 补的" ✗）；`fec:4` 丢 2 个 ⇒ `counter_fec_failed=1` ✓ 且**有序交付**（应用此刻拿不到 ✓），随后 ARQ 兜底补齐 ✓；`fec:2` ⇒ ⚠️ 现状**等于没有冗余** ✗（钉住已知行为 ✓）（v2-only ✓）|
 | `t_fuzz` | **敌意输入**：398 个畸形片段（长度扫过每种帧类型 × 3 种载荷 + 定种子随机），**每个片段 fork 一个子进程**喂进解析器；另做洞上方洪泛的内存有界检查 | 没有片段能杀死子进程（`all N fragments survived`）**且**洪泛内存有界（`-> bounded`）✓ 见下 |
 
 ### 多对端：夹具 API（P0 新增）

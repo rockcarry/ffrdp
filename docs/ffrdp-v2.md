@@ -115,7 +115,7 @@ ffrdps://0.0.0.0:8000,maxconn:16,handshake_ms:10000,idle_ms:5000,mss:1024,fec:0,
 
 ```
 bash build.sh                 # 真机侧（ffrdp.c + lowlevel-udp.c + socket.c + utils.c + test.c）
-bash tools/sim/run.sh         # 仿真侧：9 个测试 + 场景组（详见 docs/sim-test.md）
+bash tools/sim/run.sh         # 仿真侧：12 个测试 + 场景组（详见 docs/sim-test.md）
 ```
 
 - `tools/sim/run.sh` 会把每个测试编两份：**HEAD 那份**与**工作区那份** ✓ ⇒ 新旧行为可直接逐字对照 ✓。
