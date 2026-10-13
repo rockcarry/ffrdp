@@ -2088,7 +2088,14 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
             if ((cc->flags & FLAG_ACK_DUE) && (!d || (int32_t)(d - get_timestamp32_ms()) > 0)) {
                 cc->flags &= ~FLAG_ACK_DUE;
                 ffrdp_recvdata_and_sendack(ffrdp, cc);
-            } else ffrdp_tick_conn(ffrdp, cc);
+            } else {
+                ffrdp_tick_conn(ffrdp, cc);
+                // ⚠️ tick 里可能刚刚把这条连接**判死并收摊**（keepalive 超时 ⇒ 表槽清空 + free ✓）
+                //    ⇒ 这里必须重新查表，绝不能再碰 cc 这个旧指针 ✗
+                //   （ASAN 实测：`cc->pub_wait_snd = ...` 就是 heap-use-after-free ✓ ——
+                //     仿真不带 ASAN 时读到的还是释放前的内存 ⇒ 不崩、所以一直没露 ✗）。
+                if (ffrdp->table[i] != cc) continue;
+            }
             cc->pub_wait_snd = cc->wait_snd;   // 发布给应用看的镜像（受理判据用）
         }
     }
