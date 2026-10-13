@@ -1430,10 +1430,16 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     //   * 少了"还没首发的帧"那一半：一个 ack 刚把窗口/在途数打开，却没有人立刻把队列里的帧顶上 ——
     //     管线在每个 ack 之后空一段。实测 tick 次数腰斩（45253 -> 22793 / 12s），吞吐同步腰斩。
     // 条件是"发得出去"而不是"有东西要发"：窗口关着时叫醒只是空转，那种情况下一个 ack 自然会来敲门。
-    // 立刻叫醒的判据必须与 tick 真正"发得出去"的判据一致（否则窗口关着时空转）：
-    //   * 应用队列里有东西 —— drain 不受 cwnd 限制，它一定能成帧 ⇒ 有活，叫醒；
+    // 立刻叫醒的判据必须与"真正发得出去"的判据一致（否则窗口关着时空转）：
+    //   * 应用队列里有东西 **且 drain 这一轮真会喂** —— drain 自己的早退闸是
+    //     `wait_snd >= FFRDP_MAX_CWND_SIZE` ⇒ 表里排满窗口那么多未确认帧时它直接返回 ✗。
+    //     ⚠️ 少了后面这半句就是自旋：叫醒了、drain 每轮都早退、期限又被 arm 成 now ⇒
+    //     忠实模型（SIM_LL_DEADLINE=1）在**一个冻结的 tick 里**能转 10 万次回调，只有防自旋
+    //     护栏能打断（实测 0.05 丢包 300 步要 63s、撞 4 次护栏 ✗）。护栏是给仿真兜底的，
+    //     不该被当成设计的一部分 ✗。
     //   * 或者发送表里那个"还没首发"的帧，真的落在 tick 这一圈看得见的范围内（序号 < cwnd）。
-    if (c->app_tx_size || (pending_first && sent_before_pending < (int)c->cwnd)) {
+    if ((c->app_tx_size && c->wait_snd < (uint32_t)FFRDP_MAX_CWND_SIZE) ||
+        (pending_first && sent_before_pending < (int)c->cwnd)) {
         uint32_t limit = MAX(c->inflight_max ? c->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX, (uint32_t)FFRDP_INFLIGHT_MIN);
         // 用本圈刚数出来的 n_sent（= 在途帧数）。不能用 c->inflight_used：它只在 ffrdp_tick
         // 里刷新，而 ack 是在 DATA 回调(ffrdp_apply_acks)和 TIMER 的纯 ack 分支里处理的，那两条
