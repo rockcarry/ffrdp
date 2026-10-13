@@ -26,3 +26,13 @@ t_fuzz_base
 t_fuzz_new
 t_fuzz_base.c
 t_fuzz_new.c
+
+# run.sh 每跑一次都会按"每个测试 × 两个版本"生成一批文件 ✓ ——
+# 别一个个列（加一个新测试就会漏 ✗，实测：漏了 t_crypto/t_recvdata/t_keepalive/t_init/t_dump/t_fec/t_peer ✓），
+# 用通用图案兜住 ✓。
+*_base
+*_new
+*_base.c
+*_new.c
+*_base.h
+*_new.h
