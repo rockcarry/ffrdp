@@ -39,6 +39,21 @@
 #define FFRDP_MAX_CWND_SIZE  128
 // 连接表容量（v2：maxconn，默认 16 ✓）。句柄 = 下标 ✓、索引永不复用 ✓（见 ffrdp-v2.h）。
 #define FFRDP_MAXCONN        16
+// ── 握手（v2）────────────────────────────────────────────────────────────
+// 只吃一个帧类型号，子类型放载荷第 1 字节（将来加字段只扩载荷，不再占类型号）。
+// 构造方式照抄 QUERY：小栈缓冲 + lowlevel->send() 直接发 ⇒ 绕开 frame_node 的 FEC 尾巴。
+// 帧类型 35 是安全的：ffrdp_on_frame 只认 ≤34，其余一律静默忽略（v1 收到会直接丢掉 ✓）。
+#define FFRDP_FRAME_TYPE_HANDSHAKE 35
+#define FFRDP_HS_SYN      1
+#define FFRDP_HS_SYN_ACK  2
+#define FFRDP_HS_ACK      3
+#define FFRDP_HS_FIN      4
+#define FFRDP_HS_RETRY_MS 500   // 重传间隔（总时限用配置的 handshake_ms ✓）
+// 握手状态（每条连接）
+#define HS_NONE     0
+#define HS_SYN_SENT 1   // 客户端发了 SYN，等 SYN-ACK
+#define HS_SYN_RCVD 2   // 服务端发了 SYN-ACK（半开），等 ACK
+#define HS_UP       3   // 已建立
                                   // 2026-10-12 真机 A/B：这个上限与 FFRDP_INFLIGHT_MAX 一起从 64 抬到
                                   // 128 后，两侧吞吐同时 ×3（客户端 2.5->7.1 MB/s，服务端 3.8->11.4），
                                   // 服务端 counter_send_failed 9120->254；再抬到 256 基本不再涨（拐点在
@@ -195,7 +210,6 @@ typedef struct tagFFRDP_FRAME_NODE {
 } FFRDP_FRAME_NODE;
 
 // ── 标志位 ───────────────────────────────────────────────────────────────
-    #define FLAG_SERVER    (1 << 0)
     #define FLAG_CONNECTED (1 << 1)
     #define FLAG_FLUSH     (1 << 2)
     #define FLAG_TX_AES256 (1 << 3)
@@ -354,6 +368,9 @@ typedef struct {
     uint32_t counter_to_noack;    // 超时时：自首发以来一个 ack 都没收到过
     uint32_t counter_to_hadack;   // 超时时：收到过 ack，但没有覆盖这一帧
     uint32_t counter_to_age_max;  // 超时时"距首发"的最大毫秒数
+    uint32_t hs_state;            // 握手状态（HS_*；0 = 不走握手）—— 放 reserved 之后 ⇒ 不动清零跨度 ✓
+    uint32_t hs_tick;             // 上次发握手帧的时刻（重传计时）
+    uint32_t hs_retry;            // 已重传次数
     uint32_t counter_rx_foreign;  // 来源地址不是本连接对端的帧：按地址分发后应当只有"别人的包"
                                   // （P2 第二步新增 ⇒ 放在 reserved 之后：不参与 dump 的清零跨度、也不打印 ⇒ 输出不变 ✓）
     uint32_t reserved;            // ffrdp_dump clears everything up to here: nothing that must outlive a
@@ -402,6 +419,9 @@ typedef struct {
     int               maxconn;       // 配置：最大连接数（"maxconn:N"，默认 FFRDP_MAXCONN）
     int               handshake_ms;  // 配置：握手超时（"handshake:N"，默认 10000）
     int               idle_ms;       // 配置：空闲判死超时（"idle:N"，默认 5000）
+    int               hs_enable;     // 配置：是否走三次握手（"hs:1"，默认 0 ⇒ 线上行为与 v1 一致 ✓）
+    int               is_server;     // 角色（v1 的 FLAG_SERVER 搬到进程级：它是"这个进程"的属性，不是连接的 ✗）
+    int               next_slot;     // 连接表里下一个可用的下标（**永不复用** ✓，见 ffrdp-v2.h）
     pthread_mutex_t   lock;          // 保护 app_tx_* / recv_buff+recv_size/head/tail / peer_addr / flags / 上列几个
     pthread_cond_t    cond;          // 协议侧腾出空间或送来数据时叫醒应用侧
     uint32_t tick_ffrdp_dump;
@@ -592,6 +612,51 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int clearhistory)
 // 全文件唯一的一条函数前置声明：ffrdp_init（在上面）要把这个回调**当值**交给传输层，而它的定义
 // 在协议那一大段的后面。想连它一起消掉，只能把 ffrdp_init 也挪到最后 —— 那会让这个文件的入口
 // 跑到末尾。原来这里还有另外五条声明，已经靠调整函数位置消掉了。
+// 一条连接的默认值：主连接与"按需分配的新连接"共用同一套（方案 A：每连接一个 calloc ✓，
+// 每连接仍用固定大小缓冲 ✓ —— 与 ffrdp-v2.h 的"第一阶段不优化"一致 ✓）。
+static void ffrdp_conn_init(FFRDPCONN *c, int smss, int sfec)
+{
+    c->swnd     = FFRDP_DEF_CWND_SIZE;
+    c->cwnd     = FFRDP_DEF_CWND_SIZE;
+    c->ssthresh = FFRDP_DEF_CWND_SIZE;
+    c->rtts     = (uint32_t) -1;
+    c->rto      = FFRDP_MIN_RTO;
+    c->rmss     = FFRDP_MAX_MSS;
+    c->smss     = MAX(1, MIN(smss, FFRDP_MAX_MSS));
+    c->fec_txredundancy = MAX(0, MIN(sfec, FFRDP_FRAME_TYPE_FEC32));
+}
+
+// 按需分配一条新连接（方案 A）。句柄 = 表下标 ✓、**索引永不复用** ✓（见 ffrdp-v2.h）：
+// 所以下标只从 next_slot 往后取，关掉的槽留在表里当 NULL，不再被借走 ✓。
+// 返回新连接；*handle 给句柄。表满（maxconn / FFRDP_MAXCONN）⇒ NULL。
+static FFRDPCONN *ffrdp_conn_new(FFRDPCONTEXT *ffrdp, uint64_t addr, int *handle)
+{
+    FFRDPCONN *c;
+    int        slot = ffrdp->next_slot;
+    if (slot >= ffrdp->maxconn || slot >= FFRDP_MAXCONN) return NULL;
+    if (!(c = calloc(1, sizeof(FFRDPCONN)))) return NULL;
+    ffrdp_conn_init(c, ffrdp->conn.smss, ffrdp->conn.fec_txredundancy);
+    c->peer_addr = addr;
+    c->flags    |= FLAG_CONNECTED;      // 服务端：对端就是它（学到即连上 ✓）
+    ffrdp->table[slot] = c;
+    ffrdp->next_slot   = slot + 1;
+    ffrdp->nconn       = slot + 1;
+    if (handle) *handle = slot;
+    return c;
+}
+
+// 释放一条连接（主连接是内嵌的 ⇒ 只清空它的链表，不 free 结构体本身 ✓）。
+static void ffrdp_conn_free(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
+{
+    int i;
+    if (!c) return;
+    list_free(&c->send_list_head, &c->send_list_tail);
+    list_free(&c->recv_list_head, &c->recv_list_tail);
+    if (c->cur_new_node) { free(c->cur_new_node); c->cur_new_node = NULL; }
+    for (i = 0; i < ffrdp->nconn; i++) if (ffrdp->table[i] == c) ffrdp->table[i] = NULL;  // 槽不回收 ✓
+    if (c != &ffrdp->conn) free(c);
+}
+
 // 配置串解析（v2）："ffrdps://ip[:port][,key:val]..." / "ffrdpc://ip[:port][,key:val]..."。
 // 角色由 scheme 决定（替代 v1 的 server 参数）；smss/sfec 由 mss:/fec: 给（v2 的 init 没有位置参数）。
 // 解析失败 ⇒ 返回 NULL 并说明原因 ✓（不静默）。
@@ -601,7 +666,7 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
     char         buf[192];
     char        *text, *addr, *key;
     int          server = 0, smss = FFRDP_MAX_MSS, sfec = 0;
-    int          maxconn = FFRDP_MAXCONN, handshake_ms = 10000, idle_ms = 5000;
+    int          maxconn = FFRDP_MAXCONN, handshake_ms = 10000, idle_ms = 5000, hs_enable = 0;
 
     if (!params) { printf("ffrdp_init: params is NULL\n"); return NULL; }
     snprintf(buf, sizeof(buf), "%s", (char*)params);
@@ -626,6 +691,7 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
         else if (!strcmp(key, "idle"))      idle_ms      = val;
         else if (!strcmp(key, "mss"))       smss         = val;
         else if (!strcmp(key, "fec"))       sfec         = val;
+        else if (!strcmp(key, "hs"))        hs_enable    = val;   // 三次握手开关（默认关 ✓）
         else { printf("ffrdp_init: unknown option \"%s\"\n", key); return NULL; }
         key = next;
     }
@@ -639,19 +705,14 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
     ffrdp->maxconn      = maxconn;
     ffrdp->handshake_ms = handshake_ms;
     ffrdp->idle_ms      = idle_ms;
+    ffrdp->hs_enable    = hs_enable ? 1 : 0;
+    ffrdp->next_slot    = 1;   // 0 号被内嵌的主连接占用 ✓
     // 连接表：第一步只有 0 号，指向内嵌的主连接 ⇒ 必须在第一次碰 ffrdp->conn 之前设好 ✓。
     ffrdp->table[0] = &ffrdp->conn;
     ffrdp->nconn    = 1;
     {   // 主连接（P4）：单连接阶段协议只跑在它上面；多连接按地址分发是下一步。
         FFRDPCONN *c = &ffrdp->conn;
-    c->swnd     = FFRDP_DEF_CWND_SIZE;
-    c->cwnd     = FFRDP_DEF_CWND_SIZE;
-    c->ssthresh = FFRDP_DEF_CWND_SIZE;
-    c->rtts     = (uint32_t) -1;
-    c->rto      = FFRDP_MIN_RTO;
-    c->rmss     = FFRDP_MAX_MSS;
-    c->smss     = MAX(1, MIN(smss, FFRDP_MAX_MSS));
-    c->fec_txredundancy = MAX(0, MIN(sfec, FFRDP_FRAME_TYPE_FEC32));
+    ffrdp_conn_init(c, smss, sfec);
     ffrdp->tick_ffrdp_dump  = get_timestamp32_ms();
     ffrdp->tick_ffrdp_init  = ffrdp->tick_ffrdp_dump;
     c->tick_rto_backoff = ffrdp->tick_ffrdp_dump - c->rto; // allow the first timeout to backoff
@@ -673,7 +734,7 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
     {
         char llparams[128], peer[128];
         if (server) {
-            c->flags |= FLAG_SERVER;
+            ffrdp->is_server = 1;
             // 允许直接给传输层的原样写法（"bind:..."），其余情况由这里补前缀。
             if (addr && strncmp(addr, "bind:", 5) == 0) snprintf(llparams, sizeof(llparams), "%s", addr);
             else snprintf(llparams, sizeof(llparams), "bind:%s", (addr && *addr) ? addr : "0.0.0.0");
@@ -723,7 +784,13 @@ failed:
 void ffrdp_exit(void *ctxt)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
-    FFRDPCONN *c = &ffrdp->conn;   // 主连接（下一步：遍历连接表，按方案 A 释放）
+    FFRDPCONN *c = &ffrdp->conn;   // 主连接
+    // 先放掉按需分配的那些连接（主连接是内嵌的 ⇒ 由下面的原有代码负责 ✓）。
+    {   int i;
+        for (i = 0; i < ffrdp->nconn; i++) {
+            if (ffrdp->table[i] && ffrdp->table[i] != &ffrdp->conn) ffrdp_conn_free(ffrdp, ffrdp->table[i]);
+        }
+    }
     FFRDP_LOWLEVEL *ll;
     if (!ctxt) return;
     // 顺序是有讲究的：先让等待中的应用线程醒过来（它们看到 closing 就返回），再停工作线程。反过来的话，
@@ -769,7 +836,7 @@ int ffrdp_send(void *ctxt, int conn, char *buf, int len, int timeout_ms)
     // 三条拒绝路径都跳到同一个出口：计数与解锁只有一处，rc 已经预置成 -1。对端还没连上也在这里
     // 被拒绝（与以前一样）。
     if (ffrdp->closing) { rc = FFRDP_CLOSED; goto out; }                                  // 正在关：当作已断
-    if ((c->flags & FLAG_SERVER) && (c->flags & FLAG_CONNECTED) == 0) { rc = FFRDP_CLOSED; goto out; } // 对端还没连上
+    if (ffrdp->is_server && (c->flags & FLAG_CONNECTED) == 0) { rc = FFRDP_CLOSED; goto out; } // 对端还没连上
     // 帧数上限只在这里判一次：用的是协议发布的镜像 pub_wait_snd（"已成帧、未确认"的帧数），它不含还
     // 排在下面这个队列里、尚未成帧的消息 —— 所以这是个近似判据，队列本身的容量（FFRDP_APP_TX_SIZE）
     // 是它的兜底。drain 那边不再重复判一次（见 ffrdp_drain_tx）。
@@ -1683,16 +1750,16 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
         if (len != (int)sizeof(FFRDP_LOWLEVEL_MSG) || !msg->buf || msg->len <= 0) ret = -1;
         else {
             // 服务端从第一个收到的包学会对端（旧版是在收包循环里做同一件事）；连上之后，别人的包不理。
-            if ((c->flags & FLAG_SERVER) && (c->flags & FLAG_CONNECTED) == 0) {
+            if (ffrdp->is_server && (c->flags & FLAG_CONNECTED) == 0) {
                 c->flags |= FLAG_CONNECTED;
                 c->peer_addr = msg->addr;
             }
             // "连上之后，别人的包不理"这句以前只是注释 ✗ —— 现在由查表真正执行 ✓：
             // 来源地址不是本连接对端的帧，一律丢弃并计数（不静默 ✓）。这就是 v2 的按地址分发。
-            if ((!(c->flags & FLAG_SERVER) || (c->flags & FLAG_CONNECTED))
+            if ((!ffrdp->is_server || (c->flags & FLAG_CONNECTED))
                 && ffrdp_conn_by_addr(ffrdp, msg->addr) == NULL) {
                 c->counter_rx_foreign++;
-            } else if (!(c->flags & FLAG_SERVER) || (c->flags & FLAG_CONNECTED)) {
+            } else if (!ffrdp->is_server || (c->flags & FLAG_CONNECTED)) {
                 int n = msg->len;
                 FFRDP_FRAME_NODE *node = frame_node_new(FFRDP_FRAME_TYPE_FEC2, FFRDP_MAX_MSS);
                 if (!node) ret = -1;
