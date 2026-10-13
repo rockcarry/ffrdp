@@ -37,6 +37,8 @@
 #define FFRDP_MIN_CWND_SIZE  1
 #define FFRDP_DEF_CWND_SIZE  32
 #define FFRDP_MAX_CWND_SIZE  128
+// 连接表容量（v2：maxconn，默认 16 ✓）。句柄 = 下标 ✓、索引永不复用 ✓（见 ffrdp-v2.h）。
+#define FFRDP_MAXCONN        16
                                   // 2026-10-12 真机 A/B：这个上限与 FFRDP_INFLIGHT_MAX 一起从 64 抬到
                                   // 128 后，两侧吞吐同时 ×3（客户端 2.5->7.1 MB/s，服务端 3.8->11.4），
                                   // 服务端 counter_send_failed 9120->254；再抬到 256 基本不再涨（拐点在
@@ -397,7 +399,14 @@ typedef struct {
     pthread_cond_t    cond;          // 协议侧腾出空间或送来数据时叫醒应用侧
     uint32_t tick_ffrdp_dump;
     uint32_t tick_ffrdp_init;  // tick of ffrdp_init, for the elapsed time in the dump
-    FFRDPCONN conn;   // P1：内嵌的单连接（v2 改成 conn_list[maxconn]，句柄是下标 ✓）
+    FFRDPCONN conn;   // P1：内嵌的主连接（第一步的表 0 号就指向它 ⇒ 内存/行为与 P1 一致 ✓）
+
+    // ── 连接表（P2 第一步）──────────────────────────────────────────────────
+    // 连接句柄 = 下标 ✓；lowlevel 收到帧后按对端地址查这张表 ✓（v2 的分发点）。
+    // 第一步只启用 0 号（指向上面的内嵌主连接 ✓）⇒ 还没有任何行为变化 ✓、内存也不涨 ✓；
+    // 第二步起才谈"多条连接要不要预分配固定缓冲"（那是内存代价，要先定 ✓）。
+    FFRDPCONN *table[FFRDP_MAXCONN];
+    int        nconn;
 } FFRDPCONTEXT;
 
 static uint32_t ringbuf_write(uint8_t *rbuf, uint32_t maxsize, uint32_t tail, uint8_t *src, uint32_t len)
@@ -580,6 +589,9 @@ void* ffrdp_init(char *addr, char *txkey, char *rxkey, int server, int smss, int
     // 平台相关的初始化（Windows 的 WSAStartup / 定时器精度）不在这里：协议层不碰 socket，socket
     // 那一层（socket.c / lowlevel-udp.c）自己管自己的。
     if (!(ffrdp = calloc(1, sizeof(FFRDPCONTEXT)))) return NULL;
+    // 连接表：第一步只有 0 号，指向内嵌的主连接 ⇒ 必须在第一次碰 ffrdp->conn 之前设好 ✓。
+    ffrdp->table[0] = &ffrdp->conn;
+    ffrdp->nconn    = 1;
     ffrdp->conn.swnd     = FFRDP_DEF_CWND_SIZE;
     ffrdp->conn.cwnd     = FFRDP_DEF_CWND_SIZE;
     ffrdp->conn.ssthresh = FFRDP_DEF_CWND_SIZE;
