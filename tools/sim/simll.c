@@ -28,7 +28,6 @@
 
 // In the sim an addr is opaque: sim_send() ignores it. It must still be non zero, because a server
 // stores the addr of the first frame it receives as its peer (ffrdp_lowlevel_cb), and 0 is "no peer".
-#define SIMLL_ADDR 0x7F00000100005001ULL
 
 #define SIMLL_MAX 8 // the two endpoint tests, plus room for however many a later test wants
 

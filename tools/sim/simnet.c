@@ -139,7 +139,9 @@ static void push(int idx, uint64_t src, void *buf, int len, unsigned k)
     qt[idx] = (qt[idx] + 1) % MAXQ; qn[idx]++;
 }
 
-void sim_inject(int idx, void *buf, int len) { push(idx, g_slot[idx], buf, len, 1); }
+// 注入的包是"以对端身份"放进来的 ✓ ⇒ 源地址用约定地址 ✓（协议按它查表 ✓）；
+// 以前用 slot 自己的地址（默认 0 ✗）⇒ 按地址分发后会被当"别人的包"丢掉 ✓。
+void sim_inject(int idx, void *buf, int len) { push(idx, SIMLL_ADDR, buf, len, 1); }
 
 // 显式版本：目的 slot 与包里带的源地址都由调用方给（多对端路由用，P0 新增）。
 // 目的 slot 越界就直接丢弃 —— 旧路径只会在 slot 0/1 之间走，所以这条护栏碰不到老测试。

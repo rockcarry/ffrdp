@@ -5,6 +5,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// 仿真里 addr 对协议是不透明的 ✓ —— 但 P2 第二步起协议会**按地址分发** ✓（ffrdp_conn_by_addr ✓），
+// 所以这个默认值必须等于协议真算出来的那个地址 ✓：
+//   ffrdp_addr_make(127.0.0.1, 8001) = (0x7F000001 << 16) | 8001 = 0x7F0000011F41 ✓
+// 仿真里所有测试都用 "127.0.0.1:8001" ✓。**换端口就要同步改这里** ✗（否则帧会被当"别人的包"丢掉 ✓）。
+#define SIMLL_ADDR 0x7F0000011F41ULL
+
 #define SIMNET_SLOTS 8   // 最多几个 slot：一个 slot = 一端。v2 的多连接测试里，服务端占一个、每个对端各一个。
 
 uint32_t sim_tick(void);             // the virtual clock: run.sh rewrites utils.c's timestamp into this

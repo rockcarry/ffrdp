@@ -87,6 +87,13 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 | `sim_ll_route(fl, addr, slot)` | 假 lowlevel 的**按地址路由**：`ll->send(addr)` 落到哪个 slot ✓ |
 | `sim_ll_own(fl, addr)` | 本实例自己的地址（回给已登记对端时带的源地址 ✓）|
 
+**地址约定（P2 第二步起生效 ✗→✓）**：协议把地址表示成 `(ip << 16) | port` ✓、并**按地址查表分发** ✓
+（`ffrdp_conn_by_addr()` ✓：来源地址不是本连接对端的帧一律丢弃 ✓），所以夹具报的地址
+**必须等于协议真算出来的那个值** ✓。默认 `SIMLL_ADDR = ffrdp_addr_make(127.0.0.1, 8001)` ✓
+（仿真里所有测试都用 `127.0.0.1:8001` ✓）。**换端口要同步改它** ✗ ——
+实测把它改错一位：对端方向 **100% 丢包** ✓、`resend=140%` ✓、客户端 `recv` 掉到 1/40 ✓。
+`e2e.c` 用的是更强的做法 ✓：直接把 `c0->peer_addr` 登记给服务端那一侧 ✓（不依赖常量 ✓）。
+
 **关键约定** ✓：`sim_send()` / `sim_recv()` / `msg.addr` 的**老行为一个字都没变** ✗ ——
 没登记地址时 `msg.addr` 仍是老常量 `SIMLL_ADDR` ✓、`sim_send()` 仍是"发到 `1-cursid` 那个 slot" ✓
 ⇒ 老的两端测试一行都不用改 ✓（判据：17 场景输出**逐字相同** ✓，已验 ✓）。

@@ -354,6 +354,8 @@ typedef struct {
     uint32_t counter_to_noack;    // 超时时：自首发以来一个 ack 都没收到过
     uint32_t counter_to_hadack;   // 超时时：收到过 ack，但没有覆盖这一帧
     uint32_t counter_to_age_max;  // 超时时"距首发"的最大毫秒数
+    uint32_t counter_rx_foreign;  // 来源地址不是本连接对端的帧：按地址分发后应当只有"别人的包"
+                                  // （P2 第二步新增 ⇒ 放在 reserved 之后：不参与 dump 的清零跨度、也不打印 ⇒ 输出不变 ✓）
     uint32_t reserved;            // ffrdp_dump clears everything up to here: nothing that must outlive a
                                   // dump, and nothing a decision depends on, may sit above this line
                                   // (the probe would otherwise be reset exactly when it is about to run).
@@ -1547,6 +1549,19 @@ static void ffrdp_tick(FFRDPCONTEXT *ffrdp)
 
 // lowlevel 的入口：它的工作线程在这里回到协议里。同一时刻只会有一路，锁保护整个回调，协议自己的状态
 // 因此仍然只被一个线程碰。
+// 按对端地址查连接（v2 的分发点：lowlevel 收到帧后用它决定流向哪条连接 ✓）。
+// 连接句柄 = 表下标 ✓（见 ffrdp-v2.h）；第一步 nconn 恒为 1 ✓，所以这里就是"是不是我们的对端"。
+static FFRDPCONN *ffrdp_conn_by_addr(FFRDPCONTEXT *ffrdp, uint64_t addr)
+{
+    int i;
+    if (!addr) return NULL;                     // 0 = 没有来源地址 ⇒ 不认（旧版会把 0 学成对端 ✗）
+    for (i = 0; i < ffrdp->nconn && i < FFRDP_MAXCONN; i++) {
+        FFRDPCONN *c = ffrdp->table[i];
+        if (c && c->peer_addr == addr) return c;
+    }
+    return NULL;
+}
+
 static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)cbctx;
@@ -1563,7 +1578,12 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
                 ffrdp->conn.flags |= FLAG_CONNECTED;
                 ffrdp->conn.peer_addr = msg->addr;
             }
-            if (!(ffrdp->conn.flags & FLAG_SERVER) || (ffrdp->conn.flags & FLAG_CONNECTED)) {
+            // "连上之后，别人的包不理"这句以前只是注释 ✗ —— 现在由查表真正执行 ✓：
+            // 来源地址不是本连接对端的帧，一律丢弃并计数（不静默 ✓）。这就是 v2 的按地址分发。
+            if ((!(ffrdp->conn.flags & FLAG_SERVER) || (ffrdp->conn.flags & FLAG_CONNECTED))
+                && ffrdp_conn_by_addr(ffrdp, msg->addr) == NULL) {
+                ffrdp->conn.counter_rx_foreign++;
+            } else if (!(ffrdp->conn.flags & FLAG_SERVER) || (ffrdp->conn.flags & FLAG_CONNECTED)) {
                 int n = msg->len;
                 FFRDP_FRAME_NODE *node = frame_node_new(FFRDP_FRAME_TYPE_FEC2, FFRDP_MAX_MSS);
                 if (!node) ret = -1;
