@@ -19,31 +19,51 @@
 // 单帧载荷上限：由传输层的一帧上限派生（**不再写死 1500**）——减掉最大帧开销，再向下对齐到 4 字节。
 // 1500 - 6 = 1494 ⇒ &~3 = 1492，与旧值 (1500 - 8) 相同 ⇒ 这次只是把来源写清、行为不变。
 #define FFRDP_MAX_MSS       ((FFRDP_LOWLEVEL_FRAME_MAX - FFRDP_FRAME_OVERHEAD) & ~3)
-#define FFRDP_MIN_RTO        16
+#define FFRDP_MIN_RTO        16   // RTO 硬下限（v1.1.0 原值）。
+                                  // 2026-10-12 真机教训：改成的不是这个常数，而是"让 RTO 自己去够到延迟尾部"。
+                                  // 真机上原有的 33~55 次/秒伪超时（resend_waste 99.7~100%）不是 RTO 太小，
+                                  // 而是**估计器看不见尾部**：RTT 采样把"被重传过的帧"整批排除，而迟到 85~92 ms
+                                  // 的恰恰全是这批 ⇒ 任何 rtts/rttd 公式都学不到它（临时把下限抬到 100 ms 能治好，
+                                  // 已验证，但那是常数、在真丢包链路上要付恢复变慢的代价）。
+                                  // 更好的做法见 rtt_tail：只采"对端其实早就有"的那种超时，把它学进 RTO。
 #define FFRDP_MAX_RTO        2000
 // 在途帧数上限（判在 ffrdp_send 的受理判据里），同时也是应用队列容量的乘数（见 FFRDP_APP_TX_SIZE）。
 // 必须 >= FFRDP_INFLIGHT_MAX（以及 FFRDP_MAX_CWND_SIZE）：比它小就成了比协议闸门更紧的刹车，在途
 // 永远填不满窗口，高 BDP 链路上会掉速 —— 而回环 RTT 极小，测不出来。默认取值与此二者相等。
-#define FFRDP_MAX_WAITSND    64
+#define FFRDP_MAX_WAITSND    256
 #define FFRDP_QUERY_CYCLE    500
 #define FFRDP_FLUSH_TIMEOUT  500
 #define FFRDP_DEAD_TIMEOUT   5000
 #define FFRDP_MIN_CWND_SIZE  1
 #define FFRDP_DEF_CWND_SIZE  32
-#define FFRDP_MAX_CWND_SIZE  64
+#define FFRDP_MAX_CWND_SIZE  128
+                                  // 2026-10-12 真机 A/B：这个上限与 FFRDP_INFLIGHT_MAX 一起从 64 抬到
+                                  // 128 后，两侧吞吐同时 ×3（客户端 2.5->7.1 MB/s，服务端 3.8->11.4），
+                                  // 服务端 counter_send_failed 9120->254；再抬到 256 基本不再涨（拐点在
+                                  // 128）。注意它同时是 ffrdp_drain_tx 的早退判据，所以不要只改在途闸门。
 
 // step29: the real brake -- the number of frames allowed on the wire at once. The peer's advertised window
 // cannot serve as one: it is handed out again on every ack, so a limit placed on it never binds (measured:
 // 63 frames in flight while the cap read 22). Measured on the target path: link ~365KB/s, idle round trip
 // 5..16ms, so the bandwidth-delay product is 1..6 frames -- and the standing queue we were holding came
 // from keeping 64 of them in flight, which is exactly the 219ms the ping sees while the test runs.
-#define FFRDP_INFLIGHT_MAX   64   // default ceiling for frames on the wire. The number that is useful on a
+// 2026-10-13 真机 A/B（z2~z6，交错跑、两端夹 oldarch）：窗口 16/8/6 的吞吐完全相同，
+// 而 RTT 随窗口线性增长（53/25/17ms）——窗口只买延迟 ⇒ 取到链路 BDP 附近（本链路 ~3 帧）。
+#define FFRDP_INFLIGHT_MAX   5
                                   // given path cannot be picked in advance: the simulator (fast links, coarse
                                   // acks) breaks below 64, while the target path needs 2..6 to stop holding a
                                   // 219ms queue. So the default is the harmless value, and the probe (see
                                   // FFRDP_PROBE_ENABLE) is what experiments its way down to the right one.
                                   // It is a source constant, not a build switch: change it here and rebuild.
-#define FFRDP_INFLIGHT_MIN   4    // the floor the brake never goes below, so the probe never asks for less.
+// 地板同步下调：探针关闭时，实际闸门就是 MAX(INFLIGHT_MAX, INFLIGHT_MIN)。
+#define FFRDP_INFLIGHT_MIN   4
+                                  // It used to be 4, and that proved to be a ceiling rather than a floor: 4 frames
+                                  // is 5 KB, and on a 1 ms path the probe kept walking down to it and pinned the
+                                  // send rate there (measured 2026-10-12: cap 5, confirmed rate 5 frames/s,
+                                  // cap-block on every tick, the application rejected 32k times in 80 s while the
+                                  // other direction, whose probe reverted, ran at 1.1 MB/s). Half of
+                                  // FFRDP_INFLIGHT_MAX leaves the probe a range to work in without being able to
+                                  // destroy the pipe with a single mistaken keep.
                                   // Named because the three places that used to write their own 4 or 8 drifted
                                   // apart and that is what the sweep caught: the brake clamped to 4, the probe
                                   // asked for 4, but its gate demanded 8 frames on the wire -- so once a
@@ -72,7 +92,21 @@
                                       // milliseconds -- so it is compared as one. The rate guard below is what
                                       // keeps an over-eager keep harmless, and the giveback undoes a stale one.
 #define FFRDP_PROBE_RATE_KEEP_PCT 85  // ... while the rate the peer confirms stays above this percentage
-#define FFRDP_PROBE_ENABLE        1   // on by default: it is a net win wherever a queue is being held, and
+// 2026-10-13 暂时关闭：探针的判据与地板是在"唤醒坏掉"的时期调出来的，先固定窗口；
+// 唤醒修好之后（见 ffrdp_next_due 里 n_sent 那一段）可以再打开重验。
+#define FFRDP_PROBE_ENABLE        0
+                                      // —— 把在途砍半，若 rtts 明显下降且确认速率没掉，就保留更小的上限（同吞吐、低延迟）。
+                                      // 真机上它曾走过一次"单向棘轮"✗：参考取紧邻的前一秒，第一刀之后参考自己也掉 ⇒
+                                      // 每一刀都通过 ⇒ 上限被一路 keep 到地板。现在三处安全网就位：
+                                      //   1) 参考改成"探测前一秒"与"见过的最好一秒"里的较大者（rate_best，每秒衰减 1/16）
+                                      //      ⇒ 一个 keep 必须让速率不低于历史最好值的 85%，砍过头会被拒；
+                                      //   2) 按秒 giveback：被 keep 的上限把速率拖到最好值的 85% 以下 ⇒ 每秒翻倍还回去；
+                                      //   3) 地板 INFLIGHT_MIN = 32（= INFLIGHT_MAX 的一半）⇒ 一次误 keep 也压不死管子。
+                                      // 注意它是"延迟 ↔ 吞吐"的取向选择：2026-10-12 坏 AP 那次（RTT 0.3~2 s）它把上限
+                                      // keep 到 32~64，吞吐因此更低，但 RTT 确实掉回 109ms —— 那是设计行为（§1.1 优先级②），
+                                      // 不是故障。要"吞吐优先"就把这一行改成 0 重编（dist 里有 test_ffrdp_noprobe）。
+                                      // lo 上它不触发（rtts ≈ rtt_min）⇒ 只有真机或 tools/sim 能验它；见 notes 26.9/26.14/26.15。
+                                      // on by default: it is a net win wherever a queue is being held, and
                                       // where there is none the rate guard reverts it and nothing is lost.
                                       // it is also how a new path gets asked "is the delay ours?", so it is
                                       // left on rather than built specially for the question.
@@ -107,7 +141,13 @@
 // 一条最大的合法消息（FFRDP_MAX_WAITSND 帧 × smss，smss ≤ FFRDP_MAX_MSS）一定放得下。
 // 反过来：把它配小之后，仍然能发送的单条消息上限就是 FFRDP_APP_TX_SIZE - 4（4 字节长度前缀），
 // 超过它的 ffrdp_send 会直接返回 -1，不会空等（见那里的守卫）。配小的代价只是发送背压更早出现。
-#define FFRDP_APP_TX_SIZE   (FFRDP_MAX_WAITSND * (FFRDP_MAX_MSS + 4))
+#define FFRDP_APP_TX_SIZE   (64 * 1024)   // 64 KiB：**与 FFRDP_MAX_WAITSND 解耦**（v1.1.0 里是 WAITSND×(MSS+4)
+                                  // = 374 KiB）。理由：WAITSND 现在只是"在途/受理"的**帧数闸门**，与这块纯应用侧
+                                  // 缓冲没有关系；旧的乘法把两者捆在一起，于是"省内存"必然"掉吞吐"——那是个假取舍
+                                  // （真机实测：WAITSND 64→256 让两侧吞吐 ×3，而队列容量本可以不动）。
+                                  // 这条式子只决定两件事：① 能发的**单条消息**上限 = 这个数 − 4；
+                                  // ② 背压何时出现。容量小 ⇒ 非阻塞调用更早返回 -1（调用方按契约重试即可），
+                                  // 对吞吐**中性**（协议的在途量由 WAITSND / INFLIGHT_MAX 决定，不由它决定）。
 // how far ahead of the hole a received frame may sit before it is dropped instead of stored. The window
 // we advertise travels in a one byte field of the ack, so it is never more than 255 frames, and a peer
 // that respects its credit cannot be further ahead than that. Anything beyond it is a lie or a
@@ -148,6 +188,8 @@ typedef struct tagFFRDP_FRAME_NODE {
     uint32_t tick_1sts;    // frame first time send tick
     uint32_t tick_send;    // frame send tick
     uint32_t tick_timeout; // frame ack timeout tick
+    uint32_t ticket;       // 首发时的 counter_ack_recv 快照：超时时用来分辨"等待期间 ack 到没到"。
+                           // 不是临时调试：它是 timeout diag 与 rtt_tail 采样条件的依据，保留。
 } FFRDP_FRAME_NODE;
 
 typedef struct {
@@ -191,7 +233,12 @@ typedef struct {
     uint32_t wait_snd; // data frame number wait to send
     uint32_t rttm, rtts, rttd, rto;
     uint32_t rmss, smss, swnd, cwnd, ssthresh;
+    uint32_t peer_wnd_raw;        // 对端最近一次广告的窗口（夹之前的原值）：用来区分"我们夹的"与"对端给的"
+    uint32_t counter_swnd0;       // 有帧等着首发、却没有信用的 tick 数：发送被饿死的直接证据
+    uint32_t counter_capblock;    // 有帧等着首发、却被在途闸门挡住的 tick 数
     uint32_t rto_floor;           // persistent lower bound on the rto, moved only by the peer's duplicate reports
+    uint32_t rtt_tail;            // 学到的"确认延迟尾部"：由"被重传过的帧最后被确认时的等待"喂入，每次增长限速
+                                  // （首次 ≤64ms，之后 ≤ +50%+25ms），每秒衰减 1/16；让 RTO 覆盖 rtts/rttd 看不见的那一档。
     uint32_t win_need, win_dup;   // retransmits attempted in this evidence window, and how many the peer called pointless
     uint32_t tick_win;            // when the current evidence window was opened
     uint32_t hole_wait;           // ms a frame must be outstanding before a reported hole is believed
@@ -228,6 +275,9 @@ typedef struct {
     uint32_t counter_send_1sttime; // first transmissions: the denominator of counter_resend_ratio
     uint32_t counter_send_failed;  // ffrdp_send refused the call (app queue full, or an allocation failed)
     uint32_t counter_send_query;
+    // 2026-10-13 诊断：收帧→回 ack 的耗时（微秒）。服务端（对端）看到的 RTT 里含这一段。
+    uint32_t ack_lat_n, ack_lat_avg_us, ack_lat_max_us;
+    uint64_t ack_lat_sum_us;
     uint32_t counter_resend_fast;
     uint32_t counter_resend_rto;
     uint32_t counter_reach_maxrto;
@@ -294,6 +344,18 @@ typedef struct {
     uint32_t counter_rto_stale;   // rto retransmits of a frame the peer had already reported as received
     uint32_t counter_rto_behind;  // rto retransmits of a frame the peer had not reported yet
     uint32_t ack_una;             // last una seen in an ack frame
+    // 2026-10-12 真机 A/B 后加的三个判据。真机上 counter_capblock 三组全是 0（在途闸门从未挡过），
+    // 而吞吐确实随窗口 ×3，所以嫌疑落在另外两处：drain 的早退闸（它也随同一个宏缩放、却一直没有
+    // 计数器），以及"乱序被当成丢包"把 cwnd 打回。前者按 tick 计，后者按事件计：
+    uint32_t counter_drain_block; // drain 因 wait_snd >= MAX_CWND_SIZE 而少喂一轮的 tick 数
+    uint32_t counter_cwnd_back;   // cwnd 被 RTO/快速重传打回的次数（乱序误判的直接证据）
+    uint32_t counter_cwnd_sfail;  // ... 被"内核没收下这一包"打回的次数（发送缓冲压力）
+    // 2026-10-12 真机 n_*.log：33~55 次/秒的伪超时（resend_waste 99.7~100%），每次都把 cwnd
+    // 打到 MIN。要修就得先知道它属于哪一种：等待期间一个 ack 都没到（ack 路径停摆/ack 丢了），
+    // 还是收到过 ack 却没覆盖这一帧（洞上方的帧无法被确认，只能等洞补上）。纯计数，不改行为。
+    uint32_t counter_to_noack;    // 超时时：自首发以来一个 ack 都没收到过
+    uint32_t counter_to_hadack;   // 超时时：收到过 ack，但没有覆盖这一帧
+    uint32_t counter_to_age_max;  // 超时时"距首发"的最大毫秒数
     uint32_t reserved;            // ffrdp_dump clears everything up to here: nothing that must outlive a
                                   // dump, and nothing a decision depends on, may sit above this line
                                   // (the probe would otherwise be reset exactly when it is about to run).
@@ -313,6 +375,7 @@ typedef struct {
     uint32_t probe_best;          // lowest round trip seen during the probe
     uint32_t probe_del_ref;       // delivered frames at the start of the probe
     uint32_t probe_rate_ref;      // frames per second the peer confirmed just before the probe
+    uint32_t rate_best;           // best confirmed rate ever seen (decays 1/16 per second): the reference a keep must survive
     uint32_t probe_gap;           // current back off between probes
     uint32_t probe_next;          // earliest tick for the next probe
     uint32_t cap, cap_kept;       // in-flight limit enforced now, and the one a probe proved
@@ -768,6 +831,17 @@ int ffrdp_isdead(void *ctxt)
     return ret;
 }
 
+// 诊断用微秒时钟：只为量"收到帧 → ack 已交给内核"这一段。
+#if defined(LINUX) || defined(__linux__)
+static uint64_t ffrdp_us(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
+}
+#else
+static uint64_t ffrdp_us(void) { return (uint64_t)get_timestamp32_ms() * 1000ull; }
+#endif
+
 static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp)
 {
     FFRDP_FRAME_NODE *p;
@@ -833,11 +907,17 @@ static void ffrdp_congestion_control(FFRDPCONTEXT *ffrdp, int event)
         ffrdp->cwnd = MAX(ffrdp->cwnd, FFRDP_MIN_CWND_SIZE);
         break;
     case CEVENT_ACK_TIMEOUT:
+        ffrdp->counter_cwnd_back++;
+        ffrdp->ssthresh = MAX(ffrdp->cwnd / 2, FFRDP_MIN_CWND_SIZE);
+        ffrdp->cwnd     = FFRDP_MIN_CWND_SIZE;
+        break;
     case CEVENT_SEND_FAILED:
+        ffrdp->counter_cwnd_sfail++;
         ffrdp->ssthresh = MAX(ffrdp->cwnd / 2, FFRDP_MIN_CWND_SIZE);
         ffrdp->cwnd     = FFRDP_MIN_CWND_SIZE;
         break;
     case CEVENT_FAST_RESEND:
+        ffrdp->counter_cwnd_back++;
         ffrdp->ssthresh = MAX(ffrdp->cwnd / 2, FFRDP_MIN_CWND_SIZE);
         ffrdp->cwnd     = ffrdp->ssthresh;
         break;
@@ -854,6 +934,12 @@ static void ffrdp_congestion_control(FFRDPCONTEXT *ffrdp, int event)
 static void ffrdp_drain_tx(FFRDPCONTEXT *ffrdp)
 {
     uint32_t cap = (uint32_t)sizeof(ffrdp->app_tx_buff);
+    // 表里已经排着窗口那么多"已成帧、未确认"的帧时，这一轮不再往下喂：tick 的发送循环只从表头看
+    // cwnd 个条目，喂得更长只会让表尾那些帧既发不出去、也等不到超时，wait_snd 于是只涨不落、应用被
+    // 判满（真机 lo 实测：wait_snd 264->279->401，吞吐 16.8->7.4MB/s）。留在应用队列里的消息下一轮
+    // 还能成帧，背压由队列容量（FFRDP_APP_TX_SIZE）承担，与旧版等价。
+    // 早退一次就记一次（counter_drain_block）：真机上它是"窗口×3"的那个嫌疑，而它此前没有计数器。
+    if (ffrdp->wait_snd >= (uint32_t)FFRDP_MAX_CWND_SIZE) { ffrdp->counter_drain_block++; return; }
     while (ffrdp->app_tx_size >= 4) {
         uint32_t len, head = (ffrdp->app_tx_head + 4) % cap;   // 负载起点（可能回绕）
         ringbuf_read(ffrdp->app_tx_buff, cap, ffrdp->app_tx_head, (uint8_t*)&len, 4);
@@ -940,13 +1026,18 @@ static int ffrdp_on_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *node, int len, 
             }
             dist = seq_distance(una, b->send_una);
             if (dist >= 0) {
-                b->send_una    = una;
-                b->send_mack   = (b->send_mack >> dist) | mack;
+                b->send_una  = una;
+                b->send_mack = (b->send_mack >> dist) | mack;
                 // the peer's window is a buffer size, not a rate: on the measured link it allowed 148
                 // frames where the path carried five, and the rest sat in its buffer as a standing queue
                 // of about 200ms. cap is what a probe has proven, and what is being tested right now.
                 ffrdp->swnd = node->data[7];
-                if (ffrdp->cap && ffrdp->swnd > ffrdp->cap) ffrdp->swnd = ffrdp->cap;
+                ffrdp->peer_wnd_raw = ffrdp->swnd;
+                // 这里原来把信用夹到 cap：那是探测还驱动信用时的写法。现在探测驱动的是"在途量"这道真闸
+                // （inflight_max，见 tick 的探测段），再夹一次信用就是第二道刹车 —— 探测把 cap 压到 4 时，
+                // 它会让"每收一个 ack 最多再发 4 帧"，真机上就是发送被饿死（swnd 恒等于 cap、send_failed
+                // 占绝大多数）。信用只受对端缓冲本身约束，上界用一个不可能触发的大数兜住即可。
+                if (ffrdp->swnd > FFRDP_MAX_WAITSND) ffrdp->swnd = FFRDP_MAX_WAITSND;
                 ffrdp->tick_recv_ack = get_timestamp32_ms();
             }
         } else if (node->data[0] == FFRDP_FRAME_TYPE_QUERY) b->got_query = 1;
@@ -1032,16 +1123,43 @@ static void ffrdp_apply_acks(FFRDPCONTEXT *ffrdp, FFRDP_RX_BATCH *b)
                             // any more. Note that a quiet window is *not* fed into the decay path above --
                             // on a rate limited link a quiet window is usually the floor doing its job, and
                             // decaying on it would make the loop undo its own progress.
-                            {   uint32_t rtt = (ffrdp->rtts == (uint32_t)-1 || ffrdp->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : ffrdp->rtts;
-                                uint32_t cap = MAX(3 * rtt, 100u);
+                            {   // the ceiling has to be relative to THIS path's own round trip. It used to be
+                                // MAX(3 * rtt, 100) with rtt itself raised to FFRDP_MIN_RTO whenever rtts was
+                                // under it, so on a 1 ms path the ceiling was 100 ms flat: a hole was allowed to
+                                // sit for a hundred milliseconds, while holes are everywhere on a path that
+                                // reorders. measured 2026-10-12 17:16 with the delay probe off: rto_floor climbed
+                                // 52 -> 81 -> 100 and both directions decayed (4802 -> 1649 KB/s client,
+                                // 4924 -> 2478 KB/s server) while waste sat at 84~100% and recv_ooo was 47%
+                                // (including d25_64 / dgt64 / far, i.e. distances well past the 24 bit mask).
+                                // The floor is a repair delay, so a few typical round trips plus the rto minimum
+                                // is the most it can ever be worth.
+                                uint32_t rtt = (ffrdp->rtts == (uint32_t)-1) ? FFRDP_MIN_RTO : MAX(ffrdp->rtts, 1u);
+                                uint32_t cap = MAX(4 * rtt, (uint32_t)FFRDP_MIN_RTO);
                                 if (ffrdp->rto_floor > cap) ffrdp->rto_floor = cap;
                             }
                             ffrdp->win_need = ffrdp->win_dup = 0;
                         }
                         ffrdp->rto = MAX(ffrdp->rtts + 4 * ffrdp->rttd, ffrdp->rto_floor);
+                        // 尾部也要被覆盖住：rtts/rttd 用的是"没被重传过"的样本 ⇒ 结构性看不见 RTO 以上的延迟
+                        // （任何 > RTO 的样本都已经被排除），所以要靠 rtt_tail 补这一块。留 25% 余量。
+                        if (ffrdp->rtt_tail)
+                            ffrdp->rto = MAX(ffrdp->rto, MIN(ffrdp->rtt_tail + ffrdp->rtt_tail / 4, (uint32_t)FFRDP_MAX_RTO));
                         ffrdp->rto = MAX(FFRDP_MIN_RTO, ffrdp->rto);
                         ffrdp->rto = MIN(FFRDP_MAX_RTO, ffrdp->rto);
                     }
+                }
+                if (p->flags & FLAG_TIMEOUT_RESEND) {
+                    // 被重传过的帧：上面那个 if 里的 RTT 采样必须跳过（Karn：这次确认可能对应原包，也可能
+                    // 对应重传包），但"首发起多久才被确认"正是判断 RTO 够不够用的量 —— 真机上（RTT 1~5ms）
+                    // 超时那一刻该帧已经等了 85~92ms，而 rtts/rttd 只用"没被重传过的帧"⇒ 结构性看不见这一档。
+                    // 所以喂进 rtt_tail，但**限速增长**：首次最多 64ms、之后每次最多 +50% + 25ms。
+                    // 真丢包时这个样本 ≈ RTO + RTT（Karn 担心的那个），限速之后它不可能一次把尾部推飞，
+                    // 而每秒 1/16 的衰减会把它拉回来 ⇒ 收敛到"这条路径真实的确认延迟尾部"。
+                    uint32_t conf  = get_timestamp32_ms() - p->tick_send;
+                    uint32_t allow = ffrdp->rtt_tail ? ffrdp->rtt_tail + ffrdp->rtt_tail / 2 + 25 : 64;
+                    if (allow > (uint32_t)FFRDP_MAX_RTO) allow = (uint32_t)FFRDP_MAX_RTO;
+                    if (conf  > allow) conf = allow;
+                    if (conf  > ffrdp->rtt_tail) ffrdp->rtt_tail = conf;
                 }
                 t = p; p = p->next; list_remove(&ffrdp->send_list_head, &ffrdp->send_list_tail, t); ffrdp->counter_delivered++; continue;
             } else if (seq_distance(maxack, GET_FRAME_SEQ(p)) > 0) {
@@ -1072,8 +1190,8 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp)
     const FFRDP_FRAME_NODE *q;
     uint32_t now = get_timestamp32_ms(), due = 0, x;
     int      n_sent = 0;
-    int      pending_first = 0;                            // 发送表里有还没首发出去的帧
-    int      sent_before_pending = 0;                      // 第一个"还没首发"的帧前面有几帧已首发
+    int      pending_first = 0;       // 发送表里有还没首发出去的帧
+    int      sent_before_pending = 0; // 第一个"还没首发"的帧前面有几帧已首发
     for (q = ffrdp->send_list_head; q; q = q->next) {
         if (!(q->flags & FLAG_FIRST_SEND)) {
             // tick 的发送循环是"从表头起最多看 cwnd 帧"。表头那些已首发、在等 ack 的帧会把窗口占满，
@@ -1101,9 +1219,17 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp)
     //   * 或者发送表里那个"还没首发"的帧，真的落在 tick 这一圈看得见的范围内（序号 < cwnd）。
     if (ffrdp->app_tx_size || (pending_first && sent_before_pending < (int)ffrdp->cwnd)) {
         uint32_t limit = MAX(ffrdp->inflight_max ? ffrdp->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX, (uint32_t)FFRDP_INFLIGHT_MIN);
-        if (ffrdp->swnd > 0 && ffrdp->inflight_used < limit) due = now;
+        // 用本圈刚数出来的 n_sent（= 在途帧数）。不能用 ffrdp->inflight_used：它只在 ffrdp_tick
+        // 里刷新，而 ack 是在 DATA 回调(ffrdp_apply_acks)和 TIMER 的纯 ack 分支里处理的，那两条
+        // 路径都不刷新它 ⇒ ack 刚把槽位空出来、该马上补下一帧的那一刻，判据读到的是旧值 ⇒
+        // 不叫醒 ⇒ 睡到下面 rate_tick+1000 那条期限上（真机 y-run1：小窗口 lap 最大 1002ms、
+        // 两端只剩 32~48 帧/s；大窗口下 limit=128 让旧值几乎永远成立 ⇒ 循环自旋掩盖了它）。
+        if (ffrdp->swnd > 0 && (uint32_t)n_sent < limit) due = now;
     }
     if (due && (int32_t)(due - now) < 0) due = now;       // 已经过期 ⇒ 立刻（这也是"快一点"的做法）
+    // 兜底：有未确认的帧、或应用队列非空时最多睡 4ms。上面那条判据修好后它不该再触发；
+    // 真机上 lap 最大曾到 59/114/222ms，每漏一次小窗口就少送好几帧，而多醒几次只费一点 CPU。
+    if (ffrdp->send_list_head || ffrdp->app_tx_size) { if (!due || (int32_t)(due - (now + 4)) > 0) due = now + 4; }
     return due;
 }
 
@@ -1151,22 +1277,41 @@ static void ffrdp_tick(FFRDPCONTEXT *ffrdp)
     }
     for (i = 0, p = ffrdp->send_list_head; i < (int32_t)ffrdp->cwnd && p; i++, p = p->next) {
         if (!(p->flags & FLAG_FIRST_SEND)) { // first send
-            // frames are first sent in sequence order, so everything already sent sits in front of this
-            // one and breaking here skips nothing that needed attention. retransmits are untouched: this
-            // only stops adding new frames to a wire that already holds FFRDP_INFLIGHT_MAX of them.
-            if (ffrdp->inflight_used >= MAX(ffrdp->inflight_max ? ffrdp->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX, (uint32_t)FFRDP_INFLIGHT_MIN)) break;
+            // 顺序：先看信用、再看在途闸门。反过来的话，在途一满就 break，谁都到不了下面那条"要窗口"
+            // —— 而"没有信用"正是最需要问对端一次的时候（真机上 counter_send_query 恒为 0 就是这么来的）。
             if (ffrdp->swnd > 0) {
+                // frames are first sent in sequence order, so everything already sent sits in front of this
+                // one and breaking here skips nothing that needed attention. retransmits are untouched: this
+                // only stops adding new frames to a wire that already holds FFRDP_INFLIGHT_MAX of them.
+                if (ffrdp->inflight_used >= MAX(ffrdp->inflight_max ? ffrdp->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX, (uint32_t)FFRDP_INFLIGHT_MIN)) {
+                    ffrdp->counter_capblock++;
+                    break;
+                }
                 if (ffrdp_send_data_frame(ffrdp, p) != 0) { ffrdp_congestion_control(ffrdp, CEVENT_SEND_FAILED); break; }
-                p->tick_1sts = p->tick_send = get_timestamp32_ms();
+                p->tick_1sts    = p->tick_send = get_timestamp32_ms();
+                p->ticket       = ffrdp->counter_ack_recv;   // 诊断用：从这一刻起，ack 有没有来过
                 p->tick_timeout = p->tick_send + ffrdp->rto;
                 p->flags       |= FLAG_FIRST_SEND;
                 ffrdp->swnd--; ffrdp->counter_send_1sttime++; ffrdp->inflight_used++;
-            } else if (ffrdp->tick_send_query == 0 || (int32_t)get_timestamp32_ms() - (int32_t)ffrdp->tick_send_query > FFRDP_QUERY_CYCLE) { // query remote receive window size
-                data[0] = FFRDP_FRAME_TYPE_QUERY; if (ffrdp->lowlevel->send(ffrdp->lowlevel, ffrdp->peer_addr, data, 1) != 0) ffrdp->counter_send_err++;
-                ffrdp->tick_send_query = get_timestamp32_ms(); ffrdp->counter_send_query++;
-                break;
+            } else {
+                ffrdp->counter_swnd0++;                        // 有帧等着首发、却没信用（这一项按帧计）
+                if (ffrdp->tick_send_query == 0 || (int32_t)get_timestamp32_ms() - (int32_t)ffrdp->tick_send_query > FFRDP_QUERY_CYCLE) { // query remote receive window size
+                    data[0] = FFRDP_FRAME_TYPE_QUERY; if (ffrdp->lowlevel->send(ffrdp->lowlevel, ffrdp->peer_addr, data, 1) != 0) ffrdp->counter_send_err++;
+                    ffrdp->tick_send_query = get_timestamp32_ms(); ffrdp->counter_send_query++;
+                    break;
+                }
+                // 没信用、又还没到该问的时候：**不 break** —— 这个节点只是发不出去，后面那些"到点该重传"
+                // 的帧不吃信用（重传那一段不碰 swnd），必须照走（原逻辑如此，别在这里提前收口）。
             }
         } else if ((p->flags & FLAG_FIRST_SEND) && ((int32_t)get_timestamp32_ms() - (int32_t)p->tick_timeout > 0 || (p->flags & FLAG_FAST_RESEND))) { // resend
+            if (!(p->flags & FLAG_FAST_RESEND)) {   // 只统计真正的 RTO 超时，快速重传不算
+                uint32_t toage = get_timestamp32_ms() - p->tick_1sts;
+                if (toage > ffrdp->counter_to_age_max) ffrdp->counter_to_age_max = toage;
+                if (p->ticket == ffrdp->counter_ack_recv) ffrdp->counter_to_noack++; else ffrdp->counter_to_hadack++;
+                // 这里原来按"una 已越过这一帧"采尾部 —— 真机四份日志里 rtt_tail 恒为 0 ⇒ 那个条件几乎
+                // 不成立（帧被确认时就从表里移除，"una 越过它"与"它超时"很难同时发生）。采样改到确认
+                // 到达的那一刻，见下面那个"被重传过的帧"的兄弟块。
+            }
             ffrdp_congestion_control(ffrdp, CEVENT_ACK_TIMEOUT);
             if (ffrdp_send_data_frame(ffrdp, p) != 0) break;
             if (!(p->flags & FLAG_FAST_RESEND)) {
@@ -1226,6 +1371,7 @@ static void ffrdp_tick(FFRDPCONTEXT *ffrdp)
             uint32_t firsts = ffrdp->counter_send_1sttime;
             ffrdp->rate_now     = ffrdp->counter_delivered - ffrdp->rate_del_ref;
             ffrdp->rate_tick    = now;
+            if (ffrdp->rtt_tail) ffrdp->rtt_tail -= ffrdp->rtt_tail / 16;   // 约 16 秒忘掉旧的尾部
             ffrdp->rate_del_ref = ffrdp->counter_delivered;
             // the trigger needs evidence over a whole second. the window the rto floor uses holds a few
             // tens of frames, and one retransmit out of thirty is a ratio of three percent -- that is
@@ -1236,6 +1382,16 @@ static void ffrdp_tick(FFRDPCONTEXT *ffrdp)
                                : 0;
             ffrdp->probe_resend_seen = resend;
             ffrdp->probe_first_seen  = firsts;
+            // 见过的最好一秒（升就立刻记，降就每秒衰减 1/16，约 16 秒忘掉旧高水位）。keep 的速率参考要用它：
+            // 只跟紧邻的一秒比，第一刀之后参考自己也掉，于是每一刀都通过，闸门被一路 keep 到地板。
+            if (ffrdp->rate_now >= ffrdp->rate_best) ffrdp->rate_best = ffrdp->rate_now;
+            else                                     ffrdp->rate_best -= ffrdp->rate_best / 16;
+            // 事后修复：被 keep 的闸门把确认速率拖到最好值的某个比例以下，就按秒翻倍还回去。
+            if (ffrdp->cap_kept && ffrdp->cap_kept < (uint32_t)FFRDP_INFLIGHT_MAX && ffrdp->rate_best &&
+                ffrdp->rate_now * 100 < ffrdp->rate_best * FFRDP_PROBE_RATE_KEEP_PCT) {
+                ffrdp->cap_kept = MIN(ffrdp->cap_kept * 2, (uint32_t)FFRDP_INFLIGHT_MAX);
+                ffrdp->counter_giveback++;
+            }
         }
         if (ffrdp->probe_state == 0) {
             uint32_t waste = ffrdp->probe_waste;
@@ -1332,7 +1488,10 @@ static void ffrdp_tick(FFRDPCONTEXT *ffrdp)
                 uint32_t rtt_down  = ffrdp->probe_best != 0xFFFFFFFF &&
                                      ffrdp->probe_rtt_ref > ffrdp->probe_best &&
                                      ffrdp->probe_rtt_ref - ffrdp->probe_best >= FFRDP_PROBE_RTT_DROP_MS;
-                uint32_t rate_kept = rate_held * 100 >= ffrdp->probe_rate_ref * FFRDP_PROBE_RATE_KEEP_PCT;
+                // 参考取"探测开始前一秒"与"见过的最好一秒"里的较大者。只跟紧邻的前一秒比是不够的：
+                // 真机实测里第一刀砍下去之后参考本身跟着掉，于是每一刀都"速率没降"，闸门一路被 keep 到地板。
+                uint32_t rate_ref  = MAX(ffrdp->probe_rate_ref, ffrdp->rate_best);
+                uint32_t rate_kept = rate_held * 100 >= rate_ref * FFRDP_PROBE_RATE_KEEP_PCT;
                 if (rtt_down && rate_kept) {
                     ffrdp->cap_kept  = ffrdp->probe_cap;
                     ffrdp->probe_gap = FFRDP_PROBE_GAP_MS;
@@ -1393,7 +1552,18 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
                     b.send_una  = ffrdp->send_list_head ? GET_FRAME_SEQ(ffrdp->send_list_head) : 0;
                     b.send_mack = 0; b.got_data = 0; b.got_query = 0;
                     if (!ffrdp_on_frame(ffrdp, node, n, &b)) free(node);   // 没被乱序队列接管 ⇒ 归我们
+                    uint64_t t_ack0 = ffrdp_us();   // 诊断：从能回 ack 这一刻算起
                     ffrdp_apply_acks(ffrdp, &b);
+                    // 收到帧就当场回 ack，别等下一圈 TIMER（以前那一步要花掉整整一圈，lap 平均 2~3ms），
+                    // 对端看到的 RTT 里就含着我们这一圈。顺带把"收到帧→已交给内核"的耗时记下来：
+                    // 服务端比老架构多等的那 5~7ms 若不在这一段，就一定在内核/驱动出队之后。
+                    if (ffrdp->flags & FLAG_ACK_DUE) {
+                        ffrdp->flags &= ~FLAG_ACK_DUE;
+                        ffrdp_recvdata_and_sendack(ffrdp);
+                        uint64_t dt = ffrdp_us() - t_ack0;
+                        ffrdp->ack_lat_n++; ffrdp->ack_lat_sum_us += dt;
+                        if (dt > ffrdp->ack_lat_max_us) ffrdp->ack_lat_max_us = (uint32_t)dt;
+                    }
                 }
             }
         }
@@ -1450,6 +1620,17 @@ static void ffrdp_dump_locked(FFRDPCONTEXT *ffrdp, int clearhistory)
     printf("wait_snd            : %u\n"  , ffrdp->wait_snd            );
     printf("rmss, smss          : %u, %u\n"    , ffrdp->rmss, ffrdp->smss);
     printf("swnd, cwnd, ssthresh: %u, %u, %u\n", ffrdp->swnd, ffrdp->cwnd, ffrdp->ssthresh);
+    // 三个判据一行打完：drain 早退（它随窗口宏缩放，之前没有计数器）、cwnd 被乱序误判打回、
+    // 以及被内核丢包/缓冲压力打回。计数是累计的（测试驱动的 dump 传 clearhistory=0），看增量。
+    printf("drain-block/backdrop: %u ticks (drain held), cwnd back %u (rto/fast) + %u (send fail)\n",
+           ffrdp->counter_drain_block, ffrdp->counter_cwnd_back, ffrdp->counter_cwnd_sfail);
+    printf("timeout diag        : no-ack-arrived %u, acks-arrived-but-missed %u, max wait %u ms\n",
+           ffrdp->counter_to_noack, ffrdp->counter_to_hadack, ffrdp->counter_to_age_max);
+    printf("peer wnd raw/clamped: %u, %u\n", ffrdp->peer_wnd_raw, ffrdp->swnd);
+    printf("send starved/blocked: swnd0 %u frames, cap-block %u ticks\n", ffrdp->counter_swnd0, ffrdp->counter_capblock);
+    printf("ack latency         : %u us avg, %u us max (%u acks)\n",
+           ffrdp->ack_lat_n ? (uint32_t)(ffrdp->ack_lat_sum_us / ffrdp->ack_lat_n) : 0,
+           ffrdp->ack_lat_max_us, ffrdp->ack_lat_n);
     {   // the delay probe: how many frames are really outstanding, what limit is enforced, and what the
         // experiment reported. rtt ref->best is the number to read: if best is well below ref the window
         // was keeping a queue alive; if they are close the delay is the path's and nothing was touched.
@@ -1561,7 +1742,9 @@ static void ffrdp_dump_locked(FFRDPCONTEXT *ffrdp, int clearhistory)
     printf("counter_rx_bad      : %u\n"  , ffrdp->counter_rx_bad      );
     printf("counter_recv_drop   : %u\n"  , ffrdp->counter_recv_drop   );
     printf("counter_ack_dup     : %u\n"  , ffrdp->counter_ack_dup     );
-    printf("rto_floor           : %u\n"  , ffrdp->rto_floor); // 白费率见上面的 counter_resend_waste（同一个量，不再打两遍）
+    // rtt_tail 是这一版"让 RTO 自己够到延迟尾部"的那个学习量（见 FFRDP_MIN_RTO 的注释）；它应当收敛到
+    // 这条链路的确认延迟尾部（真机上是 85~92 ms 那一档），并在链路变好后每秒衰减 1/16。
+    printf("rto_floor           : %u, rtt_tail %u ms\n"  , ffrdp->rto_floor, ffrdp->rtt_tail); // 白费率见上面的 counter_resend_waste（同一个量，不再打两遍）
     printf("counter_rto_behind  : %u\n"  , ffrdp->counter_rto_behind  );
     printf("lap period avgmax   : %u, %u ms (%u laps, cost max %u ms)\n",
            ffrdp->counter_upd_gap / MAX(ffrdp->counter_upd_cnt - 1, 1), ffrdp->counter_upd_gap_max,
