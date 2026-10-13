@@ -125,6 +125,8 @@ for t in $TESTS; do
         grep -q 'void\* ffrdp_init(char \*addr' ffrdp_$v.c && EXTRA="$EXTRA -DFFRDP_API_HAS_ADDR"
         # 结构拆分（P1）：连接级字段挂到 ctxt->conn 下之后，测试用 CONN() 适配 · 按形状探测 ✓
         grep -q 'FFRDPCONN' ffrdp_$v.c && EXTRA="$EXTRA -DCONN_SPLIT"
+        # v2 接口形状（params + 回调 + 连接句柄）⇒ 测试改用 TEST_* 的 v2 分支 ✓
+        grep -q 'ffrdp_init(void \*params' ffrdp_$v.c && EXTRA="$EXTRA -DFFRDP_API_V2"
         # A side that carries lowlevel (the working tree) is stepped by sim_ll_run() instead of
         # ffrdp_update(), and needs the fake lowlevel linked in; HEAD is still stepped by ffrdp_update().
         LL=""

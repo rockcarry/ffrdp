@@ -397,6 +397,11 @@ typedef struct {
     // inflight / rto / 各个计数器……）仍然只被一个执行者碰 —— 这正是这次搬家不需要给协议加锁的原因。
     FFRDP_LOWLEVEL   *lowlevel;      // 传输层：socket/收包/定时都在它自己的工作线程里
     int               closing;       // 应用说要关：让等待中的应用线程醒来并返回（全部访问都在锁内，不需要原子类型）
+    FFRDP_CALLBACK    app_cb;        // 应用回调（v2 起：ACCEPT/CONNECT/DISCONN/ENCRYPT/DECRYPT/RECVDATA）
+    void             *app_cbctx;
+    int               maxconn;       // 配置：最大连接数（"maxconn:N"，默认 FFRDP_MAXCONN）
+    int               handshake_ms;  // 配置：握手超时（"handshake:N"，默认 10000）
+    int               idle_ms;       // 配置：空闲判死超时（"idle:N"，默认 5000）
     pthread_mutex_t   lock;          // 保护 app_tx_* / recv_buff+recv_size/head/tail / peer_addr / flags / 上列几个
     pthread_cond_t    cond;          // 协议侧腾出空间或送来数据时叫醒应用侧
     uint32_t tick_ffrdp_dump;
@@ -585,12 +590,53 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len);   // l
 // 全文件唯一的一条函数前置声明：ffrdp_init（在上面）要把这个回调**当值**交给传输层，而它的定义
 // 在协议那一大段的后面。想连它一起消掉，只能把 ffrdp_init 也挪到最后 —— 那会让这个文件的入口
 // 跑到末尾。原来这里还有另外五条声明，已经靠调整函数位置消掉了。
-void* ffrdp_init(char *addr, char *txkey, char *rxkey, int server, int smss, int sfec)
+// 配置串解析（v2）："ffrdps://ip[:port][,key:val]..." / "ffrdpc://ip[:port][,key:val]..."。
+// 角色由 scheme 决定（替代 v1 的 server 参数）；smss/sfec 由 mss:/fec: 给（v2 的 init 没有位置参数）。
+// 解析失败 ⇒ 返回 NULL 并说明原因 ✓（不静默）。
+void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
 {
     FFRDPCONTEXT *ffrdp = NULL;
+    char         buf[192];
+    char        *text, *addr, *key;
+    int          server = 0, smss = FFRDP_MAX_MSS, sfec = 0;
+    int          maxconn = FFRDP_MAXCONN, handshake_ms = 10000, idle_ms = 5000;
+
+    if (!params) { printf("ffrdp_init: params is NULL\n"); return NULL; }
+    snprintf(buf, sizeof(buf), "%s", (char*)params);
+    text = buf;
+    if      (strncmp(text, "ffrdps://", 9) == 0) { server = 1; text += 9; }
+    else if (strncmp(text, "ffrdpc://", 9) == 0) { server = 0; text += 9; }
+    else { printf("ffrdp_init: params must start with ffrdps:// or ffrdpc:// (got \"%s\")\n", buf); return NULL; }
+    addr = text;
+    key  = strchr(text, ',');
+    if (key) *key++ = 0;
+    while (key && *key) {
+        char *next = strchr(key, ',');
+        char *colon;
+        int   val;
+        if (next) *next++ = 0;
+        colon = strchr(key, ':');
+        if (!colon) { printf("ffrdp_init: bad option \"%s\" (want key:value)\n", key); return NULL; }
+        *colon++ = 0;
+        val = atoi(colon);
+        if      (!strcmp(key, "maxconn"))   maxconn      = val;
+        else if (!strcmp(key, "handshake")) handshake_ms = val;
+        else if (!strcmp(key, "idle"))      idle_ms      = val;
+        else if (!strcmp(key, "mss"))       smss         = val;
+        else if (!strcmp(key, "fec"))       sfec         = val;
+        else { printf("ffrdp_init: unknown option \"%s\"\n", key); return NULL; }
+        key = next;
+    }
+    if (maxconn < 1 || maxconn > FFRDP_MAXCONN) { printf("ffrdp_init: maxconn %d out of range (1..%d)\n", maxconn, FFRDP_MAXCONN); return NULL; }
+
     // 平台相关的初始化（Windows 的 WSAStartup / 定时器精度）不在这里：协议层不碰 socket，socket
     // 那一层（socket.c / lowlevel-udp.c）自己管自己的。
     if (!(ffrdp = calloc(1, sizeof(FFRDPCONTEXT)))) return NULL;
+    ffrdp->app_cb       = callback;
+    ffrdp->app_cbctx    = cbctx;
+    ffrdp->maxconn      = maxconn;
+    ffrdp->handshake_ms = handshake_ms;
+    ffrdp->idle_ms      = idle_ms;
     // 连接表：第一步只有 0 号，指向内嵌的主连接 ⇒ 必须在第一次碰 ffrdp->conn 之前设好 ✓。
     ffrdp->table[0] = &ffrdp->conn;
     ffrdp->nconn    = 1;
@@ -614,14 +660,14 @@ void* ffrdp_init(char *addr, char *txkey, char *rxkey, int server, int smss, int
     pthread_mutex_init(&ffrdp->lock, NULL);
     pthread_cond_init (&ffrdp->cond, NULL);
     {
-        char params[128], peer[128];
+        char llparams[128], peer[128];
         if (server) {
             ffrdp->conn.flags |= FLAG_SERVER;
             // 允许直接给传输层的原样写法（"bind:..."），其余情况由这里补前缀。
-            if (addr && strncmp(addr, "bind:", 5) == 0) snprintf(params, sizeof(params), "%s", addr);
-            else snprintf(params, sizeof(params), "bind:%s", (addr && *addr) ? addr : "0.0.0.0");
-        } else snprintf(params, sizeof(params), "none");
-        ffrdp->lowlevel = ffrdp_udp_lowlevel_init(params, ffrdp_lowlevel_cb, ffrdp);
+            if (addr && strncmp(addr, "bind:", 5) == 0) snprintf(llparams, sizeof(llparams), "%s", addr);
+            else snprintf(llparams, sizeof(llparams), "bind:%s", (addr && *addr) ? addr : "0.0.0.0");
+        } else snprintf(llparams, sizeof(llparams), "none");
+        ffrdp->lowlevel = ffrdp_udp_lowlevel_init(llparams, ffrdp_lowlevel_cb, ffrdp);
         if (!ffrdp->lowlevel) {
             printf("failed to start the lowlevel transport !\n");
             goto failed;
@@ -639,13 +685,13 @@ void* ffrdp_init(char *addr, char *txkey, char *rxkey, int server, int smss, int
         }
     }
 
-    if (txkey) {
+    if (0) {   // v2：加密改由 FFRDP_ENCRYPT / FFRDP_DECRYPT 回调承担 ⇒ 这两个 v1 的位置参数没了
 #ifdef CONFIG_ENABLE_AES256
         ffrdp->conn.flags |= FLAG_TX_AES256;
         AES_set_encrypt_key((uint8_t*)txkey, 256, &ffrdp->conn.aes_encrypt_key);
 #endif
     }
-    if (rxkey) {
+    if (0) {   // 同上（rxkey）
 #ifdef CONFIG_ENABLE_AES256
         ffrdp->conn.flags |= FLAG_RX_AES256;
         AES_set_decrypt_key((uint8_t*)rxkey, 256, &ffrdp->conn.aes_decrypt_key);
@@ -661,7 +707,7 @@ failed:
     return NULL;
 }
 
-void ffrdp_free(void *ctxt)
+void ffrdp_exit(void *ctxt)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     FFRDP_LOWLEVEL *ll;
@@ -694,7 +740,7 @@ void ffrdp_free(void *ctxt)
 // 它只把消息（4 字节长度 + 数据）放进应用队列，成帧留给协议在 tick 里做 —— 这样所有协议状态
 // （cur_new_node / send_seq / 加密密钥）都只被协议侧碰，为下一步把协议搬到 lowlevel 线程做好准备。
 // timeout_ms：0 = 放不下就直接失败；>0 = 最多等这么久（等待期间跑协议，它会把队列腾出来）；<0 = 等到能放。
-int ffrdp_send(void *ctxt, char *buf, int len, int timeout_ms)
+int ffrdp_send(void *ctxt, int conn, char *buf, int len, int timeout_ms)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     uint32_t      t0;
@@ -813,7 +859,7 @@ static int ffrdp_isdead_locked(FFRDPCONTEXT *ffrdp)
 // 接收：有数据就立刻返回（不会为了凑满 len 而等），没数据时按 timeout_ms 等。
 // 等待期间协议由 lowlevel 的工作线程自己推进（旧版是在这里让应用调 ffrdp_update，那一步已经删掉），
 // 所以应用不再需要"主循环里调 update"这件事 —— 这个函数就是应用侧的等待点。对端失联时提前返回 0，免得调用方永远等下去。
-int ffrdp_recv(void *ctxt, char *buf, int len, int timeout_ms)
+int ffrdp_recv(void *ctxt, int conn, char *buf, int len, int timeout_ms)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     uint32_t      t0;
@@ -1628,7 +1674,7 @@ out:
     return ret;
 }
 
-void ffrdp_flush(void *ctxt)
+void ffrdp_flush(void *ctxt, int conn)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ffrdp) return;
@@ -1809,7 +1855,7 @@ static void ffrdp_dump_locked(FFRDPCONTEXT *ffrdp, int clearhistory)
     }
 }
 
-void ffrdp_dump(void *ctxt, int clearhistory)
+void ffrdp_dump(void *ctxt, int conn, int clearhistory)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ffrdp) return;

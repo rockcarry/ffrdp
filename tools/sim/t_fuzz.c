@@ -42,7 +42,15 @@
 
 // ffrdp_init 的参数形状变过一次：ip + port 收敛成单个 "ip:port"。两侧都要能编，所以测试走这个入口
 // （调用点只关心 ip / port / 角色 / smss）。
-#ifdef FFRDP_API_HAS_ADDR
+#ifdef FFRDP_API_V2
+static void *TEST_INIT(const char *ip, int port, int server, int mss)
+{
+    char params[128];
+    snprintf(params, sizeof(params), "%s://%s:%d,mss:%d,fec:0",
+             server ? "ffrdps" : "ffrdpc", ip, port, mss);
+    return ffrdp_init(params, NULL, NULL);
+}
+#elif defined(FFRDP_API_HAS_ADDR)
 static void *TEST_INIT(const char *ip, int port, int server, int mss)
 {
     char addr[64];

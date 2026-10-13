@@ -19,12 +19,19 @@
 // has no timeout argument on send/recv and the working tree does, so the test calls these wrappers -- both
 // sides compile, and both sides mean "do not wait", which is exactly what HEAD does. run.sh defines
 // FFRDP_API_HAS_TIMEOUT for the side that has it.
-#ifdef FFRDP_API_HAS_TIMEOUT
+#ifdef FFRDP_API_V2
+// v2 接口：send/recv 多了连接句柄（单连接测试用 0），init 收配置串，退出叫 exit。
+#define TEST_SEND(c, b, l) ffrdp_send(c, 0, b, l, 0)
+#define TEST_RECV(c, b, l) ffrdp_recv(c, 0, b, l, 0)
+#define TEST_FREE(c)       ffrdp_exit(c)
+#elif defined(FFRDP_API_HAS_TIMEOUT)
 #define TEST_SEND(c, b, l) ffrdp_send(c, b, l, 0)
 #define TEST_RECV(c, b, l) ffrdp_recv(c, b, l, 0)
+#define TEST_FREE(c)       ffrdp_free(c)
 #else
 #define TEST_SEND(c, b, l) ffrdp_send(c, b, l)
 #define TEST_RECV(c, b, l) ffrdp_recv(c, b, l)
+#define TEST_FREE(c)       ffrdp_free(c)
 #endif
 
 // One step of the protocol. HEAD is driven by the test (ffrdp_update); the working tree is driven by
@@ -39,7 +46,15 @@
 
 // ffrdp_init 的参数形状变过一次：ip + port 收敛成单个 "ip:port"。两侧都要能编，所以测试走这个入口
 // （调用点只关心 ip / port / 角色 / smss）。
-#ifdef FFRDP_API_HAS_ADDR
+#ifdef FFRDP_API_V2
+static void *TEST_INIT(const char *ip, int port, int server, int mss)
+{
+    char params[128];
+    snprintf(params, sizeof(params), "%s://%s:%d,mss:%d,fec:0",
+             server ? "ffrdps" : "ffrdpc", ip, port, mss);
+    return ffrdp_init(params, NULL, NULL);
+}
+#elif defined(FFRDP_API_HAS_ADDR)
 static void *TEST_INIT(const char *ip, int port, int server, int mss)
 {
     char addr[64];
@@ -148,7 +163,7 @@ int main(int argc, char *argv[])
 #endif
     s0.mbs = CONN(c1)->counter_mack_bits_sent; s0.mbr = CONN(c0)->counter_mack_bits_recv; // c1's reports, what c0 got
 #endif
-    ffrdp_free(c0); ffrdp_free(c1); // everything must be returned, so the residual is a leak
+    TEST_FREE(c0); TEST_FREE(c1); // everything must be returned, so the residual is a leak
     printf("loss=%.3f burst=%d delay=%d jit=%d cap=%.0fKB/s q=%dKB pol=%.0fKB/s/%dKB spike=%d%%/%dms | "
            "c0 recv=%6.2fMB resend=%5.2f%% (rto %4u fast %4u) cwnd=%2u ssth=%2u wait=%3u fail=%4u rttd=%u | "
            "c1 recv=%6.2fMB resend=%5.2f%% maxrto=%u leaked=%lu\n",
