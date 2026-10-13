@@ -692,8 +692,10 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
         *colon++ = 0;
         val = atoi(colon);
         if      (!strcmp(key, "maxconn"))   maxconn      = val;
-        else if (!strcmp(key, "handshake")) handshake_ms = val * 1000;   // 配置里是**秒**（"handshake:10" = 10s，见 ffrdp.h）⇒ 内部一律毫秒 ✗→✓
-        else if (!strcmp(key, "idle"))      idle_ms      = val * 1000;   // 同上（配置里是秒）
+        // 时间的单位一律写进键名（毫秒 ✓）—— 与 ffrdp_send 的 timeout_ms 同一套风格，
+        // 不留"配置是秒、内部是毫秒"的换算点 ✗（那正是踩过的坑）。
+        else if (!strcmp(key, "handshake_ms")) handshake_ms = val;
+        else if (!strcmp(key, "idle_ms"))      idle_ms      = val;
         else if (!strcmp(key, "mss"))       smss         = val;
         else if (!strcmp(key, "fec"))       sfec         = val;
         else if (!strcmp(key, "hs"))        hs_enable    = val;   // 三次握手开关（默认关 ✓）
@@ -981,8 +983,10 @@ int ffrdp_recv(void *ctxt, int conn, char *buf, int len, int timeout_ms)
             c->recv_size-= ret; c->counter_recv_bytes += ret;
             break;
         }
+        // 先判死、再看"要不要等"：已断的连接，即使 timeout=0 也必须报 CLOSED ✓
+        //（否则应用在 timeout=0 的轮询里永远学不到"断了"，只会一直拿到 EAGAIN ✗）。
+        if (ffrdp_isdead_locked(ffrdp, c)) { ret = FFRDP_CLOSED; break; }
         if (timeout_ms == 0 || ffrdp->closing) { ret = FFRDP_EAGAIN; break; }   // 只是没有数据（还没断）
-        if (ffrdp_isdead_locked(ffrdp, c)) { ret = FFRDP_CLOSED; break; }          // 对端已断：只有这一条是 0 ✓
         if (timeout_ms > 0 && (int32_t)(get_timestamp32_ms() - t0) >= timeout_ms) { ret = FFRDP_EAGAIN; break; }
         // 睡在 cond 上等协议送数据来 —— 这一步之后，"等"是真正免费的：不再需要应用去驱动协议。
         {   struct timespec ts;

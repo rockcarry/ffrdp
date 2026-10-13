@@ -47,7 +47,9 @@ typedef long (*FFRDP_CALLBACK)(void *cbctx, const FFRDP_EVENT *ev);
 //   "ffrdps://0.0.0.0:8000"                       服务器
 //   "ffrdpc://192.168.0.213:8000"                 客户端
 //   "ffrdps://0.0.0.0:8000,maxconn:10"            最大连接数（默认 16，上限 FFRDP_MAXCONN）
-//   "ffrdps://0.0.0.0:8000,handshake:10,idle:5"   握手超时 10s / 空闲(keepalive)超时 5s
+//   "ffrdps://0.0.0.0:8000,handshake_ms:10000,idle_ms:5000"  握手超时 / 空闲(keepalive)超时
+//        ⚠️ 时间的单位**写进键名**（毫秒 ✓）—— 与 ffrdp_send 的 timeout_ms 同一套风格，
+//           不留"配置是秒、内部是毫秒"的换算点 ✗。
 //   ",mss:1280,fec:0"                             本端 MSS 与 FEC 冗余（v1 的 smss / sfec 两个参数；
 //                                                 v2 的 init 没有位置参数，所以进了配置串）
 // 解析失败 ⇒ 返回 NULL，原因打印出来（用户从输出判断）。
