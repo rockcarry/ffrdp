@@ -32,12 +32,17 @@
 
 #define SIMLL_MAX 8 // the two endpoint tests, plus room for however many a later test wants
 
+#define SIMLL_ROUTES 8   // 一个假 lowlevel 能登记几个对端（v2 的多连接测试要按地址分发）
+
 typedef struct {
     FFRDP_LOWLEVEL    ll;
     FFRDP_LOWLEVEL_CB cb;
     void             *cbctx;
     int               used;
-    uint32_t          due;   // 协议 arm 的绝对毫秒期限（0 = 无）；忠实模型靠它决定何时给 TIMER
+    uint32_t          due;    // 协议 arm 的绝对毫秒期限（0 = 无）；忠实模型靠它决定何时给 TIMER
+    uint64_t          own;    // 本实例自己的地址：回给已登记对端时，包里带的源地址
+    int               nrt;    // 已登记的"对端地址 ⇒ 目的 slot"条数（0 = 走旧路径）
+    struct { uint64_t addr; int slot; } rt[SIMLL_ROUTES];
 } SIMLL;
 
 static SIMLL g_ll[SIMLL_MAX];
@@ -52,7 +57,15 @@ static SIMLL *simll_find_ctx(void *cbctx)
 
 static int simll_send(void *fl, uint64_t addr, uint8_t *buf, int len)
 {
-    (void)fl; (void)addr;
+    SIMLL *s = (SIMLL*)fl;   // ll 是第一个成员，所以句柄就是实例（与 simll_exit 同一招）
+    int    i;
+    // 登记过的对端：按地址路由到它所在的 slot。这就是 v2 多连接要用的那条路。
+    if (s) for (i = 0; i < s->nrt; i++) {
+        if (s->rt[i].addr == addr) {
+            return sim_send_from(s->rt[i].slot, s->own ? s->own : SIMLL_ADDR, buf, len) > 0 ? 0 : -1;
+        }
+    }
+    // 未登记：与以前逐字相同（忽略 addr，发到"对面"那个 slot）
     // sim_send returns the length it took, always > 0 here: the lowlevel contract is 0 = accepted.
     return sim_send(buf, len) > 0 ? 0 : -1;
 }
@@ -118,7 +131,10 @@ void *sim_ll_init(void *params, FFRDP_LOWLEVEL_CB cb, void *cbctx)
 static void simll_deliver(SIMLL *s, unsigned char *tmp, int n)
 {
     FFRDP_LOWLEVEL_MSG msg;
-    msg.addr = SIMLL_ADDR;
+    uint64_t src = sim_recv_src();
+    // 旧路径（slot 未登记地址）的源地址是 0 ⇒ 仍报那个老常量，与以前逐字相同；
+    // 登记过就报真实来源地址 ⇒ 上层才能按地址分发（v2 的 conn 查表就靠它）。
+    msg.addr = src ? src : SIMLL_ADDR;
     msg.buf  = tmp;
     msg.len  = n;
     s->cb(s->cbctx, FFRDP_LOWLEVEL_TYPE_RECV, &msg, sizeof(msg));
@@ -155,4 +171,26 @@ void sim_ll_run(int idx, void *ctxt)
         simll_deliver(s, tmp, n);
     }
     s->cb(s->cbctx, FFRDP_LOWLEVEL_TYPE_TIMER, NULL, 0);
+}
+
+// ── 多对端路由（P0 新增）──────────────────────────────────────────────────────
+// 登记一条"对端地址 ⇒ 目的 slot"。没有登记过的对端仍走旧路径（发到 1-cursid 那个 slot），
+// 所以老的两端测试完全不受影响：它们一条都不登记。
+int sim_ll_route(void *fl, uint64_t addr, int slot)
+{
+    SIMLL *s = (SIMLL*)fl;
+    int    i;
+    if (!s || slot < 0 || slot >= SIMNET_SLOTS) return -1;
+    for (i = 0; i < s->nrt; i++) if (s->rt[i].addr == addr) { s->rt[i].slot = slot; return 0; }
+    if (s->nrt >= SIMLL_ROUTES) return -1;
+    s->rt[s->nrt].addr = addr;
+    s->rt[s->nrt].slot = slot;
+    s->nrt++;
+    return 0;
+}
+
+void sim_ll_own(void *fl, uint64_t addr)
+{
+    SIMLL *s = (SIMLL*)fl;
+    if (s) s->own = addr;
 }

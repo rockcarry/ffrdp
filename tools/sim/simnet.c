@@ -12,14 +12,16 @@
 #define MAXQ    8192
 #define PKTSIZE 2048
 
-typedef struct { unsigned char buf[PKTSIZE]; int len; int due; } PKT;
-static PKT q[2][MAXQ];
-static int qh[2], qt[2], qn[2];
+typedef struct { unsigned char buf[PKTSIZE]; int len; int due; uint64_t src; } PKT;
+static PKT q[SIMNET_SLOTS][MAXQ];
+static int qh[SIMNET_SLOTS], qt[SIMNET_SLOTS], qn[SIMNET_SLOTS];
 static int cursid = 0;
+static uint64_t g_slot[SIMNET_SLOTS];   // 每个 slot 自己的地址；0 = 未登记（走旧路径）
+static uint64_t g_lastsrc = 0;          // 最近一次 sim_recv 取到的包的源地址
 static uint32_t g_vtick = 0;
-static int gstep = 0, gdelay = 0, gjitter = 0, gburst = 0, gburstleft[2];
-static unsigned gpn[2];
-static double gloss[2];
+static int gstep = 0, gdelay = 0, gjitter = 0, gburst = 0, gburstleft[SIMNET_SLOTS];
+static unsigned gpn[SIMNET_SLOTS];
+static double gloss[SIMNET_SLOTS];
 static double g_cap = 0;      // shaper rate, bytes per ms, 0 = unlimited
 static int    g_qmax = 0;     // shaper queue limit in bytes
 static double g_busy = 0;     // when the shaper finishes the packets already queued
@@ -49,8 +51,8 @@ unsigned long sim_freed(void) { return g_freed; }
 void sim_reset(void)
 {
     int i;
-    for (i = 0; i < 2; i++) { qh[i] = qt[i] = qn[i] = 0; gburstleft[i] = 0; gloss[i] = 0; gpn[i] = 0; }
-    cursid = 0; gstep = 0; g_vtick = 0; gdelay = 0; gjitter = 0; gburst = 0;
+    for (i = 0; i < SIMNET_SLOTS; i++) { qh[i] = qt[i] = qn[i] = 0; gburstleft[i] = 0; gloss[i] = 0; gpn[i] = 0; g_slot[i] = 0; }
+    cursid = 0; g_lastsrc = 0; gstep = 0; g_vtick = 0; gdelay = 0; gjitter = 0; gburst = 0;
     g_cap = 0; g_qmax = 0; g_busy = 0; g_qbytes = 0;
     g_pcap = 0; g_pburst = 0; g_ptok = 0; g_plast = 0;
     g_spikep = 0; g_spikems = 0;
@@ -59,7 +61,10 @@ void sim_reset(void)
 
 void sim_config(double loss, int burst, int delay, int jitter)
 {
-    gloss[0] = gloss[1] = loss; gburst = burst; gdelay = delay; gjitter = jitter;
+    int i;
+    // 老的两端测试只用到 slot 0/1，所以这条循环与原来的 gloss[0] = gloss[1] = loss 完全等价 ✓
+    for (i = 0; i < SIMNET_SLOTS; i++) gloss[i] = loss;
+    gburst = burst; gdelay = delay; gjitter = jitter;
 }
 
 // One shared shaper for both directions, like an access point policing udp:
@@ -88,7 +93,11 @@ void sim_spike(int percent, int extra_ms)
     g_spikep = percent; g_spikems = extra_ms;
 }
 
-void sim_begin(int idx) { cursid = idx; }
+void sim_begin(int idx) { cursid = (idx >= 0 && idx < SIMNET_SLOTS) ? idx : 0; }
+
+// 登记/查询 slot 的地址。不登记就是 0：包不带源地址，接收侧也就报不出对端 —— 与以前逐字相同。
+void     sim_slot(int idx, uint64_t addr) { if (idx >= 0 && idx < SIMNET_SLOTS) g_slot[idx] = addr; }
+uint64_t sim_recv_src(void) { return g_lastsrc; }
 int  sim_queued(int idx) { return qn[idx]; }
 
 void sim_setstep(int step)
@@ -103,7 +112,7 @@ void sim_advance(uint32_t ms)
     gstep   += (int)ms;
 }
 
-static void push(int idx, void *buf, int len, unsigned k)
+static void push(int idx, uint64_t src, void *buf, int len, unsigned k)
 {
     int due, prev, start;
     if (qn[idx] >= MAXQ) return;
@@ -125,16 +134,21 @@ static void push(int idx, void *buf, int len, unsigned k)
     // because Karn drops the samples of retransmitted frames, the long tail never reaches
     // rtts/rttd - so rto stays tuned to the fast part and the tail keeps timing out.
     if (g_spikep > 0 && (int)(hash(k, 3 + idx) % 100u) < g_spikep) due += g_spikems;
+    q[idx][qt[idx]].src = src;   // 随包携带：接收侧靠它告诉上层"这是谁发的"
     q[idx][qt[idx]].due = due;
     qt[idx] = (qt[idx] + 1) % MAXQ; qn[idx]++;
 }
 
-void sim_inject(int idx, void *buf, int len) { push(idx, buf, len, 1); }
+void sim_inject(int idx, void *buf, int len) { push(idx, g_slot[idx], buf, len, 1); }
 
-int sim_send(void *buf, int len) // the fake sendto
+// 显式版本：目的 slot 与包里带的源地址都由调用方给（多对端路由用，P0 新增）。
+// 目的 slot 越界就直接丢弃 —— 旧路径只会在 slot 0/1 之间走，所以这条护栏碰不到老测试。
+int sim_send_from(int dst, uint64_t src, void *buf, int len)
 {
-    int idx = 1 - cursid, drop = 0;
-    unsigned k = ++gpn[idx];
+    int idx = dst, drop = 0;
+    unsigned k;
+    if (idx < 0 || idx >= SIMNET_SLOTS) return len;
+    k = ++gpn[idx];
     unsigned r = hash(k, idx) % 100000u;
     if (g_pcap > 0 && cursid == 0) { // token bucket on the uplink of side 0
         int dt = gstep - g_plast;
@@ -149,14 +163,21 @@ int sim_send(void *buf, int len) // the fake sendto
         if (gburstleft[idx] > 0) { gburstleft[idx]--; drop = 1; }
         else if (r < (unsigned)(gloss[idx] * 100000)) { gburstleft[idx] = gburst - 1; drop = 1; }
     } else if (r < (unsigned)(gloss[idx] * 100000)) drop = 1;
-    if (!drop) push(idx, buf, len, k);
+    if (!drop) push(idx, src, buf, len, k);
     return len;
+}
+
+// 旧路径：发到"对面"那个 slot，源地址 = 本 slot 登记的地址（默认 0 ⇒ 与以前逐字相同）。
+int sim_send(void *buf, int len) // the fake sendto
+{
+    return sim_send_from(1 - cursid, g_slot[cursid], buf, len);
 }
 
 int sim_recv(void *buf, int maxlen) // the fake recvfrom
 {
     int len;
     if (qn[cursid] == 0 || q[cursid][qh[cursid]].due > gstep) return -1;
+    g_lastsrc = q[cursid][qh[cursid]].src;   // 交付时把"谁发的"一起给出（旧路径是 0）
     len = q[cursid][qh[cursid]].len;
     if (len > maxlen) len = maxlen;
     memcpy(buf, q[cursid][qh[cursid]].buf, len);

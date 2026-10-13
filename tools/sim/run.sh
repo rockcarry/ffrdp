@@ -100,7 +100,7 @@ gcc -O1 -w $HAVE_B -DSIMLL_BASE -c simll.c -o simll_base.o
 # utils.c lives one level up (run.sh works from tools/sim).
 # -I../..: the copy sits here, so its quoted includes ("utils.h") need the repo root on the path.
 gcc -O1 -w -I../.. -c utils_sim.c -o utils.o
-TESTS="${TESTS:-t_rto t_ack t_fuzz e2e}"
+TESTS="${TESTS:-t_rto t_ack t_fuzz t_peer e2e}"
 
 # 每一侧的输出同时进终端与一份日志：末尾的"判定汇总"从日志里读，免得靠人眼看统计数字。
 # 统计行（resend%、rto_floor、ooo 直方图……）随负载与旋钮变化，不是判据。
@@ -154,6 +154,12 @@ for t in $TESTS; do
         echo "===== t_fuzz: hostile fragments (a crash names the bytes)"
         echo "-- HEAD --" | tee -a "$SIMLOG"; run $RUN ./t_fuzz_base
         echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_fuzz_new ;;
+    t_peer)
+        # 夹具自测：按对端地址分发是否成立。它不含 ffrdp.c（测的是 simnet + 假 lowlevel 这一层），
+        # 所以只跑一份；用 "-- work --" 标记，让它计入判定汇总的 work 侧。
+        echo
+        echo "===== t_peer: multi-peer routing by addr (fake lowlevel) ====="
+        echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_peer_new ;;
     e2e)
         echo
         echo "===== e2e: loss burst delay jitter ====="

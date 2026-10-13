@@ -1,7 +1,7 @@
 # 差分仿真工具（`tools/sim`）使用说明
 
 工具本体在仓库的 `tools/sim/`：`run.sh`（构建 + A/B 驱动）、`simnet.c`（假网络）、
-`simll.c`（**假 lowlevel** ✓）、`simdefs.h`（两侧共享声明），以及四个测试 `e2e.c` / `t_rto.c` / `t_ack.c` / `t_fuzz.c` ✓。
+`simll.c`（**假 lowlevel** ✓）、`simdefs.h`（两侧共享声明），以及五个测试 `e2e.c` / `t_rto.c` / `t_ack.c` / `t_fuzz.c` / `t_peer.c` ✓。
 本文是它的使用说明。所有命令都在**仓库根目录**执行。
 
 相关文档：[`../readme.md`](../readme.md)（概述/编译）、[`ffrdp-protocol.md`](ffrdp-protocol.md)（协议与优化）、
@@ -19,7 +19,7 @@
 ## 怎么跑
 
 ```bash
-bash tools/sim/run.sh                    # 跑全部（t_rto + t_ack + t_fuzz + e2e）
+bash tools/sim/run.sh                    # 跑全部（t_rto + t_ack + t_fuzz + t_peer + e2e）
 TESTS="e2e"  bash tools/sim/run.sh       # 只跑端到端
 TESTS="t_rto" bash tools/sim/run.sh      # 只跑 RTO 放大测试
 REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而用指定文件
@@ -27,10 +27,10 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 
 | 环境变量 | 含义 | 默认 |
 |---|---|---|
-| `TESTS` | 要跑哪些测试（可多选，空格分隔）| `t_rto t_ack t_fuzz e2e` |
+| `TESTS` | 要跑哪些测试（可多选，空格分隔）| `t_rto t_ack t_fuzz t_peer e2e` |
 | `REF` | **基线**源码路径 | `git show HEAD:ffrdp.c` |
 | `ASAN=1` | 打开地址消毒器（并自动加上 `halt_on_error=1` 与 `setarch -R` ✓）| 关 |
-| `SIM_LL_DEADLINE=1` | 假 lowlevel 换**忠实模型**（只在"有帧到"或"期限到"时唤醒 ✓）| 关 ⇒ 用旧模型（每步无条件一次 TIMER ✗）|
+| `SIM_LL_DEADLINE=1` | 假 lowlevel 换**忠实模型**（只在"有帧到"或"期限到"时唤醒 ✓）⚠️ 丢包场景下很贵 ✗，见下文的实测 | 关 ⇒ 用旧模型（每步无条件一次 TIMER ✗）|
 | `SIMLOG` | 逐行日志写到哪个文件 | `/tmp/ffrdp-sim-harness.log` |
 
 **被测版本恒为工作区当前 `ffrdp.c`** ✓ —— 所以典型用法是：改完代码直接 `bash tools/sim/run.sh`，
@@ -50,7 +50,7 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
    工作区侧**由假 lowlevel 驱动**（`sim_ll_run()`：先把已排队的包逐个走 RECV ✓，再走一次 TIMER ✓）——
    与真传输的一圈同形 ✓。开关 `SIM_LL_DEADLINE=1` 换成忠实模型：只在"有帧到 / 期限到"时唤醒 ✓（默认模型每步无条件 TIMER ✗ ⇒
    判"唤醒是否正常"必须打开这个开关 ✗）。
-3. **假网络**（`simnet.c`）：两个内存队列，提供丢包、连丢、延迟、抖动、
+3. **假网络**（`simnet.c`）：**每个 slot 一个内存队列**（默认就是 side 0 / 1 两个 ✓），提供丢包、连丢、延迟、抖动、
    **共享限速器（shaper）**、**令牌桶（policer）**、**重尾尖峰（spike）** ✓。
 4. **内存记账**：`calloc/free` 被计数 ⇒ 输出里的 `leaked=` 是**真正的泄漏** ✓（应当恒为 0 ✓）。
 5. **两侧各一份头文件 + 按形状决定开关** ✓：两侧各自生成 `ffrdp_base.h` / `ffrdp_new.h` 与
@@ -63,14 +63,36 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 > 生成的中间文件（`ffrdp_base.c`、`ffrdp_new.c`、`ffrdp_*.h`、`lowlevel_*.h`、`utils_sim.c`、`*_base`、`*_new`、`*.o`）
 > 都在 `.gitignore` 里 ✓ —— 它们不是源码，每次 `run.sh` 都会重写 ✓。
 
-## 四个测试
+## 五个测试
 
 | 测试 | 内容 | 判据 |
 |---|---|---|
 | `t_rto` | 12 个同时过期的帧被逐个重传，观察 RTO 被放大多少次 | 期望"**每往返退让一次**"⇒ `rto_backoff` 只有 1 次，而不是 12 次 ✗ |
 | `t_ack` | 手工注入 3 个 ACK 帧（无洞 / 连续 / 有洞），验证诊断计数 | 期望 `ack_recv=3 mack=2 hole=1` ⇒ 打印 `PASS` ✓ |
 | `e2e` | 端到端跑 `steps` 步，输出一行摘要 + 若干诊断行 | A/B 对比 `recv`（交付量）与 `resend%`（重传率）✓ |
+| `t_peer` | **夹具自测（P0）**：一个"服务端" slot + 两个对端 slot，验"按对端地址分发" ✓（不含 `ffrdp.c` ✓）| 服务端读到的两帧各自带着正确的来源地址 ✓；按地址回包落到正确 slot、不串台 ✓；未登记地址的 slot 仍走旧路径（源地址 0 ✓）|
 | `t_fuzz` | **敌意输入**：398 个畸形片段（长度扫过每种帧类型 × 3 种载荷 + 定种子随机），**每个片段 fork 一个子进程**喂进解析器；另做洞上方洪泛的内存有界检查 | 没有片段能杀死子进程（`all N fragments survived`）**且**洪泛内存有界（`-> bounded`）✓ 见下 |
+
+### 多对端：夹具 API（P0 新增）
+
+为 v2 的"**一个 lowlevel 服务 N 个对端**"做准备 ✓。夹具里**一个 slot = 一端**，地址是可选的 ✓：
+
+| API | 作用 |
+|---|---|
+| `sim_slot(idx, addr)` | 登记 slot `idx` 自己的地址 ✓（不登记 = 0 ⇒ 包不带源地址，与以前逐字相同 ✓）|
+| `sim_send_from(dst, src, buf, len)` | 显式发：**目的 slot + 包里带的源地址** ✓（多对端用这个 ✓）|
+| `sim_recv_src()` | 最近一次 `sim_recv` 取到的包的源地址 ✓（0 = 旧路径 ✓）|
+| `sim_ll_route(fl, addr, slot)` | 假 lowlevel 的**按地址路由**：`ll->send(addr)` 落到哪个 slot ✓ |
+| `sim_ll_own(fl, addr)` | 本实例自己的地址（回给已登记对端时带的源地址 ✓）|
+
+**关键约定** ✓：`sim_send()` / `sim_recv()` / `msg.addr` 的**老行为一个字都没变** ✗ ——
+没登记地址时 `msg.addr` 仍是老常量 `SIMLL_ADDR` ✓、`sim_send()` 仍是"发到 `1-cursid` 那个 slot" ✓
+⇒ 老的两端测试一行都不用改 ✓（判据：17 场景输出**逐字相同** ✓，已验 ✓）。
+
+⚠️ **忠实模型的成本实测** ✗（同一个 0.05 丢包场景，本机）：
+`SIM_LL_DEADLINE=1` 下 **300 步要 63s 并撞 4 次防自旋护栏** ✗；1200 步已超 150s ✗；
+而**默认模型 3000 步只要 1s** ✓。⇒ 用忠实模型判定时请**用小步数 + 干净/轻丢包场景** ✓，
+不要直接拿 17 场景 × 6000 步去跑 ✗（那条路基本跑不完 ✓）。
 
 ### t_fuzz：敌意输入（端口健壮性的回归）
 
