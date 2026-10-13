@@ -73,7 +73,7 @@ static void ffrdp_udp_addr_unpack(uint64_t addr, struct sockaddr_in *sin)
 // out of 1000), and connect() means nothing else can put a byte in it.
 static int ffrdp_udp_wakeup_create(UDP_LOWLEVEL *udp)
 {
-    struct sockaddr_in lo = {};
+    struct sockaddr_in lo  = {};
     socklen_t          len = sizeof(lo);
     int                fd  = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (fd < 0) return -1;
