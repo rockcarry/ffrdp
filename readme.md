@@ -190,6 +190,9 @@ column -s, -t logs/summary.csv | tail -10     # 摘要表
 ```
 
 ### 对外 API（`ffrdp.h`）—— **v1.2.0** ✓
+> ⚠️ `ffrdp.h` 现在是 **v2.0.0** ✓（`FFRDP_VERSION` ✓）：签名见 [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) ✓；
+> 下面列的是 **v1.2.x 分支**的签名 ✓，作为旧接口留档 ✓。注意 `hs` **默认已翻成开** ✓
+> ⇒ 想沿下面这条老路走，params 里要显式 `hs:0` ✓。
 
 ⚠️ **下面是 v1.2.0 的签名** ✓；相对 v1.0.0 / v1.1.0 **有三处变化** ✗（`ffrdp_init` 改收地址字符串、
 `send` / `recv` 多一个 `timeout_ms`、`ffrdp_update` 删除）⇒ 细节与理由见
@@ -220,6 +223,7 @@ void  ffrdp_dump  (void *ctxt, int clearhistory);     // 打印诊断
 | 帧格式、mack、FEC、RTO 计算、通信流程 | [`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) 第一部分（v1.0.0）|
 | 每个改动的动机、被否掉的路线、当时的上机原始 log | [`docs/notes.md`](docs/notes.md) |
 | 没有真机时怎么验证"没有回归" | [`docs/sim-test.md`](docs/sim-test.md) |
+| v2.0.0 的接口（params / 句柄 / 事件 / 加密回调 / 握手）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |
 
 ---
 

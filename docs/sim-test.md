@@ -1,7 +1,7 @@
 # 差分仿真工具（`tools/sim`）使用说明
 
 工具本体在仓库的 `tools/sim/`：`run.sh`（构建 + A/B 驱动）、`simnet.c`（假网络）、
-`simll.c`（**假 lowlevel** ✓）、`simdefs.h`（两侧共享声明），以及五个测试 `e2e.c` / `t_rto.c` / `t_ack.c` / `t_fuzz.c` / `t_peer.c` ✓。
+`simll.c`（**假 lowlevel** ✓）、`simdefs.h`（两侧共享声明），以及七个测试 `e2e.c` / `t_rto.c` / `t_ack.c` / `t_fuzz.c` / `t_peer.c` / `t_handshake.c` / `t_crypto.c` ✓。
 本文是它的使用说明。所有命令都在**仓库根目录**执行。
 
 相关文档：[`../readme.md`](../readme.md)（概述/编译）、[`ffrdp-protocol.md`](ffrdp-protocol.md)（协议与优化）、
@@ -19,7 +19,7 @@
 ## 怎么跑
 
 ```bash
-bash tools/sim/run.sh                    # 跑全部（t_rto + t_ack + t_fuzz + t_peer + e2e）
+bash tools/sim/run.sh                    # 跑全部（7 个测试 + hs-e2e / e2e-raw / e2e 三个场景组）
 TESTS="e2e"  bash tools/sim/run.sh       # 只跑端到端
 TESTS="t_rto" bash tools/sim/run.sh      # 只跑 RTO 放大测试
 REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而用指定文件
@@ -27,7 +27,7 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 
 | 环境变量 | 含义 | 默认 |
 |---|---|---|
-| `TESTS` | 要跑哪些测试（可多选，空格分隔）| `t_rto t_ack t_fuzz t_peer e2e` |
+| `TESTS` | 要跑哪些测试 / 场景组（可多选，空格分隔）| `t_rto t_ack t_fuzz t_peer t_handshake t_crypto hs-e2e e2e-raw e2e` |
 | `REF` | **基线**源码路径 | `git show HEAD:ffrdp.c` |
 | `ASAN=1` | 打开地址消毒器（并自动加上 `halt_on_error=1` 与 `setarch -R` ✓）| 关 |
 | `SIM_LL_DEADLINE=1` | 假 lowlevel 换**忠实模型**（只在"有帧到"或"期限到"时唤醒 ✓）⚠️ 丢包场景下很贵 ✗，见下文的实测 | 关 ⇒ 用旧模型（每步无条件一次 TIMER ✗）|
@@ -65,7 +65,7 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 > 生成的中间文件（`ffrdp_base.c`、`ffrdp_new.c`、`ffrdp_*.h`、`lowlevel_*.h`、`utils_sim.c`、`*_base`、`*_new`、`*.o`）
 > 都在 `.gitignore` 里 ✓ —— 它们不是源码，每次 `run.sh` 都会重写 ✓。
 
-## 五个测试
+## 七个测试
 
 | 测试 | 内容 | 判据 |
 |---|---|---|
@@ -73,6 +73,9 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 | `t_ack` | 手工注入 3 个 ACK 帧（无洞 / 连续 / 有洞），验证诊断计数 | 期望 `ack_recv=3 mack=2 hole=1` ⇒ 打印 `PASS` ✓ |
 | `e2e` | 端到端跑 `steps` 步，输出一行摘要 + 若干诊断行 | A/B 对比 `recv`（交付量）与 `resend%`（重传率）✓ |
 | `t_peer` | **夹具自测（P0）**：一个"服务端" slot + 两个对端 slot，验"按对端地址分发" ✓（不含 `ffrdp.c` ✓）| 服务端读到的两帧各自带着正确的来源地址 ✓；按地址回包落到正确 slot、不串台 ✓；未登记地址的 slot 仍走旧路径（源地址 0 ✓）|
+| `t_handshake` | **握手 + 多连接（v2）**：一个服务端 + 两个客户端，验 CONNECT/ACCEPT、句柄不同、不串台、FIN ⇒ DISCONN ✓（v2-only ✓）|
+
+| `t_crypto` | **加密回调（v2）**：加/解密回调都被调到 ✓；**两条出口**（攒满 mss 的整帧 / 超时或 flush 的短帧）都验到 ✓；逐字节完好 ⇒ 线上确实是密文 ✓；另加"回调不改载荷"的对照段 ✓（v2-only ✓）|
 | `t_fuzz` | **敌意输入**：398 个畸形片段（长度扫过每种帧类型 × 3 种载荷 + 定种子随机），**每个片段 fork 一个子进程**喂进解析器；另做洞上方洪泛的内存有界检查 | 没有片段能杀死子进程（`all N fragments survived`）**且**洪泛内存有界（`-> bounded`）✓ 见下 |
 
 ### 多对端：夹具 API（P0 新增）
@@ -170,6 +173,19 @@ ASAN=1 TESTS="t_fuzz" bash run.sh   # 地址消毒器：不崩但越界读也要
 
 `shaper` 与 `policer` 的区别值得记住：**shaper = 排队（延迟上升）**、
 **policer = 丢弃（超量直接丢）** ✓ —— 真机链路上的限速往往两者混合 ✓。
+
+### 三个场景组：`e2e` / `hs-e2e` / `e2e-raw`
+
+| 组 | 是什么 | 用途 |
+|---|---|---|
+| `e2e` | 17 个场景，**不给 hs 键** | 现在走的就是**握手路径**（v2 默认 ✓）⇒ 新判据 ✓ |
+| `hs-e2e` | 4 个场景，同样不给 hs 键 | 握手路径的**快速**组（开发时用 ✓）|
+| `e2e-raw` | 4 个场景，`E2E_HS=0` ⇒ `hs:0` | **老路径的回归网** ✓：输出应与"翻默认之前"**逐字相同** ✓ |
+
+- ⚠️ `hs` **默认已翻成开** ✓（v2 起）⇒ 任何"以为没握手"的判据都作废 ✗。要跑老路径必须显式 `hs:0` ✓；
+  `t_rto` / `t_ack` / `t_fuzz` 这三个单连接测试就是显式 `hs:0` 的 ✓（它们测的就是老路径 ✓）。
+- `E2E_HS` 三态：`1` 强制握手 ✓ / `0` 强制老路径 ✓ / 不设 ⇒ 跟随协议默认 ✓。
+- 为什么值得留着 `e2e-raw` ✓：翻默认这类改动，"没碰老路径"必须**能用字节证明** ✓，而不是靠读代码相信 ✓。
 
 ### 内置的 17 个场景（`run.sh` 里写死；参数可直接复制）
 
