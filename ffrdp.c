@@ -1406,9 +1406,12 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     const FFRDP_FRAME_NODE *q;
     uint32_t now = get_timestamp32_ms(), due = 0, x;
     int      n_sent = 0;
+    int      entry  = 0;             // 表项序号（与 tick 的 i 同坐标系 ✓）
+    int      armed_now = 0;          // due 是"立刻就要发东西"（不是某帧的 RTO 到期 ✓）
     int      pending_first = 0;       // 发送表里有还没首发出去的帧
     int      sent_before_pending = 0; // 第一个"还没首发"的帧前面有几帧已首发
-    for (q = c->send_list_head; q; q = q->next) {
+    // entry = 表项序号，与 tick 那个发送循环的 i **同一个坐标系** ✓（下面只数 tick 看得见的那一段 ✓）。
+    for (q = c->send_list_head, entry = 0; q; q = q->next, entry++) {
         if (!(q->flags & FLAG_FIRST_SEND)) {
             // tick 的发送循环是"从表头起最多看 cwnd 帧"。表头那些已首发、在等 ack 的帧会把窗口占满，
             // 排在后面的未首发帧这一圈根本够不着 —— 那时候报"现在有活"就是空转：对端静默时 cwnd 塌成
@@ -1418,7 +1421,13 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             continue;
         }
         n_sent++;
-        if (!due || (int32_t)(q->tick_timeout - due) < 0) due = q->tick_timeout;
+        // ⚠️ 只有 tick 这一圈**看得见**的帧才拿它算期限：tick 的重传分支在
+        //     `for (i = 0; ...; i < cwnd ...)` 里 ⇒ 表头 cwnd 个条目之外的帧，这一圈根本动不了 ✗。
+        //     把窗口外的 tick_timeout 也算进来，就会拿一个"没人会处理"的过期期限要求"立刻" ⇒
+        //     叫醒了、没人干活、期限又停在 now ⇒ 自旋 ✓（实测：cwnd=1 时表头没到期、后面那帧过期，
+        //     忠实模型一个 tick 里转 60 万次 ✓）。
+        //     n_sent 仍然按**全表**数 ✓：它的语义是"在途帧数"，和可见窗口是两件事 ✓。
+        if (entry < (int)c->cwnd && (!due || (int32_t)(q->tick_timeout - due) < 0)) due = q->tick_timeout;
     }
     if (c->cur_new_node) { x = c->cur_new_tick + FFRDP_FLUSH_TIMEOUT; if (!due || (int32_t)(x - due) < 0) due = x; }
     x = c->rate_tick + 1000;                          if (!due || (int32_t)(x - due) < 0) due = x;
@@ -1446,8 +1455,13 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         // 路径都不刷新它 ⇒ ack 刚把槽位空出来、该马上补下一帧的那一刻，判据读到的是旧值 ⇒
         // 不叫醒 ⇒ 睡到下面 rate_tick+1000 那条期限上（真机 y-run1：小窗口 lap 最大 1002ms、
         // 两端只剩 32~48 帧/s；大窗口下 limit=128 让旧值几乎永远成立 ⇒ 循环自旋掩盖了它）。
-        if (c->swnd > 0 && (uint32_t)n_sent < limit) due = now;
+        if (c->swnd > 0 && (uint32_t)n_sent < limit) { due = now; armed_now = 1; }
     }
+    // ⚠️ tick 判"到期要重传"用的是 `now - tick_timeout > 0`（**严格**大于 ✓）⇒ tick_timeout 恰好等于
+    //    now 的帧，这一圈不会被重传 ✗。若把它当"现在"叫醒，就是在**同一个冻结的 tick 里**空转 ✓
+    //    （忠实模型实测：每个这样的步都要撞一次防自旋护栏 ✓）。它只差 1ms，往前挪一下就好 ✓。
+    //    注意顺序：必须放在下面"过期 ⇒ 立刻"那句**之前** ✓ —— 真正已过期（< now）的帧 tick 是能干活的 ✓。
+    if (!armed_now && due && (int32_t)(due - now) == 0) due = now + 1;
     if (due && (int32_t)(due - now) < 0) due = now;       // 已经过期 ⇒ 立刻（这也是"快一点"的做法）
     // 兜底：有未确认的帧、或应用队列非空时最多睡 4ms。上面那条判据修好后它不该再触发；
     // 真机上 lap 最大曾到 59/114/222ms，每漏一次小窗口就少送好几帧，而多醒几次只费一点 CPU。
