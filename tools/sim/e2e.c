@@ -24,14 +24,37 @@
 #define TEST_SEND(c, b, l) ffrdp_send(c, 0, b, l, 0)
 #define TEST_RECV(c, b, l) ffrdp_recv(c, 0, b, l, 0)
 #define TEST_FREE(c)       ffrdp_exit(c)
+// ── 应用句柄（v2 多连接）────────────────────────────────────────────────
+// 服务端**没有**现成的句柄：它必须先被 accept，拿到 FFRDP_ACCEPT 报出来的那个
+// 句柄，才有地方收发 ✓（客户端就是 0 号主连接 ✓）。这个小组件把它记下来，
+// 两侧于是写成同一句话 ⇒ 老场景（握手关、只有 0 号）行为一字不变 ✓。
+struct e2e_app { int conn; };
+static long e2e_event(void *cbctx, const FFRDP_EVENT *ev)
+{
+    // 持着协议锁被调用 ⇒ 只记句柄，绝不回调 ffrdp_*（会自锁）✓
+    struct e2e_app *a = (struct e2e_app*)cbctx;
+    if (a && ev->type == FFRDP_ACCEPT) a->conn = ev->conn;
+    return FFRDP_NOT_CONSUMED;
+}
+#define APP_CONN(c, h)          (((FFRDPCONTEXT*)(c))->table[h])   // 按句柄取连接
+#define TEST_SEND_H(c, h, b, l) ffrdp_send(c, h, b, l, 0)
+#define TEST_RECV_H(c, h, b, l) ffrdp_recv(c, h, b, l, 0)
 #elif defined(FFRDP_API_HAS_TIMEOUT)
 #define TEST_SEND(c, b, l) ffrdp_send(c, b, l, 0)
 #define TEST_RECV(c, b, l) ffrdp_recv(c, b, l, 0)
 #define TEST_FREE(c)       ffrdp_free(c)
+struct e2e_app { int conn; };            // 老接口：没有句柄这回事
+#define APP_CONN(c, h)          CONN(c)
+#define TEST_SEND_H(c, h, b, l) ffrdp_send(c, b, l, 0)
+#define TEST_RECV_H(c, h, b, l) ffrdp_recv(c, b, l, 0)
 #else
 #define TEST_SEND(c, b, l) ffrdp_send(c, b, l)
 #define TEST_RECV(c, b, l) ffrdp_recv(c, b, l)
 #define TEST_FREE(c)       ffrdp_free(c)
+struct e2e_app { int conn; };
+#define APP_CONN(c, h)          CONN(c)
+#define TEST_SEND_H(c, h, b, l) ffrdp_send(c, b, l)
+#define TEST_RECV_H(c, h, b, l) ffrdp_recv(c, b, l)
 #endif
 
 // One step of the protocol. HEAD is driven by the test (ffrdp_update); the working tree is driven by
@@ -47,22 +70,24 @@
 // ffrdp_init 的参数形状变过一次：ip + port 收敛成单个 "ip:port"。两侧都要能编，所以测试走这个入口
 // （调用点只关心 ip / port / 角色 / smss）。
 #ifdef FFRDP_API_V2
-static void *TEST_INIT(const char *ip, int port, int server, int mss)
+static void *TEST_INIT_CB(const char *ip, int port, int server, int mss, void *cbctx)
 {
     char params[128];
-    snprintf(params, sizeof(params), "%s://%s:%d,mss:%d,fec:0",
-             server ? "ffrdps" : "ffrdpc", ip, port, mss);
-    return ffrdp_init(params, NULL, NULL);
+    // E2E_HS=1 ⇒ 这一轮跑"带三次握手"的路径（默认仍是关 ⇒ 老场景的判据不动 ✓）。
+    snprintf(params, sizeof(params), "%s://%s:%d,mss:%d,fec:0%s",
+             server ? "ffrdps" : "ffrdpc", ip, port, mss, getenv("E2E_HS") ? ",hs:1" : "");
+    return ffrdp_init(params, e2e_event, cbctx);
 }
 #elif defined(FFRDP_API_HAS_ADDR)
-static void *TEST_INIT(const char *ip, int port, int server, int mss)
+static void *TEST_INIT_CB(const char *ip, int port, int server, int mss, void *cbctx)
 {
     char addr[64];
+    (void)cbctx;
     snprintf(addr, sizeof(addr), "%s:%d", ip, port);
     return ffrdp_init(addr, NULL, NULL, server, mss, 0);
 }
 #else
-#define TEST_INIT(ip, port, server, mss) ffrdp_init((char *)(ip), port, NULL, NULL, server, mss, 0)
+#define TEST_INIT_CB(ip, port, server, mss, cbctx) ffrdp_init((char *)(ip), port, NULL, NULL, server, mss, 0)
 #endif
 
 // ---- 判定：只放"任何负载/任何旋钮下都必须成立"的不变量。统计数字（resend%、rto、rto_floor、
@@ -98,50 +123,55 @@ int main(int argc, char *argv[])
     struct { unsigned rto, fast, cwnd, ssth, wait, fail, rttd, maxrto, first, ack, mack, hole, tev, rbk, inflight, tx, rx, ooo, far, dup, adup, spur, rfl, flr, d1, d25, dgt, d65, d128, mbs, mbr; } s0, s1;
     FFRDPCONTEXT *c0, *c1;
     unsigned long r0 = 0, r1 = 0;
-    int i, ret;
+    struct e2e_app app0 = { 0 }, app1 = { 0 };
+    int i, ret, h0 = 0, h1 = 0;   // 应用句柄：客户端恒 0；服务端等 ACCEPT ✓
 
     sim_reset();
     sim_config(loss, burst, delay, jit);
     if (cap  > 0) sim_shaper (cap  * 1024.0 / 1000.0, qmax * 1024);  // KB/s -> bytes per ms
     if (pcap > 0) sim_policer(pcap * 1024.0 / 1000.0, pburst * 1024);
     if (spikep > 0) sim_spike(spikep, spikem);
-    c0 = TEST_INIT("127.0.0.1", 8001, 0, 1280);
-    c1 = TEST_INIT("127.0.0.1", 8002, 1, 1280);
+    c0 = TEST_INIT_CB("127.0.0.1", 8001, 0, 1280, &app0);
+    c1 = TEST_INIT_CB("127.0.0.1", 8002, 1, 1280, &app1);
     if (!c0 || !c1) { printf("       FAIL: init failed\n"); return -1; }
     // ── 地址登记（P2 第二步）──────────────────────────────────────────────
     // 协议按 (ip<<16)|port 表示地址 ✓、按地址查表分发 ✓ ⇒ 仿真必须报**协议真在用的值** ✓：
     //   slot 1（服务端）发出的帧带 c0 认为的对端地址 ✓（否则 c0 会把回包当"别人的包"丢掉 ✗）；
     //   slot 0（客户端）发出的帧带客户端自己的地址 ✓ —— c1 从第一帧学会它、之后回包都用它 ✓。
-    sim_slot(1, CONN(c0)->peer_addr);
-    sim_slot(0, (uint64_t)0x7F0000010000C000ULL);   // 127.0.0.1:49152：仿真里只需与上面不同 ✓
+    // 两侧登记**同一个**地址：在这套两端夹具里，双方"眼中的对端"都是 c0 的 peer_addr ✓。
+    // ⚠️ 别给某一侧登记自造地址 ✗：走握手时，服务端记下的是它**收到 SYN 时**的地址，
+    // 之后的数据帧必须带同一个值，否则按地址分发会把它当"别人的包"丢掉 ✓。
+    sim_slot(1, APP_CONN(c0, h0)->peer_addr);
+    sim_slot(0, APP_CONN(c0, h0)->peer_addr);
     memset(sbuf, 0x5a, sizeof(sbuf));
 
     for (i = 0; i < steps; i++) {
+        h0 = app0.conn; h1 = app1.conn;   // 服务端：ACCEPT 之前是 0（那时 send 会被拒 ✓）
         sim_setstep(i);
         // same shape as test.c: a random chunk of 1..sndsz bytes every iteration
-        sim_begin(0); TEST_SEND(c0, (char*)sbuf, 1 + (int)(hash(i, 11) % (unsigned)sndsz)); TEST_RUN(c0, 0);
-        sim_begin(1); TEST_SEND(c1, (char*)sbuf, 1 + (int)(hash(i, 12) % (unsigned)sndsz)); TEST_RUN(c1, 1);
-        sim_begin(1); while ((ret = TEST_RECV(c1, (char*)rbuf, sizeof(rbuf))) > 0) r1 += ret;
-        sim_begin(0); while ((ret = TEST_RECV(c0, (char*)rbuf, sizeof(rbuf))) > 0) r0 += ret;
+        sim_begin(0); TEST_SEND_H(c0, h0, (char*)sbuf, 1 + (int)(hash(i, 11) % (unsigned)sndsz)); TEST_RUN(c0, 0);
+        sim_begin(1); TEST_SEND_H(c1, h1, (char*)sbuf, 1 + (int)(hash(i, 12) % (unsigned)sndsz)); TEST_RUN(c1, 1);
+        sim_begin(1); while ((ret = TEST_RECV_H(c1, h1, (char*)rbuf, sizeof(rbuf))) > 0) r1 += ret;
+        sim_begin(0); while ((ret = TEST_RECV_H(c0, h0, (char*)rbuf, sizeof(rbuf))) > 0) r0 += ret;
     }
-    s0.rto = CONN(c0)->counter_resend_rto; s0.fast = CONN(c0)->counter_resend_fast; s0.first = CONN(c0)->counter_send_1sttime;
-    s0.cwnd = CONN(c0)->cwnd; s0.ssth = CONN(c0)->ssthresh; s0.wait = CONN(c0)->wait_snd; s0.fail = CONN(c0)->counter_send_failed; s0.rttd = CONN(c0)->rttd;
-    s1.rto = CONN(c1)->counter_resend_rto; s1.fast = CONN(c1)->counter_resend_fast; s1.first = CONN(c1)->counter_send_1sttime;
-    s1.maxrto = CONN(c1)->counter_reach_maxrto;
-    s0.tx = CONN(c0)->counter_txfull; s0.rx = CONN(c1)->counter_rxfull; // frames c0 sent vs frames c1 received: the real air loss
-    s1.tx = CONN(c1)->counter_txfull; s1.rx = CONN(c0)->counter_rxfull;
+    s0.rto = APP_CONN(c0, h0)->counter_resend_rto; s0.fast = APP_CONN(c0, h0)->counter_resend_fast; s0.first = APP_CONN(c0, h0)->counter_send_1sttime;
+    s0.cwnd = APP_CONN(c0, h0)->cwnd; s0.ssth = APP_CONN(c0, h0)->ssthresh; s0.wait = APP_CONN(c0, h0)->wait_snd; s0.fail = APP_CONN(c0, h0)->counter_send_failed; s0.rttd = APP_CONN(c0, h0)->rttd;
+    s1.rto = APP_CONN(c1, h1)->counter_resend_rto; s1.fast = APP_CONN(c1, h1)->counter_resend_fast; s1.first = APP_CONN(c1, h1)->counter_send_1sttime;
+    s1.maxrto = APP_CONN(c1, h1)->counter_reach_maxrto;
+    s0.tx = APP_CONN(c0, h0)->counter_txfull; s0.rx = APP_CONN(c1, h1)->counter_rxfull; // frames c0 sent vs frames c1 received: the real air loss
+    s1.tx = APP_CONN(c1, h1)->counter_txfull; s1.rx = APP_CONN(c0, h0)->counter_rxfull;
     s0.ooo = s0.far = s0.dup = s0.adup = s0.spur = s0.rfl = 0;
 #ifdef NEW_COUNTERS
-    s0.ack = CONN(c0)->counter_ack_recv; s0.mack = CONN(c0)->counter_ack_mack; s0.hole = CONN(c0)->counter_ack_hole;
-    s0.tev = CONN(c0)->counter_timeout_evt; s0.rbk = CONN(c0)->counter_rto_backoff;
+    s0.ack = APP_CONN(c0, h0)->counter_ack_recv; s0.mack = APP_CONN(c0, h0)->counter_ack_mack; s0.hole = APP_CONN(c0, h0)->counter_ack_hole;
+    s0.tev = APP_CONN(c0, h0)->counter_timeout_evt; s0.rbk = APP_CONN(c0, h0)->counter_rto_backoff;
 #endif
 #ifdef RECV_OOO
-    s0.ooo = CONN(c1)->counter_recv_ooo; s0.far = CONN(c1)->counter_recv_far; // c1's view of what c0 sent
+    s0.ooo = APP_CONN(c1, h1)->counter_recv_ooo; s0.far = APP_CONN(c1, h1)->counter_recv_far; // c1's view of what c0 sent
 #endif
 #ifdef DUP_REPORT
-    s0.dup  = CONN(c1)->counter_recv_dup; // what c1 actually received a second time
-    s0.adup = CONN(c0)->counter_ack_dup;  // ... and what c0 was told about it
-    s0.flr  = CONN(c0)->rto_floor;
+    s0.dup  = APP_CONN(c1, h1)->counter_recv_dup; // what c1 actually received a second time
+    s0.adup = APP_CONN(c0, h0)->counter_ack_dup;  // ... and what c0 was told about it
+    s0.flr  = APP_CONN(c0, h0)->rto_floor;
 #endif
 #ifdef DUP_REPORT
     printf("       rto_floor=%u ms (the peer called %u of our retransmits pointless)\n", s0.flr, s0.adup);
@@ -157,11 +187,11 @@ int main(int argc, char *argv[])
 #endif
 #ifdef OOO_HIST
     // read these before the contexts are returned: the summary below prints after they are gone
-    s0.d1 = CONN(c1)->counter_ooo_d1_24; s0.d25 = CONN(c1)->counter_ooo_d25_64; s0.dgt = CONN(c1)->counter_ooo_dgt64;
+    s0.d1 = APP_CONN(c1, h1)->counter_ooo_d1_24; s0.d25 = APP_CONN(c1, h1)->counter_ooo_d25_64; s0.dgt = APP_CONN(c1, h1)->counter_ooo_dgt64;
 #ifdef OOO_HIST2
-    s0.d65 = CONN(c1)->counter_ooo_d65_128; s0.d128 = CONN(c1)->counter_ooo_dgt128;
+    s0.d65 = APP_CONN(c1, h1)->counter_ooo_d65_128; s0.d128 = APP_CONN(c1, h1)->counter_ooo_dgt128;
 #endif
-    s0.mbs = CONN(c1)->counter_mack_bits_sent; s0.mbr = CONN(c0)->counter_mack_bits_recv; // c1's reports, what c0 got
+    s0.mbs = APP_CONN(c1, h1)->counter_mack_bits_sent; s0.mbr = APP_CONN(c0, h0)->counter_mack_bits_recv; // c1's reports, what c0 got
 #endif
     TEST_FREE(c0); TEST_FREE(c1); // everything must be returned, so the residual is a leak
     printf("loss=%.3f burst=%d delay=%d jit=%d cap=%.0fKB/s q=%dKB pol=%.0fKB/s/%dKB spike=%d%%/%dms | "
@@ -208,6 +238,12 @@ int main(int argc, char *argv[])
         check(l10 >= loss * 100.0 - 10.0 && l10 <= loss * 100.0 + 10.0, "observed loss c1->c0 far from the configured rate");
     }
     // 3) 交付上界：收到的不可能比发出的多（两边都发，所以用各自的对端）
+    //    走握手的那一轮另加一条：**必须真的传过数据** ✓ —— 普通场景故意不看统计量
+    //    （调参不该被判失败 ✓），但 hs 组的存在意义就是"accept 之后收发都能用" ✓，
+    //    recv=0 必须算失败 ✗（曾经因为没有这条，一个字节没传也判 OK ✗）。
+    if (getenv("E2E_HS")) {
+        check(r1 > 0 && r0 > 0, "E2E_HS: no application data got through after the handshake");
+    }
     check(r1 >= 0 && r0 >= 0, "negative byte count");
     printf("       verdict -> %s\n", g_fail ? "FAIL" : "OK");
     return 0;   // 判定结果体现在上面那一行：run.sh 读它

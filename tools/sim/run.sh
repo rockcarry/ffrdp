@@ -100,7 +100,7 @@ gcc -O1 -w $HAVE_B -DSIMLL_BASE -c simll.c -o simll_base.o
 # utils.c lives one level up (run.sh works from tools/sim).
 # -I../..: the copy sits here, so its quoted includes ("utils.h") need the repo root on the path.
 gcc -O1 -w -I../.. -c utils_sim.c -o utils.o
-TESTS="${TESTS:-t_rto t_ack t_fuzz t_peer t_handshake e2e}"
+TESTS="${TESTS:-t_rto t_ack t_fuzz t_peer t_handshake hs-e2e e2e}"
 
 # 每一侧的输出同时进终端与一份日志：末尾的"判定汇总"从日志里读，免得靠人眼看统计数字。
 # 统计行（resend%、rto_floor、ooo 直方图……）随负载与旋钮变化，不是判据。
@@ -109,10 +109,12 @@ SIMLOG="${SIMLOG:-/tmp/ffrdp-sim-harness.log}"
 run() { "$@" 2>&1 | tee -a "$SIMLOG" || true; }
 for t in $TESTS; do
     # v2-only 的测试（接口只有工作区那份才有）⇒ 不编 HEAD 那一份 ✗
-    V2ONLY=""; case $t in t_handshake) V2ONLY=1 ;; esac
+    # 有的 TESTS 项只是"派发用的场景组"，复用别的测试的二进制（hs-e2e ⇒ e2e ✓）
+    BUILD_T=$t; case $t in hs-e2e) BUILD_T=e2e ;; esac
+    V2ONLY=""; case $BUILD_T in t_handshake) V2ONLY=1 ;; esac
     for v in base new; do
         if [ -n "$V2ONLY" ] && [ "$v" = base ]; then continue; fi
-        sed "s|#include \"../../ffrdp.c\"|#include \"ffrdp_$v.c\"|; s|#include \"../../ffrdp.h\"|#include \"ffrdp_$v.h\"|" $t.c > ${t}_$v.c
+        sed "s|#include \"../../ffrdp.c\"|#include \"ffrdp_$v.c\"|; s|#include \"../../ffrdp.h\"|#include \"ffrdp_$v.h\"|" ${BUILD_T}.c > ${BUILD_T}_$v.c
         EXTRA=""; grep -q counter_ack_recv ffrdp_$v.c && EXTRA="$EXTRA -DNEW_COUNTERS"
         grep -q counter_recv_ooo ffrdp_$v.c && EXTRA="$EXTRA -DRECV_OOO"
         grep -q counter_recv_dup ffrdp_$v.c && EXTRA="$EXTRA -DDUP_REPORT"
@@ -141,7 +143,7 @@ for t in $TESTS; do
         fi
         # -lpthread: utils.o carries the address convention and also the module-thread helpers, both of
         # which live in the same file and the latter needs pthread at link time.
-        eval gcc $CFLAGS $ASANFLAGS $EXTRA ${t}_$v.c simnet.o $LL -lpthread -o ${t}_$v
+        eval gcc $CFLAGS $ASANFLAGS $EXTRA ${BUILD_T}_$v.c simnet.o $LL -lpthread -o ${BUILD_T}_$v
     done
 done
 
@@ -172,6 +174,16 @@ for t in $TESTS; do
         echo
         echo "===== t_handshake: 三次握手 + 多连接（两个对端不串台）====="
         echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_handshake_new ;;
+    hs-e2e)
+        # 端到端 + 三次握手（v2 的新路径）。单独一组：上面那 17 个场景是"握手关"的判据，
+        # 不能混进来（否则旧判据就废了 ✓）。这里看的是 work 侧能不能**建连 + 传数据 + 判据 OK** ✓。
+        echo
+        echo "===== hs-e2e: end to end over the handshake (hs:1) ====="
+        for cfg in "0.0 0 4 0 4000 16384" "0.05 0 4 0 4000 16384" "0.0 0 40 0 4000 16384" "0.0 0 4 1 4000 16384 1200 200"; do
+            echo "-- $cfg --"
+            printf "  HEAD " | tee -a "$SIMLOG"; run env E2E_HS=1 $RUN ./e2e_base $cfg
+            printf "  work " | tee -a "$SIMLOG"; run env E2E_HS=1 $RUN ./e2e_new  $cfg
+        done ;;
     e2e)
         echo
         echo "===== e2e: loss burst delay jitter ====="
