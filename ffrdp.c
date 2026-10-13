@@ -265,10 +265,10 @@ typedef struct {
     // reading. Comparing bits_sent (the receiver's count) with bits_recv (the sender's) is the only way
     // to tell a report that was never made from one that was made and never arrived -- neither end can
     // see that on its own.
-    uint32_t counter_mack_bits_sent; // mack bits we put on the wire
-    uint32_t counter_mack_bits_recv; // mack bits the peer sent us
-    uint32_t rtt_min            ; // lowest round trip seen this interval: the path's floor, the number to judge latency by
-    uint32_t inflight_used      ; // frames actually on the wire (recounted every pass): what step29 limits
+    uint32_t counter_mack_bits_tx;// mack bits we put on the wire
+    uint32_t counter_mack_bits_rx;// mack bits the peer sent us
+    uint32_t rtt_min;             // lowest round trip seen this interval: the path's floor, the number to judge latency by
+    uint32_t inflight_used;       // frames actually on the wire (recounted every pass): what step29 limits
 
     uint32_t counter_rto_backoff; // times the rto was multiplied
     uint32_t counter_timeout_evt; // updates in which at least one frame timed out
@@ -477,15 +477,29 @@ static int ffrdp_recv_data_frame(FFRDPCONTEXT *ffrdp, FFRDP_FRAME_NODE *frame)
     fecrdc = frame->data[0];
     if (fecseq / fecrdc != ffrdp->fec_rxseq / fecrdc || ffrdp->fec_rxredundancy != fecrdc) { // group changed or fec_rxredundancy changed
         memcpy(ffrdp->fec_rxbuf, frame->data, frame->size);
-        ffrdp->fec_rxseq = fecseq; ffrdp->fec_rxmask = 1 << (fecseq % fecrdc); ffrdp->fec_rxcnt = 1; ffrdp->fec_rxredundancy = fecrdc;
-        return fecseq % fecrdc != fecrdc - 1 ? 0 : -1;
+        ffrdp->fec_rxseq = fecseq; ffrdp->fec_rxredundancy = fecrdc;
+        if (fecseq % fecrdc == fecrdc - 1) {
+            // ⚠️ 这一帧**就是冗余帧** ⇒ 它不能算成"收到一个数据帧" ✗：此刻组里收到的数据是 0 个 ✓。
+            //    旧写法把它记成 rxcnt = 1 并直接 return -1 ⇒ 组里只剩一个数据帧时（rdc == 2 ✓）
+            //    那一帧永远补不回来 ✗（实测：fec:2 的冗余等于白搭 ✓，由 t_fec 阶段 C 钉住 ✓）。
+            ffrdp->fec_rxmask = 0;
+            ffrdp->fec_rxcnt  = 0;
+        } else {
+            ffrdp->fec_rxmask = 1 << (fecseq % fecrdc);
+            ffrdp->fec_rxcnt  = 1;
+        }
+        // 这里**不再 return**：接着走下面的"冗余帧恢复 / 数据帧累积" ✓（rdc == 2 正是靠这条才恢复 ✓）
     } else ffrdp->fec_rxseq = fecseq; // group not changed
     if (fecseq % fecrdc == fecrdc - 1) { // it's redundance frame
         if (ffrdp->fec_rxcnt == fecrdc - 1) return -1;
         if (ffrdp->fec_rxcnt != fecrdc - 2) { ffrdp->counter_fec_failed++; return -1; }
         type = frame->data[0];
-        psrc = (uint32_t*)ffrdp->fec_rxbuf; pdst = (uint32_t*)frame->data;
-        for (i = 0; i < (frame->size - 2) / sizeof(uint32_t); i++) *pdst++ ^= *psrc++;
+        // rxcnt == 0（只有 rdc == 2 到得了这儿 ✓）：组里一个数据帧都没收到 ⇒ 冗余帧**本身就是**
+        // 那一帧 ✓（异或空集 = 原样 ✓）⇒ 不能再拿它跟自己异或一遍（那是全 0 ✗）。
+        if (ffrdp->fec_rxcnt > 0) {
+            psrc = (uint32_t*)ffrdp->fec_rxbuf; pdst = (uint32_t*)frame->data;
+            for (i = 0; i < (frame->size - 2) / sizeof(uint32_t); i++) *pdst++ ^= *psrc++;
+        }
         frame->data[0] = type;
         ffrdp->counter_fec_ok++;
     } else if (!(ffrdp->fec_rxmask & (1 << (fecseq % fecrdc)))) { // update fec_rxbuf
@@ -684,11 +698,11 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, struct sockaddr_in *
         if (dist <= 24) recv_mack |= 1 << (dist - 1); // dist is obviously > 0
     }
     // how many frames this ack is telling the peer about, counted in bits so that it can be compared
-    // with counter_mack_bits_recv on the other side: the difference between the two is the part of the
+    // with counter_mack_bits_rx on the other side: the difference between the two is the part of the
     // reporting that the path ate. a frame can contribute a bit to several acks in a row, so this is
     // not a frame count -- it answers "is the reporting happening at all", which is the question that
     // counter_ack_mack (acks carrying any bit) is too coarse to answer.
-    for (i = 0; i < 24; i++) if (recv_mack & (1 << i)) ffrdp->counter_mack_bits_sent++;
+    for (i = 0; i < 24; i++) if (recv_mack & (1 << i)) ffrdp->counter_mack_bits_tx++;
     // rmss is a divisor learned from whatever arrived (ffrdp_recv_data_frame rejects the lengths that
     // cannot carry a payload; it starts at FFRDP_MAX_MSS). Never divide by it unconditionally.
     recv_wnd = ffrdp->rmss ? (sizeof(ffrdp->recv_buff) - ffrdp->recv_size) / ffrdp->rmss : 0;
@@ -880,9 +894,9 @@ void ffrdp_update(void *ctxt)
             ffrdp->ack_una = (uint32_t)una;
             if (mack) { // the peer reported frames that arrived after a hole
                 ffrdp->counter_ack_mack++;
-                // counted in bits, to be compared with counter_mack_bits_sent on the other side: a
+                // counted in bits, to be compared with counter_mack_bits_tx on the other side: a
                 // report that never arrived and a report that was never made look identical from here.
-                for (j = 0; j < 24; j++) if (mack & (1 << j)) ffrdp->counter_mack_bits_recv++;
+                for (j = 0; j < 24; j++) if (mack & (1 << j)) ffrdp->counter_mack_bits_rx++;
                 for (i = 23; i >= 0 && !(mack & (1 << i)); i--);
                 for (j = 0; j < i && (mack & (1 << j)); j++);
                 if (j < i) ffrdp->counter_ack_hole++; // a gap below the highest acked frame
@@ -1165,16 +1179,14 @@ void ffrdp_dump(void *ctxt, int clearhistory)
     if (!ctxt) return;
     secs = ((int32_t)get_tick_count() - (int32_t)ffrdp->tick_ffrdp_dump) / 1000;
     secs = secs ? secs : 1;
-    // 版本在 dump 的第一行，一次就看清（参数与实现细节见后面几行）。
-    printf("version               : %s\n", FFRDP_VERSION);
     printf("total_send, total_recv: %.2fMB, %.2fMB\n"    , ffrdp->counter_send_bytes / (1024.0 * 1024), ffrdp->counter_recv_bytes / (1024.0 * 1024));
     // secs 是距上一次 dump 的秒数：刚起来的第一次 dump 可能不足一秒，别拿 0 当除数。
     printf("averg_send, averg_recv: %.2fKB/s, %.2fKB/s\n", ffrdp->counter_send_bytes / (1024.0 * MAX(secs, 1)), ffrdp->counter_recv_bytes / (1024.0 * MAX(secs, 1)));
     printf("rttm: %u, rtts: %u, rttd: %u, rto: %u\n", ffrdp->rttm, ffrdp->rtts, ffrdp->rttd, ffrdp->rto);
     // which binary is this? the compile stamp makes a stale executable impossible to mistake for a fresh
     // one: if this time is older than the build you just ran, you are running something else.
-    printf("build               : probe %d, queue ratio %u, inflight default %u, compiled %s %s\n",
-           FFRDP_PROBE_ENABLE, (uint32_t)FFRDP_PROBE_QUEUE_RATIO, (uint32_t)FFRDP_INFLIGHT_MAX, __DATE__, __TIME__);
+    printf("version & build     : %s probe %d, queue ratio %u, inflight default %u, compiled %s %s\n",
+           FFRDP_VERSION, FFRDP_PROBE_ENABLE, (uint32_t)FFRDP_PROBE_QUEUE_RATIO, (uint32_t)FFRDP_INFLIGHT_MAX, __DATE__, __TIME__);
     // rttm is the LATEST sample (its name is misleading); rtt_min is the lowest of this interval, rtts the
     // smoothed typical latency, rttd the jitter. rto is a timer, not a delay: never read it as latency.
     printf("rtt_min, rtts, rttd : %u, %u, %u (min / typical / jitter, ms)\n",
@@ -1283,8 +1295,8 @@ void ffrdp_dump(void *ctxt, int clearhistory)
         else     { printf("counter_ooo_64reach : n/a\n");
                    printf("counter_ooo_128reach: n/a\n"); }
     }
-    printf("counter_mack_bits_sent: %u\n" , ffrdp->counter_mack_bits_sent);
-    printf("counter_mack_bits_recv: %u\n" , ffrdp->counter_mack_bits_recv);
+    printf("counter_mack_bits_tx: %u\n"  , ffrdp->counter_mack_bits_tx);
+    printf("counter_mack_bits_rx: %u\n"  , ffrdp->counter_mack_bits_rx);
     printf("counter_rto_backoff : %u\n"  , ffrdp->counter_rto_backoff );
     printf("counter_timeout_evt : %u\n"  , ffrdp->counter_timeout_evt );
     printf("counter_ack_una_dup : %u\n"  , ffrdp->counter_ack_una_dup );
