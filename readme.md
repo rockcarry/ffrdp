@@ -146,6 +146,25 @@ fd/线程零泄漏 ✓、无期限时 `exit` 及时返回 ✓）、定时器（�
 回调内重设 / 跨线程催发 / `RECV` 与 `TIMER` 不交错 / 回调不嵌套）✓。
 设计取舍与实测数字见 [`docs/notes.md`](docs/notes.md) 第 13 节。
 
+### 真机 A/B 对测（`test.sh`）
+
+把一轮真机对照压成一条命令 ✓：**上传二进制 → 远端起服务端 → 本地起客户端 → 取回日志 → 出摘要** ✓。
+
+```bash
+./test.sh <本地二进制> <user@host> [密码] [时长秒]
+export SESSION=z5-run1        # 一批扫描共用一个标识，便于成组比较（等价于 STAMP）
+./test.sh dist/test_ffrdp_w5a4 chenk@192.168.0.213 abc 120
+column -s, -t logs/summary.csv | tail -10     # 摘要表
+```
+
+- 没装 `sshpass` 时它会开一条 **SSH 复用连接** ⇒ 整轮只输一次密码 ✓（`KEEP_MUX=1` 可连跑多轮只输一次 ✓）；
+- **两侧不同版本**做交叉对照：`REMOTE_BIN=<对端二进制> ./test.sh <本端二进制> <user@host> …` ✓
+  （本地仍用第 1 个参数，远端用 `REMOTE_BIN` ✓ —— 用来分辨"某个方向被掐"是本地发送还是对端确认的问题 ✓）；
+- 其它开关：`DUR` / `PORT` / `LOGDIR` ✓、`CPUWATCH=1`（采样客户端 CPU ✓）、`CLEAN=1`（跑完清远端 ✓）、`DRY=1`（只打印计划、不碰网络 ✓）；
+- 每轮结果追加进 **`$LOGDIR/summary.csv`** ✓（`stamp,tag,role,resend_pct,waste_pct,rtts_ms,send_recv_MBps` ✓）⇒ 扫完一串二进制直接看表 ✓；
+- 读判据请对着协议文档：`rttm/rtts`、`counter_resend_ratio`、`confirmed rate`，以及 **`lap period avgmax` 的最大值**（唤醒是否正常 ✓）
+  —— 见 [`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) §3.2.4 ✓。
+
 ---
 
 ## 五、目录结构
@@ -159,6 +178,7 @@ fd/线程零泄漏 ✓、无期限时 `exit` 及时返回 ✓）、定时器（�
 ├── socket.c / socket.h     socket 薄封装（初始化、选项、超时、非阻塞）
 ├── utils.c / utils.h       时间戳、线程 setname/getname、模块线程状态机
 ├── test.c                  测试程序（服务端/客户端共用一个参数化的对等端循环 + 每 10 秒 dump）
+├── test.sh                 **真机 A/B 对测脚本**（上传 → 远端服务端 → 本地客户端 → 收日志 → 出摘要；用法见 §四）
 ├── build.sh                构建脚本（静态库 + 测试程序 + pkg-config）
 ├── readme.md               本文件：概述、版本、编译、测试、目录
 ├── LICENSE
