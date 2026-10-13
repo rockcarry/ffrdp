@@ -657,7 +657,14 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
     // 传输层：socket、bind、非阻塞、缓冲区大小、收包线程、定时，全在 lowlevel 里。协议只认
     // send / timer / 回调。服务端把 addr 交给它（bind:<addr>）；客户端交 "none"（不绑定，由内核在
     // 第一次发包时择源端口，与旧版一致），再按同一套约定解析对端。
-    pthread_mutex_init(&ffrdp->lock, NULL);
+    // 递归锁：事件回调是在**持锁**状态下被调用的 ✓，而 v2 的回调契约允许应用在回调里
+    // 立刻 ffrdp_recv 把数据取走（FFRDP_CONSUMED ✓）。普通互斥量会让那一次调用自锁死 ✗。
+    {   pthread_mutexattr_t mattr;
+        pthread_mutexattr_init(&mattr);
+        pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&ffrdp->lock, &mattr);
+        pthread_mutexattr_destroy(&mattr);
+    }
     pthread_cond_init (&ffrdp->cond, NULL);
     {
         char llparams[128], peer[128];
@@ -744,23 +751,24 @@ int ffrdp_send(void *ctxt, int conn, char *buf, int len, int timeout_ms)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     uint32_t      t0;
-    int           rc = -1;
-    if (!ffrdp || !buf || len <= 0) return -1;
+    int           rc = FFRDP_EAGAIN;   // 默认：暂时收不下（队列满/在途满）⇒ 稍后重试
+    if (!ffrdp || !buf || len <= 0) return FFRDP_EINVAL;
+    if (conn < 0 || conn >= ffrdp->nconn || !ffrdp->table[conn]) return FFRDP_CONN_INVALID;
     pthread_mutex_lock(&ffrdp->lock);
     // 受理判据与旧版逐字相同：帧数上限（在途 + 这一条要占的帧）算在这里，不在出队时算。区别只在
     // "这个在途帧数从哪来"：协议跑在工作线程里，应用不再读协议自己的 wait_snd，而读它发布的镜像
     // （pub_wait_snd，每个回调结束时刷新）—— 值与时序都和旧版一致，但不再越过线程边界。
     // 三条拒绝路径都跳到同一个出口：计数与解锁只有一处，rc 已经预置成 -1。对端还没连上也在这里
     // 被拒绝（与以前一样）。
-    if (ffrdp->closing) goto out;
-    if ((ffrdp->conn.flags & FLAG_SERVER) && (ffrdp->conn.flags & FLAG_CONNECTED) == 0) goto out;
+    if (ffrdp->closing) { rc = FFRDP_CLOSED; goto out; }                                  // 正在关：当作已断
+    if ((ffrdp->conn.flags & FLAG_SERVER) && (ffrdp->conn.flags & FLAG_CONNECTED) == 0) { rc = FFRDP_CLOSED; goto out; } // 对端还没连上
     // 帧数上限只在这里判一次：用的是协议发布的镜像 pub_wait_snd（"已成帧、未确认"的帧数），它不含还
     // 排在下面这个队列里、尚未成帧的消息 —— 所以这是个近似判据，队列本身的容量（FFRDP_APP_TX_SIZE）
     // 是它的兜底。drain 那边不再重复判一次（见 ffrdp_drain_tx）。
     if ((len + ffrdp->conn.smss - 1) / ffrdp->conn.smss + ffrdp->conn.pub_wait_snd > FFRDP_MAX_WAITSND) goto out;
     // 比队列还大的消息永远不可能被接纳（下面的字节判据会一直不成立）⇒ 直接拒，绝不在 cond 上空等：
     // 这一行是"FFRDP_APP_TX_SIZE 可以随意配小"的前提（配小后能发的单条消息上限就是它减 4）。
-    if ((uint32_t)len + 4 > FFRDP_APP_TX_SIZE) goto out;
+    if ((uint32_t)len + 4 > FFRDP_APP_TX_SIZE) { rc = FFRDP_EINVAL; goto out; }             // 永远收不下 ⇒ 不是"重试就好"
     t0 = get_timestamp32_ms();
     for (;;) {
         if ((uint32_t)len + 4 + ffrdp->conn.app_tx_size <= FFRDP_APP_TX_SIZE) {
@@ -788,7 +796,9 @@ int ffrdp_send(void *ctxt, int conn, char *buf, int len, int timeout_ms)
         }
     }
 out:
-    if (rc < 0) ffrdp->conn.counter_send_failed++;
+    // 计数口径与旧版一致：只要这条消息没被接受就记一次（现在 rc 有 0 / -1 / -2 三种，
+    // 旧版只有 -1 ⇒ 条件从 rc < 0 改成 rc <= 0 才能保持 fail 这个数不变 ✓）。
+    if (rc <= 0) ffrdp->conn.counter_send_failed++;
     // 刚排进去的东西不该等下一个期限：叫醒工作线程立刻跑一轮（这是 timer 的第二种用法）。
     if (rc > 0 && ffrdp->lowlevel) ffrdp->lowlevel->timer(ffrdp->lowlevel, get_timestamp32_ms());
     pthread_mutex_unlock(&ffrdp->lock);
@@ -863,8 +873,9 @@ int ffrdp_recv(void *ctxt, int conn, char *buf, int len, int timeout_ms)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     uint32_t      t0;
-    int           ret = 0;
-    if (!ffrdp || !buf || len <= 0) return -1;
+    int           ret = FFRDP_EAGAIN;
+    if (!ffrdp || !buf || len <= 0) return FFRDP_EINVAL;
+    if (conn < 0 || conn >= ffrdp->nconn || !ffrdp->table[conn]) return FFRDP_CONN_INVALID;
     pthread_mutex_lock(&ffrdp->lock);
     t0 = get_timestamp32_ms();
     for (;;) {
@@ -874,13 +885,13 @@ int ffrdp_recv(void *ctxt, int conn, char *buf, int len, int timeout_ms)
             ffrdp->conn.recv_size-= ret; ffrdp->conn.counter_recv_bytes += ret;
             break;
         }
-        if (timeout_ms == 0 || ffrdp->closing) { ret = 0; break; }
-        if (ffrdp_isdead_locked(ffrdp)) { ret = 0; break; }
-        if (timeout_ms > 0 && (int32_t)(get_timestamp32_ms() - t0) >= timeout_ms) { ret = 0; break; }
+        if (timeout_ms == 0 || ffrdp->closing) { ret = FFRDP_EAGAIN; break; }   // 只是没有数据（还没断）
+        if (ffrdp_isdead_locked(ffrdp)) { ret = FFRDP_CLOSED; break; }          // 对端已断：只有这一条是 0 ✓
+        if (timeout_ms > 0 && (int32_t)(get_timestamp32_ms() - t0) >= timeout_ms) { ret = FFRDP_EAGAIN; break; }
         // 睡在 cond 上等协议送数据来 —— 这一步之后，"等"是真正免费的：不再需要应用去驱动协议。
         {   struct timespec ts;
             int wait_ms = timeout_ms > 0 ? timeout_ms - (int32_t)(get_timestamp32_ms() - t0) : FFRDP_COND_WAIT_MS;
-            if (wait_ms <= 0) { ret = 0; break; }
+            if (wait_ms <= 0) { ret = FFRDP_EAGAIN; break; }
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_sec  += wait_ms / 1000;
             ts.tv_nsec += (long)(wait_ms % 1000) * 1000000L;
@@ -1608,6 +1619,22 @@ static FFRDPCONN *ffrdp_conn_by_addr(FFRDPCONTEXT *ffrdp, uint64_t addr)
     return NULL;
 }
 
+// 把一个事件送给应用（v2）。调用点都在协议线程上、并且**持着锁**（锁是递归的 ✓，见 init）。
+// app_cb 为 NULL 时什么也不做 ✓ —— 旧用法（只 ffrdp_recv 轮询）不受影响，输出也不变 ✓。
+// 触发点分几步落地：ACCEPT/RECVDATA 要多连接与连接表（下一步）、CONNECT/DISCONN 要握手与判死
+// （v2 的 handshake/idle 超时）、ENCRYPT/DECRYPT 要加密路径（本仓库没带 AES 实现）。
+static long ffrdp_emit(FFRDPCONTEXT *ffrdp, int type, int conn, uint64_t addr, void *buf, int len)
+{
+    FFRDP_EVENT ev;
+    if (!ffrdp || !ffrdp->app_cb) return FFRDP_NOT_CONSUMED;
+    ev.type = type;
+    ev.conn = conn;
+    ev.addr = addr;
+    ev.buf  = buf;
+    ev.len  = len;
+    return ffrdp->app_cb(ffrdp->app_cbctx, &ev);
+}
+
 static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)cbctx;
@@ -1678,6 +1705,8 @@ void ffrdp_flush(void *ctxt, int conn)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ffrdp) return;
+    // conn < 0 = 对全部连接生效 ✓（现在只有 0 号，逐个都刷一遍 ✓）。
+    if (conn >= ffrdp->nconn || (conn >= 0 && !ffrdp->table[conn])) return;
     pthread_mutex_lock(&ffrdp->lock);
     ffrdp->conn.flags |= FLAG_FLUSH;
     // 工作线程可能正睡在"下一个期限"上：把它叫醒，这一帧才不用等到那时候。
@@ -1859,6 +1888,9 @@ void ffrdp_dump(void *ctxt, int conn, int clearhistory)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ffrdp) return;
+    // conn >= 0：该连接的详细状态（目前只有 0 号）；conn < 0：总状态（连接数 + 每连接摘要 ——
+    // 等连接表真的多于一条时补全 ✓，现在与"只印 0 号"等价 ✓）。
+    if (conn >= ffrdp->nconn || (conn >= 0 && !ffrdp->table[conn])) return;
     // 要打印的全是协议状态，而协议现在跑在工作线程里：拿住同一把锁再读，打印出来的一整套数不会是被
     // 拆散的一半（这正是旧版单线程下不用操心、换线程后必须补上的一件小事）。
     pthread_mutex_lock(&ffrdp->lock);
