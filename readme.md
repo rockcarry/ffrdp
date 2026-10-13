@@ -31,7 +31,7 @@ v1.2.0 起传输层独立成文件（`lowlevel-udp.c` 约 380 行，另加 `sock
 |---|---|---|---|
 | **v1.0.0** | `v1.0.x` | 4 字节帧头；ACK 8 字节 | 基础 ARQ（选择重传/快重传/UNA+MACK/rwnd）+ FEC |
 | **v1.1.0** | `v1.1.x` | **未变** ✓ | 协议**逻辑**优化：ACK 回传白费计数（唯一新增的可选字节）、对端证据驱动的 RTO 下限、快重传等待纪律、在途量闸门 + 延迟探测 |
-| **v1.2.0**（当前）| `v1.2.x` | **未变** ✓ | **传输层重构**（`lowlevel` 接口 + 工作线程驱动）与随后的协议修正（唤醒判据、当圈回 ack、窗口定标）；参数与规范见 [`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) §3.1 |
+| **v1.2.0**（当前）| `v1.2.x` | **未变** ✓ | **传输层重构**（`lowlevel` 接口 + 工作线程驱动）与随后的协议修正（唤醒判据、当圈回 ack、窗口定标）；参数与规范见 [`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) §3.1 |
 
 **怎么认版本** ✓：看 dump 里的 `build : … compiled <日期>` 行，再对上编译时的 commit ✓。
 （`version : v1.2.0` 这一行是**当前工作树**才有的 —— `ffrdp.h` 的 `FFRDP_VERSION` ✓；
@@ -41,7 +41,7 @@ v1.2.0 起传输层独立成文件（`lowlevel-udp.c` 约 380 行，另加 `sock
 唯一变化是 ACK 帧尾部多了一个**可选**字节（`dups`，仅在"有内容可报"时发送）。**v1.2.0 同样未改动帧格式与 ACK 语义** ✓，但 **`ffrdp.h` 的 API 有三处签名变化** ✗（见 §3.1.6 ✓）：`ffrdp_init()` 改收地址字符串、`send` / `recv` 各多一个 `timeout_ms`、`ffrdp_update()` 删除。
 
 ⇒ 新老两端可以互相对接（双向兼容，推理与代码证据见
-[`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) §2.1 与 §3.1）。
+[`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) §2.1 与 §3.1）。
 
 ---
 
@@ -163,7 +163,7 @@ column -s, -t logs/summary.csv | tail -10     # 摘要表
 - 其它开关：`DUR` / `PORT` / `LOGDIR` ✓、`CPUWATCH=1`（采样客户端 CPU ✓）、`CLEAN=1`（跑完清远端 ✓）、`DRY=1`（只打印计划、不碰网络 ✓）；
 - 每轮结果追加进 **`$LOGDIR/summary.csv`** ✓（`stamp,tag,role,resend_pct,waste_pct,rtts_ms,send_recv_MBps` ✓）⇒ 扫完一串二进制直接看表 ✓；
 - 读判据请对着协议文档：`rttm/rtts`、`counter_resend_ratio`、`confirmed rate`，以及 **`lap period avgmax` 的最大值**（唤醒是否正常 ✓）
-  —— 见 [`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) §3.2.4 ✓。
+  —— 见 [`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) §3.2.4 ✓。
 
 ---
 
@@ -183,7 +183,7 @@ column -s, -t logs/summary.csv | tail -10     # 摘要表
 ├── readme.md               本文件：概述、版本、编译、测试、目录
 ├── LICENSE
 ├── docs/
-│   ├── ffrdp-protocol.md   协议说明：v1.0.0 / v1.1.0 / v1.2.0 三部分（帧格式、参数、改动与依据）
+│   ├── ffrdp-v1.md   协议说明：v1.0.0 / v1.1.0 / v1.2.0 三部分（帧格式、参数、改动与依据）
 │   ├── sim-test.md         差分仿真工具（tools/sim）使用说明
 │   └── notes.md            开发与调试记录（按时间顺序，含每次上机的原始 log）
 └── tools/                  辅助工具（不逐个列 ✓：差分仿真 `tools/sim/`、敌意输入、在途上限扫描、lowlevel 契约测试、日志提取 —— 以目录实际内容为准 ✓）
@@ -196,7 +196,7 @@ column -s, -t logs/summary.csv | tail -10     # 摘要表
 
 ⚠️ **下面是 v1.2.0 的签名** ✓；相对 v1.0.0 / v1.1.0 **有三处变化** ✗（`ffrdp_init` 改收地址字符串、
 `send` / `recv` 多一个 `timeout_ms`、`ffrdp_update` 删除）⇒ 细节与理由见
-[`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) §3.1.6 ✓。
+[`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) §3.1.6 ✓。
 
 ```c
 void* ffrdp_init  (char *addr, char *txkey, char *rxkey, int server, int smss, int sfec);   // addr = "ip:port" / "ip"（端口默认 8000）
@@ -220,7 +220,7 @@ void  ffrdp_dump  (void *ctxt, int clearhistory);     // 打印诊断
 
 | 想了解 | 看这里 |
 |---|---|
-| 帧格式、mack、FEC、RTO 计算、通信流程 | [`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) 第一部分（v1.0.0）|
+| 帧格式、mack、FEC、RTO 计算、通信流程 | [`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) 第一部分（v1.0.0）|
 | 每个改动的动机、被否掉的路线、当时的上机原始 log | [`docs/notes.md`](docs/notes.md) |
 | 没有真机时怎么验证"没有回归" | [`docs/sim-test.md`](docs/sim-test.md) |
 | v2.0.0 的接口（params / 句柄 / 事件 / 加密回调 / 握手）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |

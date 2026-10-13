@@ -4,7 +4,7 @@
 `simll.c`（**假 lowlevel** ✓）、`simdefs.h`（两侧共享声明），以及九个测试 `e2e.c` / `t_rto.c` / `t_ack.c` / `t_fuzz.c` / `t_peer.c` / `t_handshake.c` / `t_crypto.c` / `t_recvdata.c` / `t_keepalive.c` ✓。
 本文是它的使用说明。所有命令都在**仓库根目录**执行。
 
-相关文档：[`../readme.md`](../readme.md)（概述/编译）、[`ffrdp-protocol.md`](ffrdp-protocol.md)（协议与优化）、
+相关文档：[`../readme.md`](../readme.md)（概述/编译）、[`ffrdp-v1.md`](ffrdp-v1.md)（协议与优化）、
 [`notes.md`](notes.md)（调试记录）。
 
 ## 它解决什么问题
@@ -298,7 +298,7 @@ c1 recv=  1.88MB resend= 3.44% maxrto=0 leaked=0
    - **乱序相关**（本仿真没有乱序模型 ⇒ 快重传纪律只能在真机验证 ✓）；
    - **收窄在途量**（仿真的 ACK 粒度比真机粗 ⇒ 小窗口在仿真里会直接断流 ✗ ⇒ 只能看真机 ✓）。
 4. **判据的顺序**：仿真判"**没有回归**" ⇒ 真机判"**确实有收益**" ✓ ——
-   两者缺一不可，任何一步不过就不要上机 ✗（`ffrdp-protocol.md` §2.3.4 里的 step27 就是仿真不过而放弃的例子 ✓）。
+   两者缺一不可，任何一步不过就不要上机 ✗（`ffrdp-v1.md` §2.3.4 里的 step27 就是仿真不过而放弃的例子 ✓）。
 
 ## 局限（诚实列出）
 

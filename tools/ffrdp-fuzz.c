@@ -7,7 +7,7 @@
 // It deliberately does NOT link the library. It must not: it is emulating the far side of the port, and
 // half of what it sends is not a frame any implementation would ever produce. The frame layout it knows
 // (a type byte in byte 0, a 24 bit sequence in bytes 1..3, an ack's una/mask/window in bytes 0..7) is
-// taken from docs/ffrdp-protocol.md, and the fragments mirror those of tools/sim/t_fuzz.c -- that one
+// taken from docs/ffrdp-v1.md, and the fragments mirror those of tools/sim/t_fuzz.c -- that one
 // feeds the same shapes to the parser in memory, this one puts them on a wire.
 //
 // Two ways to watch a server:
@@ -38,7 +38,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 
-// the frame types this tool pretends to know (docs/ffrdp-protocol.md 1.6): 0 full, 1 short, 2..32 fec,
+// the frame types this tool pretends to know (docs/ffrdp-v1.md 1.6): 0 full, 1 short, 2..32 fec,
 // 33 ack, 34 query.
 #define T_FULL   0
 #define T_SHORT  1

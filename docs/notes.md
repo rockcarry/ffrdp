@@ -3,7 +3,7 @@
 本文档记录 ffrdp 传输层的调试过程、已确认的结论、以及实验档案，避免重复踩坑。
 每一条结论要么有仿真数据、要么有真机 log 支撑，来源都注明。
 
-> **文档分工**（2026-10 起）：协议规格与优化依据在 [`ffrdp-protocol.md`](ffrdp-protocol.md)；
+> **文档分工**（2026-10 起）：协议规格与优化依据在 [`ffrdp-v1.md`](ffrdp-v1.md)（v1 三代）与 [`ffrdp-v2.md`](ffrdp-v2.md)（v2 接口）；
 > 仿真工具用法在 [`sim-test.md`](sim-test.md)；概述/编译/测试在 [`../readme.md`](../readme.md)。
 > **本文是"过程记录"**：动机、试错、被否路线、每次上机的原始 log —— 有新的调试或工作记录就往这里加。
 
@@ -733,7 +733,7 @@ iperf3 单流 TCP      2.78~3.27 Mbit/s (355~418KB/s) ← 和我们同档, 这�
 
 ### 5.18 step30：`queue test` 门槛 4× → 3×（**已实现 + 真机成功 ✓✓**）
 
-**动机**（当时记在待办里的"4× 门槛偏松"；现已并入 `ffrdp-protocol.md` §2.3.3.5）：
+**动机**（当时记在待办里的"4× 门槛偏松"；现已并入 `ffrdp-v1.md` §2.3.3.5）：
 step29 收敛后 `rtts` 只剩 12~19ms，而 `rtt_min` 是 4ms
 ⇒ 比值 **3~4.75×** ✗ —— 也就是说 **4× 门槛让探测在"队列还没拆完"时就停工了** ✗。
 
@@ -779,7 +779,7 @@ step29 收敛后 `rtts` 只剩 12~19ms，而 `rtt_min` 是 4ms
 
 ### 5.19 step31：长尾收敛 —— **否掉"按环境填值"** ✗，改成通用做法 ✓
 
-**动机**（当时记在待办里的"长尾收敛"；现已并入 `ffrdp-protocol.md` §2.3.3.5）：
+**动机**（当时记在待办里的"长尾收敛"；现已并入 `ffrdp-v1.md` §2.3.3.5）：
 每次会话都要重走 64 → 32 → 16 → 8，代价是
 **头 ~20 秒在途量偏大** ✗ —— 60 秒的测试里是全程三分之一，短片传输里更是全部收益所在 ✓。
 
@@ -988,7 +988,7 @@ tail ok 稳定为 1（不再抖动）✓
 
 **下一步**：真机抓一轮 log ⇒ 看客户端的 `counter_ooo_d25_64` / `counter_ooo_64reach`
 以及两端的 `mack_bits_sent` / `recv` ✓ ⇒ 再决定做不做那个"64 位尾巴"
-（设计与要改的四处边界见 [`ffrdp-protocol.md`](ffrdp-protocol.md) §2.3.7 ✓）。
+（设计与要改的四处边界见 [`ffrdp-v1.md`](ffrdp-v1.md) §2.3.7 ✓）。
 
 ### 5.21 "Ctrl+C / kill 都杀不掉"的现场：根因是 `select` + `scanf`（2026-10-10）—— 决定：不特殊处理 Ctrl+C
 
@@ -1186,7 +1186,7 @@ REF=/path/to/ffrdp.c TESTS=e2e bash tools/sim/run.sh
 
 | 优先级 | 事项 | 说明 |
 |---|---|---|
-| — | ~~乱序掩码宽度（`ACK2`）~~ | **暂不做** ✗：两次真机会话验证（见 5.22）——需求侧成立（53% 的乱序超出 24 位 ✓）但**收益侧两次都不成立**（浪费全是 `rto` 型、`fast` 占比 0%；第二次会话乱序为 0）⇒ 掩码不是瓶颈 ✓。诊断（四档 / mack 位数）与工具（`tools/keylog.sh`）保留 ✓；将来若同时出现"`fast` 有明显占比 + 非零乱序"再回来做（设计见 `ffrdp-protocol.md` §2.3.7）|
+| — | ~~乱序掩码宽度（`ACK2`）~~ | **暂不做** ✗：两次真机会话验证（见 5.22）——需求侧成立（53% 的乱序超出 24 位 ✓）但**收益侧两次都不成立**（浪费全是 `rto` 型、`fast` 占比 0%；第二次会话乱序为 0）⇒ 掩码不是瓶颈 ✓。诊断（四档 / mack 位数）与工具（`tools/keylog.sh`）保留 ✓；将来若同时出现"`fast` 有明显占比 + 非零乱序"再回来做（设计见 `ffrdp-v1.md` §2.3.7）|
 | — | ~~pacing~~ | **已正式搁置**（见 5.3）：简单控制律全部试完，均无法满足"无负优化"。若要重启，作为独立系列，不与其它改动混做 |
 | ~~1（最高）~~ | ~~step25：对端重复上报驱动的持久 RTO 下限~~ | **已完成** ✓（v6 真机：下限双向跟随 + Apical 上 RTO 重传归零，见 5.14）；其后 step26 快重传纪律 ✓、step29 在途闸门 + 探测 ✓ 均落地 |
 | — | ~~窗口控制（step22~24）~~ | **已搁置**：定位实验证明"它治的不是这个病"（见 5.8）——窗口只改变暴露量，消除不了浪费 ✗ |
@@ -1266,7 +1266,7 @@ REF=/path/to/ffrdp.c TESTS=e2e bash tools/sim/run.sh
   需要某个实验的源码时，用相应标签即可（`tools/steps/` 已不再保留 ✓）；
 - **两端同步**：远端是 Gerrit 上的 `master`，另一台机器 `git pull` 即可 ✓（不再走"复制 patch"✓）；
   自检看 dump 第一行 `build :`（含 `probe` / `queue ratio`）以及 `ffrdp.c` 的 md5，比记提交号可靠 ✓；
-- **文档布局**（2026-10 整理）：`readme.md`（概述/编译/测试/目录）、`docs/ffrdp-protocol.md`（协议与优化）、
+- **文档布局**（2026-10 整理）：`readme.md`（概述/编译/测试/目录）、`docs/ffrdp-v1.md`（协议与优化）、
   `docs/notes.md`（本文）、`docs/sim-test.md`（仿真用法）✓；
 - 上机测任何一步前，**先确认工作区是干净的**（曾经被 `git checkout` 清掉未提交的改动）。
 
@@ -1285,12 +1285,12 @@ REF=/path/to/ffrdp.c TESTS=e2e bash tools/sim/run.sh
 帧长度计算、FEC 异或与 `fec_seq` 处理、ACK 前 8 字节的构造、`ffrdp.h` 的 8 个 API ——
 在 `55ead4a` 与当前 `ffrdp.c` 之间**逐字相同** ✓；差异只在参数常量与新增逻辑 ✓。
 ⇒ 两版可以互相对接：老对端不发的第 9 字节读到 0，新对端多发的那一字节老对端不校验（忽略）✓
-（完整推理见 `ffrdp-protocol.md` §2.1）。规格已按此分成两版写进该文档（第一部分 v1.0.0、第二部分 v1.1.0）。
+（完整推理见 `ffrdp-v1.md` §2.1）。规格已按此分成两版写进该文档（第一部分 v1.0.0、第二部分 v1.1.0）。
 
 ### 10.2 文档整理（本次）
 
 - `readme.txt` → `readme.md`：改成面向"第一次接触"的概述（协议特点 / 编译 / `test_ffrdp` 用法 / 目录结构）✓；
-- `OPTIMIZATION.md` → `docs/ffrdp-protocol.md`：前面补上 v1.0.0 的帧格式与基本协议，
+- `OPTIMIZATION.md` → `docs/ffrdp-v1.md`：前面补上 v1.0.0 的帧格式与基本协议，
   原来的优化内容成为"第二部分 v1.1.0"（依据 / 证据 / 被否路线）✓；
 - `NOTES.md` → `docs/notes.md`（本文）✓；
 - `tools/sim/README.md` → `docs/sim-test.md` ✓；
@@ -1299,7 +1299,7 @@ REF=/path/to/ffrdp.c TESTS=e2e bash tools/sim/run.sh
 
 ### 10.3 待办（小项）
 
-- **下一轮上机**：24 位乱序掩码 → `ACK2`（64 位），或 pacing（见 `ffrdp-protocol.md` §2.3.7）✓。
+- **下一轮上机**：24 位乱序掩码 → `ACK2`（64 位），或 pacing（见 `ffrdp-v1.md` §2.3.7）✓。
 
 > 原先记在下面这一条的小项**已完成，按规则从待办里删掉** ✓：`test.c` 启动横幅的版本号
 > 与用法行的二进制名 —— 现已改为 `v1.1.0`（常量 `TEST_VERSION`）与按 `argv[0]` 打印的程序名
@@ -2449,7 +2449,7 @@ readme 的对外 API 列表里那条 `ffrdp_update()` 其实是 C2 就删掉的�
 - **静态**：容量是编译期常量 `FFRDP_APP_TX_SIZE`，数组内联在结构体里（和 `recv_buff` 一样）⇒ 没有 `calloc`、
   没有"分配失败 ⇒ goto failed"这条路、没有两处 `free`、也没有 `app_tx_cap` 那个字段。
 
-代价（写进 `ffrdp-protocol.md` §2.4.3）：容量不再随 `smss` 缩，smss 小时会多占；且运行期不可配。
+代价（写进 `ffrdp-v1.md` §2.4.3）：容量不再随 `smss` 缩，smss 小时会多占；且运行期不可配。
 
 判据：四个单元零告警；套件 250/0；回环 2×（每方向约 800 次回绕）两端 `verify: OK`；另外**专门做了一次
 强制回绕**——`/tmp` 里另建一份把容量配成 4 条消息（5984 B）、并把发送改成阻塞（免得"应用被拒"干扰），
@@ -2504,7 +2504,7 @@ readme 的对外 API 列表里那条 `ffrdp_update()` 其实是 C2 就删掉的�
 判据：`-O2 -Wall -Werror` 与 `-O2 -Wall -Wextra -Werror` 都零告警；把改前的 `test.c` 放回去，同一命令 rc=1
 （对照成立）。
 
-### 23.7 文档：`ffrdp-protocol.md` 新增第三部分
+### 23.7 文档：`ffrdp-v1.md` 新增第三部分
 
 第一/二部分是 v1.0.0 / v1.1.0 的**版本快照**，保持原样；当前版本的可配参数与内存占用集中写在新增的
 第二部分 §2.4 里：§2.4.1 派生链（一个旋钮 `FFRDP_LOWLEVEL_FRAME_MAX` 决定 `recv_buff`、`app_tx` 默认值与
@@ -2990,7 +2990,7 @@ if (!(p->flags & FLAG_TIMEOUT_RESEND)) {
 （每端省 310 KiB ✓，吞吐不受影响 ✓）。而**真取舍**只有三处 ✓：`FFRDP_LOWLEVEL_FRAME_MAX`（派生 `recv_buff` ✓）、
 `FFRDP_RECVBUF_SIZE`（它决定我们广告的 `rwnd` ✓，要和对端成对考虑 ✓）、以及 `WAITSND` / `MAX_CWND_SIZE` 决定的
 **在途量** ✓ —— 在途字节 = 带宽 × RTT 是物理需求 ✓，压它就是压吞吐 ✓。
-⇒ 这四条已写进 `docs/ffrdp-protocol.md` §2.4.3 / §2.4.5 / **§2.4.6（哪些是真取舍）** / §2.5 ✓。
+⇒ 这四条已写进 `docs/ffrdp-v1.md` §2.4.3 / §2.4.5 / **§2.4.6（哪些是真取舍）** / §2.5 ✓。
 
 ### 26.14 review 结论与遗留 ✔
 
@@ -3002,4 +3002,4 @@ if (!(p->flags & FLAG_TIMEOUT_RESEND)) {
 - `p->ticket` 那一行**不能单独删** ✗：它是 `timeout diag` 三项计数与 `rtt_tail` 采样条件的依据 ✓
   （要删就得整组删 ⇒ 会失去"伪超时属于哪一种"这个判据 ✓）；注释已改成"不是临时调试，保留" ✓；
 - 遗留 nits ✓：`counter_swnd0` / `counter_capblock` 落在 dump 的重置区间之外（语义上应与其它区间计数一致 ✓）；
-  `docs/ffrdp-protocol.md` 的 41 行 LF-only 是**改动前就有**的 ✗（HEAD 里 743/784 CRLF ✓），未动 ✓。
+  `docs/ffrdp-v1.md` 的 41 行 LF-only 是**改动前就有**的 ✗（HEAD 里 743/784 CRLF ✓），未动 ✓。
