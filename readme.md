@@ -159,6 +159,17 @@ column -s, -t logs/summary.csv | tail -10     # 摘要表
 
 - 没装 `sshpass` 时它会开一条 **SSH 复用连接** ⇒ 整轮只输一次密码 ✓（`KEEP_MUX=1` 可连跑多轮只输一次 ✓）；
 - **两侧不同版本**做交叉对照：`REMOTE_BIN=<对端二进制> ./test.sh <本端二进制> <user@host> …` ✓
+
+**一条命令跑完全部判据**（改协议后先跑它 ✓，尤其适合性能优化那种改动 ✓）：
+
+```bash
+bash tools/check.sh              # 编译 + 仿真(12 测试/3 场景组) + ASAN + 本机两进程四条路径 + v1 互通
+QUICK=1 bash tools/check.sh      # 跳过 ASAN 与 e2e（约 1 分钟）✓
+```
+- 六步：真机口径 `build.sh` ✓、仿真默认模型（HEAD 与工作区逐条对照 ✓）、仿真 **ASAN** ✓、
+  本机两进程（默认 / `FFRDP_HS=0` 老路径 / `FFRDP_IDLE=1 FFRDP_CLOSE=1` 空闲+挥手 / 多客户端 ✓）、
+  **v1 互通**（`hs:0` 两个方向必须通、默认 `hs:1` 必须不通 ✓）；
+- 全绿 exit 0，任何一项红 exit 1 ⇒ 可直接挂 `pre-push` 或流水线 ✓；日志在 `logs/check-<时间戳>/` ✓。
   （本地仍用第 1 个参数，远端用 `REMOTE_BIN` ✓ —— 用来分辨"某个方向被掐"是本地发送还是对端确认的问题 ✓）；
 - 其它开关：`DUR` / `PORT` / `LOGDIR` ✓、`CPUWATCH=1`（采样客户端 CPU ✓）、`CLEAN=1`（跑完清远端 ✓）、`DRY=1`（只打印计划、不碰网络 ✓）；
 - 每轮结果追加进 **`$LOGDIR/summary.csv`** ✓（`stamp,tag,role,resend_pct,waste_pct,rtts_ms,send_recv_MBps` ✓）⇒ 扫完一串二进制直接看表 ✓；

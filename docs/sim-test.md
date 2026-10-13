@@ -19,13 +19,14 @@
 ## 怎么跑
 
 ```bash
-bash tools/sim/run.sh                    # 跑全部（9 个测试 + hs-e2e / e2e-raw / e2e 三个场景组）
+bash tools/sim/run.sh                    # 跑全部（12 个测试） + hs-e2e / e2e-raw / e2e 三个场景组）
 
 `ASAN=1 bash tools/sim/run.sh`         # 同一套判据再跑一遍：带地址消毒剂、并自动关 ASLR ✓
                                      # 内存类 bug 只有这一遍才露 ✓（真机上踩到的三个都是这样抓出来的 ✓）；
                                      # 现在它是**例行判据**的一部分 ✓ —— 改完必跑 ✓。
 TESTS="e2e"  bash tools/sim/run.sh       # 只跑端到端
 TESTS="t_rto" bash tools/sim/run.sh      # 只跑 RTO 放大测试
+bash tools/check.sh                     # **一条命令跑完全部判据** ✓（编译 + 仿真 + ASAN + 本机两进程 + v1 互通 ✓）
 REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而用指定文件
 ```
 
