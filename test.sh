@@ -14,6 +14,8 @@
 #     SESSION=xxx    给这一轮/这一批一个标识（等价于 STAMP；扫一串二进制时用它成组比较）
 #     REMOTE_BIN=…   远端用另一个二进制（本地仍用第 1 个参数）—— 做"两侧不同版本"的交叉对照
 #     FFRDP_HS=0/1   透传给**两侧**（v2 二进制用它强制老路径/握手；v1 二进制不认 ⇒ 无影响）
+#     FFRDP_IDLE=1   空闲验收：应用**一个字节都不发**，看 keepalive 会不会误杀（本地继承 / 远端 ssh 显式传 ✓）
+#     FFRDP_CLOSE=1  退出前 ffrdp_close ⇒ 走一遍四次挥手（FIN 往返 ⇒ 两侧各自 DISCONN ✓）
 #     CPUWATCH=1     同时采样本地客户端进程的 CPU（单核百分比），写进 *.cpu
 #     KEEP_MUX=1     跑完不关 SSH 复用连接（连跑多个二进制时少输几次密码）
 #     CLEAN=1        跑完删掉远端 /tmp 里的二进制与日志
@@ -165,7 +167,7 @@ if [ "$DRY" != 1 ]; then
     # 注意 pkill 的写法：模式里的路径写成 [/]tmp 这样带一对方括号。
     # 否则这条 ssh 包装命令自己的命令行里就含 "/tmp/xxx --server" 这个串，pkill -f 会连它一起杀掉，
     # 后面的启动步骤一行都不会执行（实测：ssh.out 是 0 字节、远端日志根本没生成、客户端连了个空端口）。
-    "${SSH[@]}" "$TARGET" "pkill -f '[/]tmp/$RBASE --server' 2>/dev/null; sleep 0.3; rm -f '$SRV_LOG'; ( sleep $((DUR+8)); echo quit ) | timeout $((DUR+25)) env FFRDP_HS='${FFRDP_HS:-}' stdbuf -oL '/tmp/$RBASE' --server=0.0.0.0:$PORT > '$SRV_LOG' 2>&1; echo REMOTE_EXIT=\$?; wc -c < '$SRV_LOG'" \
+    "${SSH[@]}" "$TARGET" "pkill -f '[/]tmp/$RBASE --server' 2>/dev/null; sleep 0.3; rm -f '$SRV_LOG'; ( sleep $((DUR+8)); echo quit ) | timeout $((DUR+25)) env FFRDP_HS='${FFRDP_HS:-}' FFRDP_IDLE='${FFRDP_IDLE:-}' FFRDP_CLOSE='${FFRDP_CLOSE:-}' stdbuf -oL '/tmp/$RBASE' --server=0.0.0.0:$PORT > '$SRV_LOG' 2>&1; echo REMOTE_EXIT=\$?; wc -c < '$SRV_LOG'" \
         > "$LOGDIR/${TAG}_server_${STAMP}.ssh.out" 2>&1 &
     SSHPID=$!
     sleep 4
