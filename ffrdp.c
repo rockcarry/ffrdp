@@ -63,7 +63,13 @@
 // from keeping 64 of them in flight, which is exactly the 219ms the ping sees while the test runs.
 // 2026-10-13 真机 A/B（z2~z6，交错跑、两端夹 oldarch）：窗口 16/8/6 的吞吐完全相同，
 // 而 RTT 随窗口线性增长（53/25/17ms）——窗口只买延迟 ⇒ 取到链路 BDP 附近（本链路 ~3 帧）。
-#define FFRDP_INFLIGHT_MAX   5
+// 2026-10-14 真机（快 AP）：从 5 抬回 64。上面那条 z2~z6 的 A/B 是**慢 AP**：那条路 BDP≈3 帧
+// ⇒ 窗口只买延迟 ✓；而快 AP 上测得 rtts 21ms、单向 ~0.87MB/s（≈305KB/s）≈ 5 帧 / 21ms
+// ⇒ 闸门本身就是吞吐刹车 ✗（另有 2026-10-12 前例：INFLIGHT_MAX 与 MAX_CWND_SIZE 一起 64→128
+// 时两侧吞吐 ×3 ✓）。所以这个值不该在源码里写死某一条链路的 BDP：按链路扫出来才是它的用法，
+// 扫描器见 tools/inflight-sweep.sh。三道闸同步核对：MAX_WAITSND 256 ✓ 与 MAX_CWND_SIZE 128 ✓
+// 本来就 >= 64 ✓（见上面"不要只改在途闸门"那条坑 ✓）。
+#define FFRDP_INFLIGHT_MAX   64
                                   // given path cannot be picked in advance: the simulator (fast links, coarse
                                   // acks) breaks below 64, while the target path needs 2..6 to stop holding a
                                   // 219ms queue. So the default is the harmless value, and the probe (see
