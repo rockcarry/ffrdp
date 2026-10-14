@@ -63,24 +63,33 @@
 // from keeping 64 of them in flight, which is exactly the 219ms the ping sees while the test runs.
 // 2026-10-13 真机 A/B（z2~z6，交错跑、两端夹 oldarch）：窗口 16/8/6 的吞吐完全相同，
 // 而 RTT 随窗口线性增长（53/25/17ms）——窗口只买延迟 ⇒ 取到链路 BDP 附近（本链路 ~3 帧）。
-// 2026-10-14 真机扫描（tools/inflight-sweep.sh，同批 5/64/128、各 180s、两端同版本 ✓；记录见 notes §26.15）：
-//   cap  5 ⇒ 1.08 / 0.25 MB/s，rtts 2ms
-//   cap 64 ⇒ 3.08 / 3.20 MB/s，rtts 18 / 8ms     ← 吞吐 ×3.0（闸门在买吞吐 ✓）
-//   cap128 ⇒ 3.14 / 3.68 MB/s，rtts 24 / 97ms    ← 速率不再涨，排队却翻了 ~10 倍 ✗
-// ⇒ 这条链路的**拐点在 64**：再抬只买延迟 ✓ —— 也就是上面 z2~z6 那条在慢 AP 上的同一个现象
-//   （差别只在拐点落哪：那条路是 3~6 帧 ✓）。所以这个值不该写死某一条链路的 BDP ✓，
-//   按链路扫出来才是它的用法：扫描器见 tools/inflight-sweep.sh（真机模式 TARGET=user@host ✓）。
+// 2026-10-14 真机扫描（tools/inflight-sweep.sh，同批多档、各 180s、两端同版本 ✓；记录见 notes §26.15/§26.16）：
+//   快 AP  cap  5 ⇒ 0.87 MB/s，rtts 21ms
+//          cap 64 ⇒ 2.66~3.20 MB/s，rtts 6~18ms    ← 吞吐 ×3（闸门在买吞吐 ✓）
+//          cap128 ⇒ 3.14~3.80 MB/s，rtts 24~97ms   ← 速率不再涨，排队却翻 ~10 倍 ✗ ⇒ 拐点在 64 ✓
+//   慢 AP  cap  5 ⇒ 0.34 MB/s，rtts **14ms**，重传 0.12% ✓
+//          cap 64 ⇒ 0.32 MB/s，rtts **227ms** ✗，重传 2.86% ✗（就是上面那句 219ms 的 ping ✓）
+//   lo     cap 64 比 cap 5 慢 ~1.5 倍 ✗（同机同家族 ✓；那条是"结构性代价"，与闸门取值无关 ✓）
+// ⇒ **同一个常数救不了两条链路** ✗：快 AP 要 64 ✓、慢 AP 要 5 ✓、lo 偏好小 ✗。
+//   所以这里取"对谁都无害"的 64 ✓，真正的自适应交给探测（FFRDP_PROBE_ENABLE，本轮重开 ✓）：
+//   2026-10-14 三张网实测"探测开 + 地板 32"（probe32）—— 快 AP **4.57/5.34 MB/s**（比静态 64 还快 1.8 倍 ✓，
+//   队列更小 ⇒ 伪超时更少 ⇒ 重传 0.08% ✓）、慢 AP rtts **104ms** ✓ / 重传 **0.29%** ✓（比静态 64 好 2 倍 / 10 倍 ✓），
+//   吞吐一处未降 ✓ ⇒ 没有一处变差 ✓。
 // 三道闸同步核对：MAX_WAITSND 256 ✓ 与 MAX_CWND_SIZE 128 ✓ 本来就 >= 64 ✓（见上面那条坑 ✓）。
-// 顺带一条与它无关的：waste% 随窗口涨（52→95→99%）但重传率本身 ≤0.25% ✓ ⇒ 那是 RTO 尾部那条
-// 独立线索（见 notes §26.5/§26.12），不要拿它当闸门的判据 ✗。
+// 与它无关的一条（别混 ✓）：waste% 随窗口涨（52→95→99%）但重传率本身 ≤0.25% ✓ ⇒ 那是 RTO 尾部那条
+// 独立线索（§26.5/§26.12），不是闸门的判据 ✗。
 #define FFRDP_INFLIGHT_MAX   64
                                   // given path cannot be picked in advance: the simulator (fast links, coarse
                                   // acks) breaks below 64, while the target path needs 2..6 to stop holding a
                                   // 219ms queue. So the default is the harmless value, and the probe (see
                                   // FFRDP_PROBE_ENABLE) is what experiments its way down to the right one.
                                   // It is a source constant, not a build switch: change it here and rebuild.
-// 地板同步下调：探针关闭时，实际闸门就是 MAX(INFLIGHT_MAX, INFLIGHT_MIN)。
-#define FFRDP_INFLIGHT_MIN   4
+// 2026-10-14：地板改回 **32 = 上限的一半**（原设计 ✓）。下面是当年"地板=4"那条论证，保留作历史 ✓
+// —— 它是在"探测判据还不成熟"的时期得出的 ✓；而本轮真机数据是：探测开时，"地板 32"那一档（probe32）
+// 在快/慢两张网上都没有变差 ✓，反而下探到更小（probe4）会把慢 AP 搅乱 ✗（227~243ms ✗，§26.16）。
+// 也就是说：**地板就是探测的刹车**，取上限的一半最稳 ✓。
+// 地板同步：探针打开时，实际闸门是 MAX(INFLIGHT_MAX, INFLIGHT_MIN) 起步、由探测往下试 ✓。
+#define FFRDP_INFLIGHT_MIN   32
                                   // It used to be 4, and that proved to be a ceiling rather than a floor: 4 frames
                                   // is 5 KB, and on a 1 ms path the probe kept walking down to it and pinned the
                                   // send rate there (measured 2026-10-12: cap 5, confirmed rate 5 frames/s,
@@ -116,9 +125,15 @@
                                       // milliseconds -- so it is compared as one. The rate guard below is what
                                       // keeps an over-eager keep harmless, and the giveback undoes a stale one.
 #define FFRDP_PROBE_RATE_KEEP_PCT 85  // ... while the rate the peer confirms stays above this percentage
-// 2026-10-13 暂时关闭：探针的判据与地板是在"唤醒坏掉"的时期调出来的，先固定窗口；
-// 唤醒修好之后（见 ffrdp_next_due 里 n_sent 那一段）可以再打开重验。
-#define FFRDP_PROBE_ENABLE        0
+// 2026-10-14 重开 ✓。当年关它的理由（"判据与地板是在**唤醒坏掉**的时期调出来的"）已经不存在：
+// 唤醒那两条 bug 已修（send/recv 句柄竞态、cond 醒后重查），而今天的真机数据正好证明**探测的前提成立** ✓
+// —— 不同链路的拐点天差地别（慢 AP 3~6 帧、快 AP 64 ✓），一个"自己走下来找拐点"的机制就是答案 ✓
+// （三张网实测：probe32 无一处变差、两处明显变好 ✓，见 §26.16）。
+// 已知不足，留着但它有安全网 ✓：keep 判据用的是 rtts 滑窗，在**突发型**链路上会踩空 ✗
+// （2026-10-14 慢 AP 日志：probe rtt ref/best = 79/79 ✗ 而实际 227ms↔79ms 在跳）；
+// 但速率守卫（FFRDP_PROBE_RATE_KEEP_PCT ✓）+ 按秒 giveback + 地板 32 三道网把它兜住了 ✓
+// —— 实测没有一次误 keep 造成损失 ✓。判据口径的重审排在后面（把"RTT 降没降"换成"resend_perMB 降没降"）。
+#define FFRDP_PROBE_ENABLE        1
                                       // —— 把在途砍半，若 rtts 明显下降且确认速率没掉，就保留更小的上限（同吞吐、低延迟）。
                                       // 真机上它曾走过一次"单向棘轮"✗：参考取紧邻的前一秒，第一刀之后参考自己也掉 ⇒
                                       // 每一刀都通过 ⇒ 上限被一路 keep 到地板。现在三处安全网就位：
