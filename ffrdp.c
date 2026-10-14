@@ -70,10 +70,12 @@
 // 别混 ✓：waste% 随窗口涨而重传率 ≤0.25% ⇒ 那是 RTO 尾部那条独立线索（§26.5/§26.12）✓，不是闸门的判据 ✗。
 #define FFRDP_INFLIGHT_MAX   64
                                   // It is a source constant, not a build switch: change it here and rebuild.
-// 2026-10-14：地板 = 上限的一半（64 ⇒ 32）✓。探针打开时闸门从 MAX(INFLIGHT_MAX, INFLIGHT_MIN) 起步、
-// 由探测往下试 ✓ —— 地板就是它下探的**刹车** ✓。（取值与判据口径的来龙去脉见 notes §26.16 ✓；
-// 命名原因：闸门 / 探测 / 预期窗口三处曾各写 4 或 8 而漂开 ⇒ 现在共用一个常量 ✓。）
-#define FFRDP_INFLIGHT_MIN   32
+// 2026-10-14（第二轮）：地板 32 → **4**。慢 AP 的延迟就是"在途字节 ÷ 该 AP 速率"✓——
+// 32 帧（41KB）÷ 0.34MB/s = 120ms（实测 116ms ✓）、5 帧（6.4KB）= 19ms（实测 14ms ✓）
+// ⇒ 要拿到 ~15-20ms，就必须允许探测走到 ~4-6 帧 ✓（§26.16 里"32"只是当时判据会抖的权宜 ✓；
+// 现在 keep 有了第二条证据（重传强度 ✓），下探才稳得住 ✓）。
+// 命名原因：闸门 / 探测 / 预期窗口三处曾各写 4 或 8 而漂开 ⇒ 现在共用一个常量 ✓。
+#define FFRDP_INFLIGHT_MIN   4
 
 // the delay probe: take half the in-flight away for a moment and watch whether the round trip follows.
 #define FFRDP_PROBE_HOLD_MS       500 // held for 2 round trips plus this much, long enough to drain a queue
@@ -368,6 +370,8 @@ typedef struct {
     uint32_t probe_rtt_ref;       // lowest round trip just before the probe
     uint32_t probe_best;          // lowest round trip seen during the probe
     uint32_t probe_del_ref;       // delivered frames at the start of the probe
+    uint32_t probe_res_ref;       // 重传总数（rto+fast）在探测开始时的快照：用来量"重传强度变没变" ✓
+    uint32_t probe_waste_ref;     // 探测前一刻的 probe_waste（每千首发帧的重传数 ✓）：与之相比
     uint32_t probe_rate_ref;      // frames per second the peer confirmed just before the probe
     uint32_t rate_best;           // best confirmed rate ever seen (decays 1/16 per second): the reference a keep must survive
     uint32_t probe_gap;           // current back off between probes
@@ -1747,6 +1751,8 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                     c->probe_rate_ref= c->rate_now;
                     c->probe_best    = 0xFFFFFFFF;
                     c->probe_del_ref = c->counter_delivered;
+                    c->probe_res_ref = c->counter_resend_rto + c->counter_resend_fast;
+                    c->probe_waste_ref = c->probe_waste;
                     c->cap           = c->probe_cap;
                     c->counter_probe++;
                 } else if (waste < FFRDP_PROBE_HEALTHY_PCT && c->cap_kept && idle) {
@@ -1795,7 +1801,16 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                 // 真机实测里第一刀砍下去之后参考本身跟着掉，于是每一刀都"速率没降"，闸门一路被 keep 到地板。
                 uint32_t rate_ref  = MAX(c->probe_rate_ref, c->rate_best);
                 uint32_t rate_kept = rate_held * 100 >= rate_ref * FFRDP_PROBE_RATE_KEEP_PCT;
-                if (rtt_down && rate_kept) {
+                // 第二条证据：**重传强度**没变差。慢 AP 上真正的收益就在这里，而且是直接量到的 ✓
+                // （2026-10-14：窗口砍半把 counter_resend_perMB 从 23.5 压到 4.8、重传率 2.86% → 0.58% ✓）。
+                // 为什么需要它：rtts 是滑窗，突发链路上会在两次读数之间漂掉 ✗（同日日志 probe rtt ref/best
+                // = 79/79 ✗ 而实际 227ms ↔ 79ms 在跳 ✓）⇒ 只看 RTT 会把"队列其实小了"漏掉 ✓。
+                // 归一成"每千交付帧"，与探测前一刻的 probe_waste（每千首发帧）比 —— 两者同为 1 秒窗口 ✓。
+                uint32_t resend_during = (c->counter_resend_rto + c->counter_resend_fast) - c->probe_res_ref;
+                uint32_t del_during    = c->counter_delivered - c->probe_del_ref;
+                uint32_t waste_during  = del_during ? (uint32_t)(1000.0 * resend_during / del_during) : 0;
+                uint32_t waste_down    = waste_during + waste_during / 4 < c->probe_waste_ref;   // 低 20% 以上才认 ✓
+                if (rate_kept && (rtt_down || waste_down)) {
                     c->cap_kept  = c->probe_cap;
                     c->probe_gap = FFRDP_PROBE_GAP_MS;
                     // the experiment just proved there is more to win, so do not sit out a whole back off
