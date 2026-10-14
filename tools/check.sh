@@ -115,26 +115,34 @@ fi
 step "4/6 本机两进程·真 socket（默认 / 老路径 / 空闲+挥手 / 多客户端）"
 PAIR_OK=1; PAIR_NOTE=""
 
-pair_run() {   # $1=标签 $2=env $3=期望(通|空闲) $4=端口
+pair_run() {   # $1=标签（只给人看 ✓）$2=env $3=期望(通|空闲) $4=端口
+    # 文件名里只放 ASCII ✓：标签里的中文进文件名会让 `for f in $(ls "$OUT"/*)` 断掉 ✗
+    # （2026-10-14 实测：日志目录里出现 pair_空闲挥手_client.log 之类 ✓）。
+    case "$1" in
+        默认hs1)  slug=default_hs1 ;;
+        老路径)   slug=legacy_hs0 ;;
+        空闲挥手) slug=idle_close ;;
+        *)        slug=pair ;;
+    esac
     local tag="$1" envs="${2:-}" want="$3" P="$4" sp rc cs ss
     pkill -f "test_ffrdp --server=127.0.0.1:$P" 2>/dev/null
-    ( sleep 14; echo quit ) | timeout 40 env $envs stdbuf -oL ./test_ffrdp --server=127.0.0.1:$P > "$OUT/pair_${tag}_server.log" 2>&1 &
+    ( sleep 14; echo quit ) | timeout 40 env $envs stdbuf -oL ./test_ffrdp --server=127.0.0.1:$P > "$OUT/pair_${slug}_server.log" 2>&1 &
     sp=$!
     sleep 1
-    ( sleep 9; echo quit ) | timeout 40 env $envs stdbuf -oL ./test_ffrdp --client=127.0.0.1:$P > "$OUT/pair_${tag}_client.log" 2>&1
+    ( sleep 9; echo quit ) | timeout 40 env $envs stdbuf -oL ./test_ffrdp --client=127.0.0.1:$P > "$OUT/pair_${slug}_client.log" 2>&1
     rc=$?
     wait $sp 2>/dev/null
-    cs=$(grep -c 'verify: OK' "$OUT/pair_${tag}_client.log" 2>/dev/null || true)
-    ss=$(grep -c 'verify: OK' "$OUT/pair_${tag}_server.log" 2>/dev/null || true)
+    cs=$(grep -c 'verify: OK' "$OUT/pair_${slug}_client.log" 2>/dev/null || true)
+    ss=$(grep -c 'verify: OK' "$OUT/pair_${slug}_server.log" 2>/dev/null || true)
     PAIR_OK=1
     if [ "$want" = "通" ]; then
         { [ "$cs" = 1 ] && [ "$ss" = 1 ] && [ "${rc:-1}" = 0 ]; } || PAIR_OK=0
         PAIR_NOTE="两侧 verify OK=${cs}/${ss}，客户端 rc=$rc"
     else
-        grep -q 'idle mode *: on' "$OUT/pair_${tag}_client.log" 2>/dev/null || PAIR_OK=0
-        grep -q 'close: 连接已断'  "$OUT/pair_${tag}_client.log" 2>/dev/null || PAIR_OK=0
-        grep -q 'lost !'          "$OUT/pair_${tag}_client.log" 2>/dev/null && PAIR_OK=0
-        PAIR_NOTE="'lost !' $(grep -c 'lost !' "$OUT/pair_${tag}_client.log" 2>/dev/null || true) 次（要 0 ✓），DISCONN $(grep -c 'DISCONN' "$OUT/pair_${tag}_client.log" 2>/dev/null || true) 次"
+        grep -q 'idle mode *: on' "$OUT/pair_${slug}_client.log" 2>/dev/null || PAIR_OK=0
+        grep -q 'close: 连接已断'  "$OUT/pair_${slug}_client.log" 2>/dev/null || PAIR_OK=0
+        grep -q 'lost !'          "$OUT/pair_${slug}_client.log" 2>/dev/null && PAIR_OK=0
+        PAIR_NOTE="'lost !' $(grep -c 'lost !' "$OUT/pair_${slug}_client.log" 2>/dev/null || true) 次（要 0 ✓），DISCONN $(grep -c 'DISCONN' "$OUT/pair_${slug}_client.log" 2>/dev/null || true) 次"
     fi
 }
 
