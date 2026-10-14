@@ -44,16 +44,35 @@ SIM_ALL="$SIM_FAST e2e"
 KNOWN_FAIL='observed loss c1->c0 far from the configured rate'
 
 note_sim() {   # $1=日志 ⇒ 设 SIM_OK / SIM_NOTE
-    local log="$1" err known unknown hits
+    local log="$1" err known unknown hits wfail
     err=$(grep -c 'error:' "$log" 2>/dev/null || true)
-    known=$(grep 'FAIL:' "$log" 2>/dev/null | grep -c "$KNOWN_FAIL" || true)
-    unknown=$(grep 'FAIL:' "$log" 2>/dev/null | grep -vc "$KNOWN_FAIL" || true)
+    known=$(grep 'FAIL:' "$log" 2>/dev/null | grep -c "$KNOWN_FAIL" || true)   # 说明用（两侧合起来数）
     hits=$(grep -c 'ERROR: AddressSanitizer' "$log" 2>/dev/null || true)
+    # "未知失败"以 run.sh 的**判定汇总**为准 ✓：数 work 侧判定失败中、无法归因到已知基线的那几条 ✓。
+    # 旧写法只数 `FAIL:` 行 ✗ ⇒ "只在 work 侧存在、又没有 FAIL: 行"的失败会被静静放过 ⇒ 假绿 ✗。
+    # （2026-10-14 实测踩过：v2-only 的 t_dump 三条新断言全红，而 check.sh 报的是"全绿/未知失败 0" ✗。）
+    # 汇总里每条失败是一对行：`FAIL: <原因>` + `verdict -> FAIL` ⇒ 按"原因是否匹配已知基线"配对 ✓。
+    set -- $(awk -v known="$KNOWN_FAIL" '
+        /^===== 判定汇总/          { in_sum = 1; next }
+        in_sum && /判定通过/        { side = ""; next }
+        in_sum && /work +判定失败/   { side = "work"; next }
+        in_sum && /HEAD +判定失败/   { side = "head"; next }
+        in_sum && /^  ⇒ /           { side = ""; next }
+        in_sum && side == "work" {
+            if ($0 ~ /^[[:space:]]+FAIL:/)      { k = ($0 ~ known) ? 1 : 0; next }
+            if ($0 ~ /-> FAIL/)                 { if (k == 1) kn++; else un++; k = 0 }
+        }
+        END { printf "%d %d\n", kn + 0, un + 0 }
+    ' "$log")
+    unknown=${2:-0}
+    wfail=0
+    grep -q '判定汇总' "$log" || wfail=1      # 连汇总都没有（harness 中途死了 ✗）⇒ 不能算全绿 ✓
     SIM_OK=1
     [ "${err:-0}"     != 0 ] && SIM_OK=0
     [ "${unknown:-0}" != 0 ] && SIM_OK=0
+    [ "${wfail:-0}"   != 0 ] && SIM_OK=0
     [ "${hits:-0}"    != 0 ] && SIM_OK=0
-    SIM_NOTE="编译错误 ${err:-0}；已知基线失败 ${known:-0}；未知失败 ${unknown:-0}；ASAN 命中 ${hits:-0}"
+    SIM_NOTE="编译错误 ${err:-0}；已知基线失败 ${known:-0}；未知失败 $((unknown + wfail))；ASAN 命中 ${hits:-0}"
 }
 pass_count() { grep -c 'verdict -> OK' "$1" 2>/dev/null || true; }
 
