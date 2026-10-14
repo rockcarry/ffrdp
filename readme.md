@@ -18,10 +18,14 @@ ffrdp 是一个基于 **UDP + ARQ + FEC** 的快速可靠传输协议。目标�
 | 面向"缓冲膨胀"链路的延迟治理 | v1.1.0 的核心：把**同时在途的帧数**当成真正的刹车，并用**一次可还原的实验**确定它该是多少 |
 | 对端证据驱动 | RTO 下限、快重传等待时长都由"对端重复上报"决定 —— 这是链路上唯一不会被本端计数污染的判据 |
 | 诊断友好 | `ffrdp_dump()` 输出延迟三分量、在途量、重传、白费比例等；`build :` 行自证二进制版本，避免"跑错二进制" |
+| **握手与连接管理**（v2.0.0）| 三次握手建立（SYN / SYN-ACK / ACK）、**FIN 四次挥手**收尾；握手与 FIN 走**独立帧类型**（35）⇒ 不占数据 ARQ 的序号空间 ✓ |
+| **服务端多客户端**（v2.0.0）| 服务端按对端地址维护**连接表**（`maxconn`，默认 16 ✓），一条连接一个**句柄**；未握手的来源一律丢弃 ✓ |
+| **加密交给应用**（v2.0.0）| 协议只把**载荷原样**交给 `ENCRYPT` / `DECRYPT` 回调（原地改、长度不变 ✓）⇒ 算法与密钥全在应用侧 ✓，整个库**连 openssl 都不再需要** ✓ |
+| **空闲不等于断开**（v2.0.0）| 半程没听到对端就发一个探活 `QUERY` 去确权 ✓；对端真哑了才在 `idle_ms` 内（默认 **5 s**）判死并报 `DISCONN` ✓ |
 
 与 v1.0.0 相比增长的部分，几乎全部是针对缓冲膨胀链路的优化（并发控制与延迟探测），**不是协议本身变复杂了**
-（帧格式只多了一个可选字节，见下）。**规模参考**（`ffrdp.c`，协议核心）：v1.0.0 **670 行** ✓、v1.1.0 **1316 行** ✓；
-v1.2.0 起传输层独立成文件（`lowlevel-udp.c` 约 380 行，另加 `socket.c` / `utils.c` 若干 ✓）。
+（帧格式只多了一个可选字节，见下）。**规模参考**：v1.0.0 的 `ffrdp.c` **670 行** ✓、v1.1.0 **1316 行** ✓；
+v1.2.0 起传输层独立成文件；v2.0.0 起连接模型与接口重构 —— 现在 `ffrdp.c` **2300 行** ✓、`lowlevel-udp.c` **381 行** ✓、`socket.c` **79 行** ✓、`utils.c` **156 行** ✓、`test.c` **563 行** ✓（合计 **3479 行** ✓，全部标准 C + `pthread` ✓）。
 
 ---
 
@@ -31,17 +35,18 @@ v1.2.0 起传输层独立成文件（`lowlevel-udp.c` 约 380 行，另加 `sock
 |---|---|---|---|
 | **v1.0.0** | `v1.0.x` | 4 字节帧头；ACK 8 字节 | 基础 ARQ（选择重传/快重传/UNA+MACK/rwnd）+ FEC |
 | **v1.1.0** | `v1.1.x` | **未变** ✓ | 协议**逻辑**优化：ACK 回传白费计数（唯一新增的可选字节）、对端证据驱动的 RTO 下限、快重传等待纪律、在途量闸门 + 延迟探测 |
-| **v1.2.0**（当前）| `v1.2.x` | **未变** ✓ | **传输层重构**（`lowlevel` 接口 + 工作线程驱动）与随后的协议修正（唤醒判据、当圈回 ack、窗口定标）；参数与规范见 [`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) §3.1 |
+| **v1.2.0** | `v1.2.x` | **未变** ✓ | **传输层重构**（`lowlevel` 接口 + 工作线程驱动）与随后的协议修正（唤醒判据、当圈回 ack、窗口定标）；参数与规范见 [`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) §3.1 |
+| **v2.0.0**（当前）| `master` | v1 帧格式 **未变** ✓ + 新增**握手帧类型 35**（不进数据 ARQ ✓）| **接口与连接模型重构**：句柄式 `send`/`recv` + 事件回调、三次握手与四次挥手、多客户端 `accept`、`keepalive`、加密回调 —— 见 [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |
 
 **怎么认版本** ✓：看 dump 里的 `build : … compiled <日期>` 行，再对上编译时的 commit ✓。
-（`version : v1.2.0` 这一行是**当前工作树**才有的 —— `ffrdp.h` 的 `FFRDP_VERSION` ✓；
-三个分支提交与更早编出来的二进制都**没有**这一行 ✗。）
+（`version : v2.0.0` 这一行是 **v2** 才有的 —— `ffrdp.h` 的 `FFRDP_VERSION` ✓；
+三个 v1 分支的提交与更早编出来的二进制都**没有**这一行 ✗。v2 的 dump 还多了**按连接**这一层 ✓ —— `ffrdp_dump(ctxt, conn, …)`：`conn < 0` 打总状态 ✓、`conn >= 0` 打那条连接的详细状态 ✓。）
 
-**帧格式兼容性结论**：v1.1.0 **没有引入新帧类型、没有改动任何既有字段的宽度与含义**，
-唯一变化是 ACK 帧尾部多了一个**可选**字节（`dups`，仅在"有内容可报"时发送）。**v1.2.0 同样未改动帧格式与 ACK 语义** ✓，但 **`ffrdp.h` 的 API 有三处签名变化** ✗（见 §3.1.6 ✓）：`ffrdp_init()` 改收地址字符串、`send` / `recv` 各多一个 `timeout_ms`、`ffrdp_update()` 删除。
+**帧格式兼容性结论**：v1.1.0 **没有引入新帧类型、没有改动任何既有字段的宽度与含义** ✓，唯一变化是 ACK 帧尾部多了一个**可选**字节（`dups`，仅在"有内容可报"时发送 ✓）。**v1.2.0 同样未改动帧格式与 ACK 语义** ✓，但 **`ffrdp.h` 的 API 有三处签名变化** ✗（见 §3.1.6 ✓）：`ffrdp_init()` 改收地址字符串、`send` / `recv` 各多一个 `timeout_ms`、`ffrdp_update()` 删除。
+**v2.0.0 的数据面与 v1 仍然同构** ✓（帧头、ACK、FEC 一个字没改 ✓），**多出来的只有握手帧**：新增帧类型 **35** ✓，而 v1 的解析只认 ≤34 ⇒ 老实现收到会**静默丢弃** ✓（细节见 [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md)）。⇒ 互通与否**由握手开关决定** ✓：`hs:0`（老路径）两个方向都能通 ✓；**默认 `hs:1` 与 v1 不互通** ✓（这是有意的：v2 的连接模型与 v1 不是一回事 ✓）。
 
-⇒ 新老两端可以互相对接（双向兼容，推理与代码证据见
-[`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) §2.1 与 §3.1）。
+⇒ **这件事有一条可执行的判据** ✓（不再靠"读代码觉得一样" ✗）：`V1_REF=<v1.2.x 二进制> ./test.sh <v2 二进制> x`（本地跑，不走 ssh ✓）——
+① v1 服务端 ← v2 客户端（两侧 `hs:0`）**必须通** ✓、② v2 服务端 ← v1 客户端（两侧 `hs:0`）**必须通** ✓、③ v2 服务端默认（`hs:1`）← v1 客户端**必须不通** ✓。`tools/check.sh` 的第 5 步就是它 ✓。
 
 ---
 
@@ -65,22 +70,25 @@ out/$TOOLCHAIN_NAME/lib/pkgconfig/libffrdp.pc           pkg-config 描述文件
 ```
 
 `build.sh` 的编译参数是 `-Wall -Werror`（**警告即错误**），链接时加 `-lpthread`
-（Windows/MinGW 目标额外加 `-lws2_32 -lwinmm`）。
+（Windows/MinGW 目标额外加 `-lws2_32 -lwinmm`）。`-DLINUX` 由 `build.sh` 在非 mingw 目标上自动加 ✓ —— 少了它，`socket.c` / `utils.c` / `lowlevel-udp.c` 的实现会被 `#ifdef LINUX` 挡掉 ⇒ 编出来一堆空函数 ✓。
 
 不想用脚本时的最小手工编译：
 
 ```bash
-gcc -Wall -Werror -c ffrdp.c -o ffrdp.o
-ar  rcs libffrdp.a ffrdp.o
-gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
+gcc -Wall -Werror -DLINUX -c ffrdp.c        -o ffrdp.o
+gcc -Wall -Werror -DLINUX -c lowlevel-udp.c -o lowlevel-udp.o
+gcc -Wall -Werror -DLINUX -c socket.c       -o socket.o
+gcc -Wall -Werror -DLINUX -c utils.c        -o utils.o
+ar  rcs libffrdp.a ffrdp.o lowlevel-udp.o socket.o utils.o
+gcc -Wall -Werror -DLINUX test.c libffrdp.a -lpthread -o test_ffrdp
 ```
 
 ---
 
 ## 四、测试程序 test_ffrdp
 
-`test_ffrdp` 在两个线程里各跑一个 ffrdp 实例，双方**不停互发随机长度的数据**，
-每 10 秒自动 `ffrdp_dump()` 一次，用来观察延迟、重传、在途量等指标。
+`test_ffrdp` 在两个线程里各跑一个 ffrdp 实例（服务端 / 客户端共用同一段参数化的对等端循环 ✓），双方**不停互发随机长度的数据**，
+每 10 秒自动 `ffrdp_dump()` 一次，用来观察延迟、重传、在途量等指标。**服务端按 `FFRDP_ACCEPT` 事件接纳多个客户端** ✓（一条连接一个句柄 ✓），每个客户端的字节流各自独立校验 ✓。
 
 ```bash
 ./test_ffrdp --server=0.0.0.0:8000            # 一端做服务端
@@ -125,10 +133,11 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
   （消息是原子的，不能裁剪 ✓）；不想限速就传 `0` 或不传 ✓；
 - **不限速时的速率由测试程序自己决定**（framing + crc32 + 伪随机填充的 CPU 开销 ✓），远高于真实链路 ✓；
 - 不带任何参数时只打印用法，然后退出；
-- **退出请用 `quit` / `exit`** ✓ —— 只有这种方式会**先打印上面的 `verify:` 汇总**再退出 ✓；
-- 内部固定 `ffrdp_init(addr, NULL, NULL, server, 1280, 0)`，`addr` 由 `peer->ip` + `*peer->port` 拼成
-  `"ip:port"`
-  ⇒ **MSS 1280 字节、FEC 冗余度 0（关闭）**，需要别的组合请改 `test.c`。
+- **退出请用 `quit` / `exit`** ✓ —— 只有这种方式会**先打印上面的 `verify:` 汇总**再退出 ✓（`FFRDP_CLOSE=1` 时还会先走一遍 `ffrdp_close()` 的**四次挥手** ✓）；
+- 内部固定 `"ffrdps://<ip:port>,mss:1280,fec:0"`（服务端）/ `"ffrdpc://<ip:port>,mss:1280,fec:0"`（客户端）
+  ⇒ **MSS 1280 字节、FEC 冗余度 0（关闭）** ✓，需要别的组合请改 `test.c` ✓；
+- **三个环境开关**（**都不设 ⇒ 与以前完全一样** ✓）：`FFRDP_HS=0` 关掉握手、走 v1 那条老路 ✓；
+  `FFRDP_IDLE=<秒>` 让应用**一个字节都不发** ⇒ 专验"空闲不被误杀" ✓；`FFRDP_CLOSE=1` 退出前用 `ffrdp_close()` 主动关 ⇒ 验**四次挥手** ✓。
 
 ### lowlevel 一致性测试（`tools/test-lowlevel-udp.sh`）
 
@@ -171,7 +180,7 @@ QUICK=1 bash tools/check.sh      # 跳过 ASAN 与 e2e（约 1 分钟）✓
   **v1 互通**（`hs:0` 两个方向必须通、默认 `hs:1` 必须不通 ✓）；
 - 全绿 exit 0，任何一项红 exit 1 ⇒ 可直接挂 `pre-push` 或流水线 ✓；日志在 `logs/check-<时间戳>/` ✓。
   （本地仍用第 1 个参数，远端用 `REMOTE_BIN` ✓ —— 用来分辨"某个方向被掐"是本地发送还是对端确认的问题 ✓）；
-- 其它开关：`DUR` / `PORT` / `LOGDIR` ✓、`CPUWATCH=1`（采样客户端 CPU ✓）、`CLEAN=1`（跑完清远端 ✓）、`DRY=1`（只打印计划、不碰网络 ✓）；
+- 其它开关：`DUR` / `PORT` / `LOGDIR` ✓、`CLIENTS=N`（本地起 N 个客户端打同一个服务端 ⇒ 验多客户端 ✓；上限 = 服务端 `maxconn` − 1 ✓）、`CPUWATCH=1`（采样客户端 CPU ✓）、`CLEAN=1`（跑完清远端 ✓）、`DRY=1`（只打印计划、不碰网络 ✓）、`FFRDP_IDLE=1` / `FFRDP_CLOSE=1`（空闲与挥手验收 ✓）、`V1_REF=<v1 二进制>`（本地跑 v2 ↔ v1.2.x 互通矩阵 ✓，见 §二的兼容性）；
 - 每轮结果追加进 **`$LOGDIR/summary.csv`** ✓（`stamp,tag,role,resend_pct,waste_pct,rtts_ms,send_recv_MBps` ✓）⇒ 扫完一串二进制直接看表 ✓；
 - 读判据请对着协议文档：`rttm/rtts`、`counter_resend_ratio`、`confirmed rate`，以及 **`lap period avgmax` 的最大值**（唤醒是否正常 ✓）
   —— 见 [`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) §3.2.4 ✓。
@@ -183,7 +192,7 @@ QUICK=1 bash tools/check.sh      # 跳过 ASAN 与 e2e（约 1 分钟）✓
 ```
 .
 ├── ffrdp.c                 协议实现（单文件：ARQ + FEC + 流控/并发控制 + 诊断）
-├── ffrdp.h                 对外 API（7 个函数，见下；v1.2.0 有三处签名变化）
+├── ffrdp.h                 对外 API（v2.0.0：**8 个函数**，见下 —— 句柄式收发 + 事件回调）
 ├── lowlevel.h              lowlevel 接口（tx + rx + timer，自带工作线程）—— v1.2.0 起
 ├── lowlevel-udp.c          lowlevel 的 UDP 实现（绑定 + 收发 + timer + 唤醒 socket）
 ├── socket.c / socket.h     socket 薄封装（初始化、选项、超时、非阻塞）
@@ -195,19 +204,44 @@ QUICK=1 bash tools/check.sh      # 跳过 ASAN 与 e2e（约 1 分钟）✓
 ├── LICENSE
 ├── docs/
 │   ├── ffrdp-v1.md   协议说明：v1.0.0 / v1.1.0 / v1.2.0 三部分（帧格式、参数、改动与依据）
+│   ├── ffrdp-v2.md    v2.0.0 说明：接口（params / 句柄 / 事件）、握手与四次挥手、多客户端、加密回调、keepalive
 │   ├── sim-test.md         差分仿真工具（tools/sim）使用说明
 │   └── notes.md            开发与调试记录（按时间顺序，含每次上机的原始 log）
 └── tools/                  辅助工具（不逐个列 ✓：差分仿真 `tools/sim/`、敌意输入、在途上限扫描、lowlevel 契约测试、日志提取 —— 以目录实际内容为准 ✓）
 ```
 
-### 对外 API（`ffrdp.h`）—— **v1.2.0** ✓
-> ⚠️ `ffrdp.h` 现在是 **v2.0.0** ✓（`FFRDP_VERSION` ✓）：签名见 [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) ✓；
-> 下面列的是 **v1.2.x 分支**的签名 ✓，作为旧接口留档 ✓。注意 `hs` **默认已翻成开** ✓
-> ⇒ 想沿下面这条老路走，params 里要显式 `hs:0` ✓。
+### 对外 API（`ffrdp.h`）—— **v2.0.0** ✓
 
-⚠️ **下面是 v1.2.0 的签名** ✓；相对 v1.0.0 / v1.1.0 **有三处变化** ✗（`ffrdp_init` 改收地址字符串、
-`send` / `recv` 多一个 `timeout_ms`、`ffrdp_update` 删除）⇒ 细节与理由见
-[`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) §3.1.6 ✓。
+```c
+void* ffrdp_init (void *params, FFRDP_CALLBACK callback, void *cbctx);   // params 见下（角色 + 配置都在串里）
+void  ffrdp_exit (void *ctxt);                                          // 关掉全部连接并释放（内部 join 传输层线程）
+int   ffrdp_send (void *ctxt, int conn, char *buf, int len, int timeout_ms);  // 原子：len = 整条接受；0 = 已断；-2 = 队列满且等不到
+int   ffrdp_recv (void *ctxt, int conn, char *buf, int len, int timeout_ms);  // 有序可靠**字节流**（无消息边界），有数据就返回
+void  ffrdp_flush(void *ctxt, int conn);                                // 把未填满的那一帧立刻发出（conn < 0 = 全部连接）
+void  ffrdp_dump (void *ctxt, int conn, int clearhistory);              // conn < 0 = 总状态；conn >= 0 = 该连接的详细状态
+int   ffrdp_isdead(void *ctxt, int conn);                               // **这条连接**是否已被判定失联
+int   ffrdp_close(void *ctxt, int conn);                                // 主动关：发 FIN，收到对端 FIN 才报 DISCONN（v2 新增 ✓）
+```
+
+```text
+params（字符串配置，解析失败返回 NULL 并把原因打出来 ✓）：
+  "ffrdps://0.0.0.0:8000"                                   服务器（bind 到该地址）
+  "ffrdpc://192.168.0.213:8000"                             客户端（连该地址）
+  "ffrdps://0.0.0.0:8000,maxconn:10"                        最大连接数（默认 16，上限 FFRDP_MAXCONN）
+  "ffrdps://0.0.0.0:8000,handshake_ms:10000,idle_ms:5000"   握手超时 / 空闲(keepalive)超时
+  ",mss:1280,fec:0"                                         本端 MSS 与 FEC 冗余（v1 的 smss / sfec）
+  ",hs:0"                                                   关掉握手 ⇒ 走 v1 那条老路（与 v1.x 互通时用）
+⚠️ 时间类键名**自带单位**（`_ms` ✓）—— 与 `timeout_ms` 同一套风格，不留"配置是秒、内部是毫秒"的换算点 ✗。
+```
+
+- **句柄式** ✓：`conn` 是连接句柄（服务端在 `FFRDP_ACCEPT` 事件里拿到 ✓）；**句柄永不复用** ✓ ⇒ 陈旧句柄只会指向"已关闭的" ✓，返回 `FFRDP_CONN_INVALID` ✓。
+- **事件回调** ✓：`FFRDP_ACCEPT` / `CONNECT` / `DISCONN` / `ENCRYPT` / `DECRYPT` / `RECVDATA` —— 语义、回调返回值（`FFRDP_CONSUMED` / `NOT_CONSUMED`）与加密约定见 [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) ✓。
+- **返回码** ✓：`> 0` = 字节数 ✓、`FFRDP_CLOSED(0)` = 对端已断 ✓、`FFRDP_EAGAIN(-2)` = 暂时没有 / 等不到 ✓、`FFRDP_CONN_INVALID(-1)` = 句柄无效（含**已关掉的**句柄 ✓）。
+- **`timeout_ms`** ✓：`0` = 不等待（旧行为 ✓）、`> 0` = 最多等这么多毫秒 ✓、`< 0` = 一直等到能收 / 能发为止 ✓。
+- **握手默认开** ✓（`hs:0` 关掉 ⇒ v1 行为 ✓）；**空闲探活**由 `idle_ms` 决定 ✓（默认 5000 ms ✓）。
+
+> **旧接口留档（`v1.2.x` 分支）** ✓ —— 下面这份只在 v1.2.x 分支上是当前接口 ✓；v2 的 `ffrdp.h` 里已经没有它了 ✗。
+> 三条签名差异（`ffrdp_init` 改收地址串、`send` / `recv` 多一个 `timeout_ms`、`ffrdp_update` 删除）见 [`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) §3.1.6 ✓。
 
 ```c
 void* ffrdp_init  (char *addr, char *txkey, char *rxkey, int server, int smss, int sfec);   // addr = "ip:port" / "ip"（端口默认 8000）
@@ -219,12 +253,6 @@ void  ffrdp_flush (void *ctxt);                       // 把未填满的帧立�
 void  ffrdp_dump  (void *ctxt, int clearhistory);     // 打印诊断
 ```
 
-- **`timeout_ms`** ✓：**`0` = 不等待** ✓（旧行为 —— 既有调用方加一个 `, 0` 即完全等价 ✓）；
-  **`> 0` = 最多等这么多毫秒** ✓（等待期间协议照常跑 ✓）；**`< 0` = 等到有数据 / 能接受为止** ✓。
-- **`ffrdp_recv`** ✓：有数据就立刻返回 ✓，不为凑满 `len` 而等 ✓。
-- **`ffrdp_update()` 已删除** ✓：协议跑在 lowlevel 的工作线程上 ✓，应用侧只等 `ffrdp_recv` 的 timeout ✓。
-- **`addr` 的写法与解析** ✓（`utils.h` 的共享约定）：见 `docs/notes.md` 第 21、22 节 ✓。
-
 ---
 
 ## 六、文档索引
@@ -234,7 +262,10 @@ void  ffrdp_dump  (void *ctxt, int clearhistory);     // 打印诊断
 | 帧格式、mack、FEC、RTO 计算、通信流程 | [`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) 第一部分（v1.0.0）|
 | 每个改动的动机、被否掉的路线、当时的上机原始 log | [`docs/notes.md`](docs/notes.md) |
 | 没有真机时怎么验证"没有回归" | [`docs/sim-test.md`](docs/sim-test.md) |
-| v2.0.0 的接口（params / 句柄 / 事件 / 加密回调 / 握手）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |
+| **一条命令跑完所有判据**（编译 / 仿真 / ASAN / 本机两进程四条路径 / v1 互通）| `tools/check.sh`（用法见 §四）|
+| 传输层（收发包 / 定时器 / 唤醒）的契约测试 | `tools/test-lowlevel-udp.sh`（用法见 §四）|
+| v2.0.0 的接口（params / 句柄 / 事件 / 加密回调 / 握手与挥手 / keepalive）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |
+| v2.0.0 的设计取舍与边界条件（连接表 / 句柄不复用 / 半开上限 / 加密约定）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |
 
 ---
 
