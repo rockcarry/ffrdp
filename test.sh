@@ -4,6 +4,12 @@
 #   用法:  ./test.sh <本地二进制> <user@host> [密码] [时长秒]
 #   例子:  ./test.sh dist/test_ffrdp_cap16 chenk@192.168.0.213 abc 120
 #
+#   第 1 个参数（本地二进制）可以是**相对路径 / 绝对路径 / 裸名字**（如 test_ffrdp）✓ —— 脚本
+#   会先把它转成绝对路径 ✓。必须如此：后面用 env / stdbuf 执行它，而 stdbuf 收到**不含 "/" 的
+#   名字**时会去 PATH 里找 ⇒ 直接写 "./test.sh test_ffrdp …" 会因为
+#   "stdbuf: failed to run command 'test_ffrdp': No such file or directory"（退出码 127）
+#   而整轮失败 ✗（症状是"没连上、日志里没有 verify 行"）。REMOTE_BIN / V1_REF 两个路径同理 ✓。
+#
 #   第 3 个参数（密码）只有当本机装了 sshpass 时才会被用上；没装的话脚本会开一条
 #   SSH 复用连接，整个过程（scp 上行 + 远端起服务 + scp 下行）只让你输一次密码。
 #
@@ -40,6 +46,16 @@ LOGDIR="${LOGDIR:-$PWD/logs}"
 STAMP="${STAMP:-${SESSION:-$(date +%m%d-%H%M%S)}}"
 DRY="${DRY:-0}"; CLEAN="${CLEAN:-0}"
 
+# 把二进制路径转成**绝对路径**再往下用 ✓ —— 后面所有执行都过 env / stdbuf，
+# 而 stdbuf 对不含 "/" 的名字会走 PATH 查找 ⇒ 裸名字（test_ffrdp）会 127 失败 ✗。
+# 转一次，./x、x、/abs/x、符号链接就都等价了 ✓。
+abspath() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *)  printf '%s/%s\n' "$(cd "$(dirname -- "$1")" && pwd)" "$(basename -- "$1")" ;;
+    esac
+}
+
 usage() {
     # 只打印开头的注释块：遇到第一条非注释行就停 ✓
     # （不要用固定行号 ✗，也别依赖空行 ✗ —— 注释块里的段落间隔是 "#" 行，不是空行 ✓）
@@ -55,6 +71,7 @@ if [ -n "${V1_REF:-}" ]; then
     V1="$V1_REF"; V2="$BIN"
     [ -x "$V1" ] || { echo "✗ V1_REF 不是可执行文件：$V1"; exit 2; }
     [ -x "$V2" ] || { echo "✗ 第 1 个参数（v2 二进制）不是可执行文件：$V2"; exit 2; }
+    V1="$(abspath "$V1")"; V2="$(abspath "$V2")"      # ⇒ 后面 stdbuf 执行它们才不会走 PATH ✓
     DUR="${DUR:-20}"; PORT="${PORT:-8111}"
     mkdir -p "$LOGDIR"
     FAILN=0
@@ -101,6 +118,7 @@ fi
 [ -n "$TARGET" ] || usage
 [ -f "$BIN" ] || { echo "✗ 找不到文件: $BIN"; exit 2; }
 [ -x "$BIN" ] || { echo "✗ 没有可执行权限: $BIN  （chmod +x 一下）"; exit 2; }
+BIN="$(abspath "$BIN")"                                  # ⇒ 裸名字也能跑 ✓（见文件头的说明）
 case "$DUR" in ''|*[!0-9]*) echo "✗ 时长必须是整数秒: $DUR"; exit 2;; esac
 case "$PORT" in ''|*[!0-9]*) echo "✗ 端口必须是数字: $PORT"; exit 2;; esac
 
@@ -111,6 +129,7 @@ TAG="${BASE#test_ffrdp_}"; [ -n "$TAG" ] || TAG="$BASE"
 # 例如本地 rthole4 + 远端 oldarch，以分辨"某个方向被掐"是本地发送路径还是对端确认路径的问题。
 REMOTE_BIN="${REMOTE_BIN:-$BIN}"
 [ -f "$REMOTE_BIN" ] || { echo "✗ REMOTE_BIN 不存在: $REMOTE_BIN"; exit 2; }
+REMOTE_BIN="$(abspath "$REMOTE_BIN")"
 RBASE="$(basename "$REMOTE_BIN")"
 RTAG="${RBASE#test_ffrdp_}"; [ -n "$RTAG" ] || RTAG="$RBASE"
 [ "$RBASE" = "$BASE" ] || TAG="${TAG}-${RTAG}"

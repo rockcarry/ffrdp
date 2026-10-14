@@ -160,7 +160,7 @@ fd/线程零泄漏 ✓、无期限时 `exit` 及时返回 ✓）、定时器（�
 把一轮真机对照压成一条命令 ✓：**上传二进制 → 远端起服务端 → 本地起客户端 → 取回日志 → 出摘要** ✓。
 
 ```bash
-./test.sh <本地二进制> <user@host> [密码] [时长秒]
+./test.sh <本地二进制> <user@host> [密码] [时长秒]     # 第 1 个参数：相对 / 绝对 / 裸名字都行 ✓
 export SESSION=z5-run1        # 一批扫描共用一个标识，便于成组比较（等价于 STAMP）
 ./test.sh dist/test_ffrdp_w5a4 chenk@192.168.0.213 abc 120
 column -s, -t logs/summary.csv | tail -10     # 摘要表
