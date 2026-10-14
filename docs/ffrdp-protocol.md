@@ -10,7 +10,7 @@
 [`notes.md`](notes.md)（逐次改动的调试与上机记录）、[`sim-test.md`](sim-test.md)（差分仿真工具用法）。
 
 **怎么确认手上跑的是哪一版**：dump 第一行有
-`build : probe 1, queue ratio 3, inflight default 64, compiled ...` 的是 v1.1.0；
+`version & build : v1.1.0 probe 1, queue ratio 3, inflight default 64, compiled ...` 的是 v1.1.0；
 v1.0.0 没有这一行 ✓（这个自证行是踩过三次"跑错二进制"之后加的）。
 
 ---
@@ -516,7 +516,7 @@ iperf3 TCP 跑时 ping      374~704 ms     ← TCP 用 550~700KB 在途，自残
 **先看这一行**（一眼识别"是不是刚编的二进制"——这个坑踩过三次：跑错 `./test` 而不是新构建 ✗）：
 
 ```
-build               : probe 1, queue ratio 3, inflight default 64, compiled Oct  9 2026 21:54:13
+version & build     : v1.1.0 probe 1, queue ratio 3, inflight default 64, compiled Oct  9 2026 21:54:13
 ```
 
 **延迟有三个量，别混用**：
@@ -551,7 +551,7 @@ build               : probe 1, queue ratio 3, inflight default 64, compiled Oct 
 | `counter_ooo_d1_24` / `d25_64` / `dgt64` | **距洞多远**，三档之和恒等于 `counter_recv_ooo` ✓。`d1_24` = 今天的 24 位掩码够得着（bit = `dist − 1`，`dist 24` 是最后一个 bit）；`d25_64` = 一个扩展字（64 位）够得着；`dgt64` = 一个扩展字也不够 |
 | `counter_ooo_d65_128` / `dgt128` | 把 `dgt64` 再细分 ✓：`65..128` = **两个扩展字（128 位）够得着**；`>128` = 两个也不够。两档之和恒等于 `dgt64` ✓ ⇒ **扩展字宽就是由这两档定的** ✓（真机上 `>64` 占 8.1%，所以 64 位不够 ✓）|
 | `counter_ooo_64reach` / `128reach` | `(d1_24 + d25_64) / recv_ooo` 与再加 `d65_128` 的版本 —— **改用 64 / 128 位掩码各能表达多少乱序**，这就是"值不值得加宽、加多宽"要看的两个数 |
-| `counter_mack_bits_sent` / `_recv` | 本端**发出去**的 mack 位数 / 从对端**收到**的 mack 位数。两端各看一份：**差值 = 报告丢在路上** ✓（谁单独看都分不清"没报"和"报了没到" ✗）；`sent / recv_ooo` 看"报告是否真的在发生" |
+| `counter_mack_bits_tx` / `_rx` | 本端**发出去**的 mack 位数 / 从对端**收到**的 mack 位数。两端各看一份：**差值 = 报告丢在路上** ✓（谁单独看都分不清"没报"和"报了没到" ✗）；`tx / recv_ooo` 看"报告是否真的在发生" |
 
 三点读法：
 
