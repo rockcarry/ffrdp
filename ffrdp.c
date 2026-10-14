@@ -58,56 +58,22 @@
 
 // step29: the real brake -- the number of frames allowed on the wire at once. The peer's advertised window
 // cannot serve as one: it is handed out again on every ack, so a limit placed on it never binds (measured:
-// 63 frames in flight while the cap read 22). Measured on the target path: link ~365KB/s, idle round trip
-// 5..16ms, so the bandwidth-delay product is 1..6 frames -- and the standing queue we were holding came
-// from keeping 64 of them in flight, which is exactly the 219ms the ping sees while the test runs.
-// 2026-10-13 真机 A/B（z2~z6，交错跑、两端夹 oldarch）：窗口 16/8/6 的吞吐完全相同，
-// 而 RTT 随窗口线性增长（53/25/17ms）——窗口只买延迟 ⇒ 取到链路 BDP 附近（本链路 ~3 帧）。
-// 2026-10-14 真机扫描（tools/inflight-sweep.sh，同批多档、各 180s、两端同版本 ✓；记录见 notes §26.15/§26.16）：
-//   快 AP  cap  5 ⇒ 0.87 MB/s，rtts 21ms
-//          cap 64 ⇒ 2.66~3.20 MB/s，rtts 6~18ms    ← 吞吐 ×3（闸门在买吞吐 ✓）
-//          cap128 ⇒ 3.14~3.80 MB/s，rtts 24~97ms   ← 速率不再涨，排队却翻 ~10 倍 ✗ ⇒ 拐点在 64 ✓
-//   慢 AP  cap  5 ⇒ 0.34 MB/s，rtts **14ms**，重传 0.12% ✓
-//          cap 64 ⇒ 0.32 MB/s，rtts **227ms** ✗，重传 2.86% ✗（就是上面那句 219ms 的 ping ✓）
-//   lo     cap 64 比 cap 5 慢 ~1.5 倍 ✗（同机同家族 ✓；那条是"结构性代价"，与闸门取值无关 ✓）
-// ⇒ **同一个常数救不了两条链路** ✗：快 AP 要 64 ✓、慢 AP 要 5 ✓、lo 偏好小 ✗。
-//   所以这里取"对谁都无害"的 64 ✓，真正的自适应交给探测（FFRDP_PROBE_ENABLE，本轮重开 ✓）：
-//   2026-10-14 三张网实测"探测开 + 地板 32"（probe32）—— 快 AP **4.57/5.34 MB/s**（比静态 64 还快 1.8 倍 ✓，
-//   队列更小 ⇒ 伪超时更少 ⇒ 重传 0.08% ✓）、慢 AP rtts **104ms** ✓ / 重传 **0.29%** ✓（比静态 64 好 2 倍 / 10 倍 ✓），
-//   吞吐一处未降 ✓ ⇒ 没有一处变差 ✓。
+// 63 frames in flight while the cap read 22).
+// 2026-10-14 真机扫描（tools/inflight-sweep.sh，同批多档、各 180s、两端同版本 ✓；见 notes §26.15/§26.16）：
+//   快 AP  cap 5 ⇒ 0.87 MB/s / rtts 21ms ｜ cap 64 ⇒ 2.66~3.20 / 6~18ms（×3 ✓）｜ cap128 ⇒ 3.14~3.80 / 24~97ms ✗
+//   慢 AP  cap 5 ⇒ 0.34 / **14ms** / 重传 0.12% ✓ ｜ cap 64 ⇒ 0.32 / **227ms** ✗ / 2.86% ✗
+//   lo     cap 64 比 cap 5 慢 ~1.5 倍 ✗（结构性代价，与闸门取值无关 ✓）
+// ⇒ 同一个常数救不了两条链路 ✗（快 AP 要 64 ✓、慢 AP 要 5 ✓）⇒ 这里取"对谁都无害"的 64 ✓，
+//   自适应交给探测（FFRDP_PROBE_ENABLE ✓）—— 实测"探测开 + 地板 32"：快 AP 4.57~8.0 MB/s ✓（还快过静态 64 ✓）、
+//   慢 AP rtts 104~116ms / 重传 0.29~1.25% ✓，无一处变差 ✓。
 // 三道闸同步核对：MAX_WAITSND 256 ✓ 与 MAX_CWND_SIZE 128 ✓ 本来就 >= 64 ✓（见上面那条坑 ✓）。
-// 与它无关的一条（别混 ✓）：waste% 随窗口涨（52→95→99%）但重传率本身 ≤0.25% ✓ ⇒ 那是 RTO 尾部那条
-// 独立线索（§26.5/§26.12），不是闸门的判据 ✗。
+// 别混 ✓：waste% 随窗口涨而重传率 ≤0.25% ⇒ 那是 RTO 尾部那条独立线索（§26.5/§26.12）✓，不是闸门的判据 ✗。
 #define FFRDP_INFLIGHT_MAX   64
-                                  // given path cannot be picked in advance: the simulator (fast links, coarse
-                                  // acks) breaks below 64, while the target path needs 2..6 to stop holding a
-                                  // 219ms queue. So the default is the harmless value, and the probe (see
-                                  // FFRDP_PROBE_ENABLE) is what experiments its way down to the right one.
                                   // It is a source constant, not a build switch: change it here and rebuild.
-// 2026-10-14：地板改回 **32 = 上限的一半**（原设计 ✓）。下面是当年"地板=4"那条论证，保留作历史 ✓
-// —— 它是在"探测判据还不成熟"的时期得出的 ✓；而本轮真机数据是：探测开时，"地板 32"那一档（probe32）
-// 在快/慢两张网上都没有变差 ✓，反而下探到更小（probe4）会把慢 AP 搅乱 ✗（227~243ms ✗，§26.16）。
-// 也就是说：**地板就是探测的刹车**，取上限的一半最稳 ✓。
-// 地板同步：探针打开时，实际闸门是 MAX(INFLIGHT_MAX, INFLIGHT_MIN) 起步、由探测往下试 ✓。
+// 2026-10-14：地板 = 上限的一半（64 ⇒ 32）✓。探针打开时闸门从 MAX(INFLIGHT_MAX, INFLIGHT_MIN) 起步、
+// 由探测往下试 ✓ —— 地板就是它下探的**刹车** ✓。（取值与判据口径的来龙去脉见 notes §26.16 ✓；
+// 命名原因：闸门 / 探测 / 预期窗口三处曾各写 4 或 8 而漂开 ⇒ 现在共用一个常量 ✓。）
 #define FFRDP_INFLIGHT_MIN   32
-                                  // It used to be 4, and that proved to be a ceiling rather than a floor: 4 frames
-                                  // is 5 KB, and on a 1 ms path the probe kept walking down to it and pinned the
-                                  // send rate there (measured 2026-10-12: cap 5, confirmed rate 5 frames/s,
-                                  // cap-block on every tick, the application rejected 32k times in 80 s while the
-                                  // other direction, whose probe reverted, ran at 1.1 MB/s). Half of
-                                  // FFRDP_INFLIGHT_MAX leaves the probe a range to work in without being able to
-                                  // destroy the pipe with a single mistaken keep.
-                                  // Named because the three places that used to write their own 4 or 8 drifted
-                                  // apart and that is what the sweep caught: the brake clamped to 4, the probe
-                                  // asked for 4, but its gate demanded 8 frames on the wire -- so once a
-                                  // proven ceiling had been given back up to 5 (see FFRDP_PROBE_HEALTHY_PCT),
-                                  // the probe could never ask about it again and the run sat at 5 for ever:
-                                  // measured inflight, cap = 5, 5, holding 4ms of queue more than the same
-                                  // path held at 4. One constant, three users, no drift.
-                                  // 4 is also where the descent ends by measurement, not by taste: the sweep
-                                  // tried caps 2 and 3, both were silently clamped to this floor, and both
-                                  // measured the same rtts 14ms over a 3..5ms floor. Nothing below 4 has ever
-                                  // been observed to help, so this is the smallest question worth asking.
 
 // the delay probe: take half the in-flight away for a moment and watch whether the round trip follows.
 #define FFRDP_PROBE_HOLD_MS       500 // held for 2 round trips plus this much, long enough to drain a queue
@@ -175,18 +141,13 @@
 #define FFRDP_WASTE_LO       40   // % below which the repairs are real and the floor is given back
 
 #define FFRDP_RECVBUF_SIZE  (128 * (FFRDP_MAX_MSS + 0))
-// 应用发送队列的容量：与 recv_buff 同样是编译期常量、同样内联在结构体里，所以没有 calloc、也没有
-// "分配失败"这条路。按"最多 FFRDP_MAX_WAITSND 帧"算，每帧留 4 字节长度前缀；这个式子同时保证了
-// 一条最大的合法消息（FFRDP_MAX_WAITSND 帧 × smss，smss ≤ FFRDP_MAX_MSS）一定放得下。
-// 反过来：把它配小之后，仍然能发送的单条消息上限就是 FFRDP_APP_TX_SIZE - 4（4 字节长度前缀），
-// 超过它的 ffrdp_send 会直接返回 -1，不会空等（见那里的守卫）。配小的代价只是发送背压更早出现。
-#define FFRDP_APP_TX_SIZE   (64 * 1024)   // 64 KiB：**与 FFRDP_MAX_WAITSND 解耦**（v1.1.0 里是 WAITSND×(MSS+4)
-                                  // = 374 KiB）。理由：WAITSND 现在只是"在途/受理"的**帧数闸门**，与这块纯应用侧
-                                  // 缓冲没有关系；旧的乘法把两者捆在一起，于是"省内存"必然"掉吞吐"——那是个假取舍
-                                  // （真机实测：WAITSND 64→256 让两侧吞吐 ×3，而队列容量本可以不动）。
-                                  // 这条式子只决定两件事：① 能发的**单条消息**上限 = 这个数 − 4；
-                                  // ② 背压何时出现。容量小 ⇒ 非阻塞调用更早返回 -1（调用方按契约重试即可），
-                                  // 对吞吐**中性**（协议的在途量由 WAITSND / INFLIGHT_MAX 决定，不由它决定）。
+// 应用发送队列容量：编译期常量、内联在结构体里 ⇒ 没有 calloc，也没有"分配失败"这条路 ✓。
+// 它只决定两件事：① 能发的**单条消息**上限 = 这个数 − 4（4 字节长度前缀，超过就返回 -1，不空等 ✓）；
+// ② 背压何时出现（配小 ⇒ 更早出现，调用方按契约重试 ✓）。
+#define FFRDP_APP_TX_SIZE   (64 * 1024)   // 64 KiB：**与 FFRDP_MAX_WAITSND 解耦**
+                                  // （v1.1.0 里是 WAITSND×(MSS+4) = 374 KiB ✓）。WAITSND 现在只是"在途/受理"的帧数闸门，
+                                  // 与这块纯应用侧缓冲无关；旧的乘法把两者捆在一起 ⇒ "省内存"必然"掉吞吐"，是个假取舍 ✗
+                                  // （真机实测：WAITSND 64→256 ⇒ 两侧吞吐 ×3，而队列容量本可以不动 ✓）。对吞吐中性 ✓。
 // how far ahead of the hole a received frame may sit before it is dropped instead of stored. The window
 // we advertise travels in a one byte field of the ack, so it is never more than 255 frames, and a peer
 // that respects its credit cannot be further ahead than that. Anything beyond it is a lie or a
@@ -1403,15 +1364,9 @@ static void ffrdp_apply_acks(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_RX_BATCH *
                             // on a rate limited link a quiet window is usually the floor doing its job, and
                             // decaying on it would make the loop undo its own progress.
                             {   // the ceiling has to be relative to THIS path's own round trip. It used to be
-                                // MAX(3 * rtt, 100) with rtt itself raised to FFRDP_MIN_RTO whenever rtts was
-                                // under it, so on a 1 ms path the ceiling was 100 ms flat: a hole was allowed to
-                                // sit for a hundred milliseconds, while holes are everywhere on a path that
-                                // reorders. measured 2026-10-12 17:16 with the delay probe off: rto_floor climbed
-                                // 52 -> 81 -> 100 and both directions decayed (4802 -> 1649 KB/s client,
-                                // 4924 -> 2478 KB/s server) while waste sat at 84~100% and recv_ooo was 47%
-                                // (including d25_64 / dgt64 / far, i.e. distances well past the 24 bit mask).
-                                // The floor is a repair delay, so a few typical round trips plus the rto minimum
-                                // is the most it can ever be worth.
+                                // MAX(3 * rtt, 100) with rtt raised to FFRDP_MIN_RTO, so on a 1 ms path it was a
+                                // flat 100ms -- a hole could sit that long on a path that reorders everywhere
+                                // (measured; §26.5/§26.6). A repair delay's worth is a few typical trips + the rto min.
                                 uint32_t rtt = (c->rtts == (uint32_t)-1) ? FFRDP_MIN_RTO : MAX(c->rtts, 1u);
                                 uint32_t cap = MAX(4 * rtt, (uint32_t)FFRDP_MIN_RTO);
                                 if (c->rto_floor > cap) c->rto_floor = cap;
