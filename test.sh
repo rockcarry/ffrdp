@@ -23,6 +23,8 @@
 #     FFRDP_IDLE=1   空闲验收：应用**一个字节都不发**，看 keepalive 会不会误杀（本地继承 / 远端 ssh 显式传 ✓）
 #     FFRDP_CLOSE=1  退出前 ffrdp_close ⇒ 走一遍四次挥手（FIN 往返 ⇒ 两侧各自 DISCONN ✓）
 #     CLIENTS=N      本地起 N 个客户端打同一个服务端（默认 1 ✓；上限 = 服务端 maxconn - 1 ✓）
+#                    日志：第 1 个是 <tag>_client_<stamp>.log ✓、第 2..N 个是它加 _c2.._cN ✓；
+#                    互通自测那几条用 ASCII 名（v1ref_v1srv_v2cli_hs0_* ✓），漂亮的 ①②③ 只在终端 ✓
 #     CPUWATCH=1     同时采样本地客户端进程的 CPU（单核百分比），写进 *.cpu
 #     KEEP_MUX=1     跑完不关 SSH 复用连接（连跑多个二进制时少输几次密码）
 #     CLEAN=1        跑完删掉远端 /tmp 里的二进制与日志
@@ -78,19 +80,22 @@ if [ -n "${V1_REF:-}" ]; then
 
     # 跑一格：$1=标签 $2=服务端 $3=客户端 $4=两侧 env $5=期望(通/不通) $6=端口
     v1_pair() {
-        local tag="$1" sb="$2" cb="$3" envs="${4:-}" want="$5" P="$6" ok=1
+        local tag="$1" slug="$2" sb="$3" cb="$4" envs="${5:-}" want="$6" P="$7" ok=1
+        # tag 是**给人看的**（带 ①②③ 与箭头 ✓）；slug 是**给文件名用的** ASCII ✓。
+        # 以前直接把 tag 拼进日志名 ⇒ logs/ 下会出现中文 + 箭头 + 双空格的文件名 ✗
+        # （ls 出来一片引号，`for f in $(ls logs/*)` 也会断 ✗）。
         pkill -f "test_ffrdp --server=127.0.0.1:$P" 2>/dev/null
         ( sleep $((DUR+4)); echo quit ) | timeout $((DUR+25)) env $envs stdbuf -oL "$sb" --server=127.0.0.1:$P \
-            > "$LOGDIR/${STAMP}_v1ref_${tag}_server.log" 2>&1 &
+            > "$LOGDIR/${STAMP}_v1ref_${slug}_server.log" 2>&1 &
         local sp=$!
         sleep 1
         ( sleep "$DUR"; echo quit ) | timeout $((DUR+20)) env $envs stdbuf -oL "$cb" --client=127.0.0.1:$P \
-            > "$LOGDIR/${STAMP}_v1ref_${tag}_client.log" 2>&1
+            > "$LOGDIR/${STAMP}_v1ref_${slug}_client.log" 2>&1
         wait $sp 2>/dev/null
         local cs ss cn
-        cs="$(grep -c 'verify: OK' "$LOGDIR/${STAMP}_v1ref_${tag}_client.log" 2>/dev/null || true)"
-        ss="$(grep -c 'verify: OK' "$LOGDIR/${STAMP}_v1ref_${tag}_server.log" 2>/dev/null || true)"
-        cn="$(grep -o 'recv [0-9]* msgs' "$LOGDIR/${STAMP}_v1ref_${tag}_client.log" 2>/dev/null | head -1 | awk '{print $2}')"
+        cs="$(grep -c 'verify: OK' "$LOGDIR/${STAMP}_v1ref_${slug}_client.log" 2>/dev/null || true)"
+        ss="$(grep -c 'verify: OK' "$LOGDIR/${STAMP}_v1ref_${slug}_server.log" 2>/dev/null || true)"
+        cn="$(grep -o 'recv [0-9]* msgs' "$LOGDIR/${STAMP}_v1ref_${slug}_client.log" 2>/dev/null | head -1 | awk '{print $2}')"
         cn="${cn:-0}"
         if [ "$want" = "通" ]; then
             [ "$cs" = 1 ] && [ "$ss" = 1 ] && [ "$cn" -gt 0 ] || ok=0
@@ -104,9 +109,9 @@ if [ -n "${V1_REF:-}" ]; then
     }
 
     echo "互通自检（v2 $V2 ↔ v1 $V1，各 ${DUR}s，本地两进程 ✓）"
-    v1_pair "① v1(srv) ← v2(cli)  hs:0" "$V1" "$V2" "FFRDP_HS=0" "通" "$PORT"
-    v1_pair "② v2(srv) ← v1(cli)  hs:0" "$V2" "$V1" "FFRDP_HS=0" "通" "$((PORT+1))"
-    v1_pair "③ v2(srv) 默认hs:1 ← v1(cli)" "$V2" "$V1" ""           "不通" "$((PORT+2))"
+    v1_pair "① v1(srv) ← v2(cli)  hs:0"     "v1srv_v2cli_hs0" "$V1" "$V2" "FFRDP_HS=0" "通" "$PORT"
+    v1_pair "② v2(srv) ← v1(cli)  hs:0"     "v2srv_v1cli_hs0" "$V2" "$V1" "FFRDP_HS=0" "通" "$((PORT+1))"
+    v1_pair "③ v2(srv) 默认hs:1 ← v1(cli)"  "v2srv_hs1_v1cli" "$V2" "$V1" ""           "不通" "$((PORT+2))"
     echo
     if [ "$FAILN" = 0 ]; then
         echo "✅ 互通自检通过：hs:0 两条方向都通 ✓、默认 hs:1 仍然不互通 ✓（日志在 $LOGDIR/${STAMP}_v1ref_*.log）"
@@ -231,8 +236,10 @@ case "$CLIENTS" in *[!0-9]*|"") echo "✗ CLIENTS 必须是正整数（现在是
 client_log()  {   # $1 = 客户端序号 ⇒ 第 1 个保持老日志名 ✓（脚本/习惯都不用改 ✓）
     if [ "$1" = 1 ]; then echo "$LOCAL_LOG"; else echo "${LOCAL_LOG%.log}_c$1.log"; fi
 }
-client_logs_hint() {
-    if [ "$CLIENTS" = 1 ]; then echo "$LOCAL_LOG"; else echo "${LOCAL_LOG%.log}_c1..c$CLIENTS.log"; fi
+client_logs_hint() {   # 第 1 个客户端**保持不带后缀**的日志名（兼容老习惯 ✓），第 2..N 个带 _cN ✓
+    if [ "$CLIENTS" = 1 ]; then echo "$LOCAL_LOG"
+    else echo "${LOCAL_LOG##*/}（第 1 个）+ ${LOCAL_LOG##*/} 的 _c2.._c$CLIENTS（第 2..N 个）"
+    fi
 }
 
 say "[1/6] 探路 $HOST:22"
