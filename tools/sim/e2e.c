@@ -194,7 +194,7 @@ int main(int argc, char *argv[])
 #ifdef OOO_HIST2
     s0.d65 = APP_CONN(c1, h1)->counter_ooo_d65_128; s0.d128 = APP_CONN(c1, h1)->counter_ooo_dgt128;
 #endif
-    s0.mbs = APP_CONN(c1, h1)->counter_mack_bits_sent; s0.mbr = APP_CONN(c0, h0)->counter_mack_bits_recv; // c1's reports, what c0 got
+    s0.mbs = APP_CONN(c1, h1)->counter_mack_bits_tx; s0.mbr = APP_CONN(c0, h0)->counter_mack_bits_rx; // c1's reports, what c0 got
 #endif
     TEST_FREE(c0); TEST_FREE(c1); // everything must be returned, so the residual is a leak
     printf("loss=%.3f burst=%d delay=%d jit=%d cap=%.0fKB/s q=%dKB pol=%.0fKB/s/%dKB spike=%d%%/%dms | "
