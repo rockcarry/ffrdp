@@ -416,9 +416,10 @@ typedef struct {
     int               next_slot;     // 连接表里下一个可用的下标（**永不复用** ✓，见 ffrdp.h 的设计说明）
     pthread_mutex_t   lock;          // 保护 app_tx_* / recv_buff+recv_size/head/tail / peer_addr / flags / 上列几个
     pthread_cond_t    cond;          // 协议侧腾出空间或送来数据时叫醒应用侧
-    uint32_t tick_ffrdp_dump;
-    uint32_t tick_ffrdp_init;  // tick of ffrdp_init, for the elapsed time in the dump
-    FFRDPCONN conn;   // P1：内嵌的主连接（第一步的表 0 号就指向它 ⇒ 内存/行为与 P1 一致 ✓）
+
+    uint32_t   tick_ffrdp_dump;
+    uint32_t   tick_ffrdp_init;  // tick of ffrdp_init, for the elapsed time in the dump
+    FFRDPCONN  conn;   // P1：内嵌的主连接（第一步的表 0 号就指向它 ⇒ 内存/行为与 P1 一致 ✓）
 
     // ── 连接表（P2 第一步）──────────────────────────────────────────────────
     // 连接句柄 = 下标 ✓；lowlevel 收到帧后按对端地址查这张表 ✓（v2 的分发点）。
@@ -602,17 +603,12 @@ static int ffrdp_recv_data_frame(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_FRAME_
 }
 
 static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len);   // lowlevel 的工作线程从这里回到协议
-static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c);              // 按连接的一圈；ffrdp_lowlevel_cb 的 TIMER 分支逐连接调用它
 static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int clearhistory); // 按连接 dump；ffrdp_dump_locked 逐连接调用
 static int  ffrdp_hs_send(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, uint8_t sub);   // 握手：定义在 lowlevel 回调之前
 static void ffrdp_arm_timer(FFRDPCONTEXT *ffrdp);                             // 定义在协议后段（init 里要用 ✓）
-static void ffrdp_hs_rx(FFRDPCONTEXT *ffrdp, uint64_t addr, uint8_t sub);
 static int  ffrdp_conn_handle(FFRDPCONTEXT *ffrdp, FFRDPCONN *c);
 static long ffrdp_emit(FFRDPCONTEXT *ffrdp, int type, int conn, uint64_t addr, void *buf, int len); // 事件出口
-static void ffrdp_frame_encrypt(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_FRAME_NODE *node);          // 加密回调
-// 全文件唯一的一条函数前置声明：ffrdp_init（在上面）要把这个回调**当值**交给传输层，而它的定义
-// 在协议那一大段的后面。想连它一起消掉，只能把 ffrdp_init 也挪到最后 —— 那会让这个文件的入口
-// 跑到末尾。原来这里还有另外五条声明，已经靠调整函数位置消掉了。
+
 // 一条连接的默认值：主连接与"按需分配的新连接"共用同一套（方案 A：每连接一个 calloc ✓，
 // 每连接仍用固定大小缓冲 ✓ —— 与 ffrdp.h 的设计说明 的"第一阶段不优化"一致 ✓）。
 static void ffrdp_conn_init(FFRDPCONN *c, int smss, int sfec)
@@ -711,8 +707,8 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
     ffrdp->hs_enable    = hs_enable ? 1 : 0;
     ffrdp->next_slot    = 1;   // 0 号被内嵌的主连接占用 ✓
     // 连接表：第一步只有 0 号，指向内嵌的主连接 ⇒ 必须在第一次碰 ffrdp->conn 之前设好 ✓。
-    ffrdp->table[0] = &ffrdp->conn;
-    ffrdp->nconn    = 1;
+    ffrdp->table[0]     = &ffrdp->conn;
+    ffrdp->nconn        = 1;
 
     // 主连接（P4）：单连接阶段协议只跑在它上面；多连接按地址分发是下一步。
     FFRDPCONN *c = &ffrdp->conn;
@@ -824,7 +820,6 @@ void ffrdp_exit(void *ctxt)
     pthread_mutex_destroy(&ffrdp->lock);
     free(ffrdp);
 }
-
 
 // 发送对外只有一个入口，语义没有变：**要么整条接受、要么一个字节都不接受**。
 // 它只把消息（4 字节长度 + 数据）放进应用队列，成帧留给协议在 tick 里做 —— 这样所有协议状态
@@ -1086,15 +1081,11 @@ int ffrdp_isdead(void *ctxt, int conn)
 }
 
 // 诊断用微秒时钟：只为量"收到帧 → ack 已交给内核"这一段。
-#if defined(LINUX) || defined(__linux__)
 static uint64_t ffrdp_us(void)
 {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
 }
-#else
-static uint64_t ffrdp_us(void) { return (uint64_t)get_timestamp32_ms() * 1000ull; }
-#endif
 
 static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 {
@@ -1981,8 +1972,8 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
     if (!ffrdp) return -1;
     pthread_mutex_lock(&ffrdp->lock);
     if (ffrdp->closing) { ret = -1; goto out; }
-    {   FFRDPCONN *c = ffrdp->table[0];   // RECV 的处理连接：单连接阶段就是主连接
-                                          // （多连接时这里改成"按 msg->addr 查表/建半开连接"）
+    FFRDPCONN *c = ffrdp->table[0];   // RECV 的处理连接：单连接阶段就是主连接
+                                      // （多连接时这里改成"按 msg->addr 查表/建半开连接"）
     if (!c) { ret = -1; goto out; }
     if (type == FFRDP_LOWLEVEL_TYPE_RECV) {
         FFRDP_LOWLEVEL_MSG *msg = (FFRDP_LOWLEVEL_MSG*)buf;
@@ -2061,7 +2052,7 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
                         ffrdp_emit(ffrdp, FFRDP_DISCONN, i, cc->peer_addr, NULL, 0);
                         ffrdp_conn_free(ffrdp, cc);
                     } else {
-                        cc->hs_state = HS_FAILED;   // 客户端：此后 send/recv 按"已断"处理
+                        cc->hs_state = HS_FAILED; // 客户端：此后 send/recv 按"已断"处理
                         ffrdp_emit(ffrdp, FFRDP_DISCONN, i, cc->peer_addr, NULL, 0);
                     }
                     continue;
@@ -2079,13 +2070,12 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
                 //     仿真不带 ASAN 时读到的还是释放前的内存 ⇒ 不崩、所以一直没露 ✗）。
                 if (ffrdp->table[i] != cc) continue;
             }
-            cc->pub_wait_snd = cc->wait_snd;   // 发布给应用看的镜像（受理判据用）
+            cc->pub_wait_snd = cc->wait_snd; // 发布给应用看的镜像（受理判据用）
         }
     }
-    c->pub_wait_snd = c->wait_snd;   // 发布给应用看的镜像（受理判据用）
+    c->pub_wait_snd = c->wait_snd; // 发布给应用看的镜像（受理判据用）
     ffrdp_arm_timer(ffrdp);
-    pthread_cond_broadcast(&ffrdp->cond);    // 可能有应用线程正等着空间或数据
-    }
+    pthread_cond_broadcast(&ffrdp->cond); // 可能有应用线程正等着空间或数据
 out:
     pthread_mutex_unlock(&ffrdp->lock);
     return ret;
