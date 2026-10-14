@@ -169,9 +169,6 @@ static int ffrdp_udp_lowlevel_timer(void *fl, uint32_t deadline_ms)
     return 0;
 }
 
-// "1.2.3.4:5678" -> addr, going through the same encoder the receive path uses, so that a peer named up
-// front is addressed exactly like one that has spoken. A peer needs a real port, so 0 is refused here.
-
 static void* ffrdp_udp_lowlevel_proc(void *arg)
 {
     UDP_LOWLEVEL *udp = arg;
