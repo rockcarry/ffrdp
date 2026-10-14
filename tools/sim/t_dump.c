@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>   // dup/dup2：把 dump 的输出抓下来数块数 ✓
 #include "../../ffrdp.h"
 #include "simdefs.h"
 #include "../../ffrdp.c"
@@ -34,6 +35,35 @@ static long on_event(void *cbctx, const FFRDP_EVENT *ev)
 }
 
 static int g_step;
+
+// ── 数一份 dump 打了几块 ──────────────────────────────────────────────────────
+// 为什么要数：`conn` 参数以前被忽略 ✗（整个表都打一遍），服务端于是每次 dump 都多出
+// 一大段"0 号槽"的零 ✗ —— 看起来就像同一台机器的另一个时刻（2026-10-14 实测误导过 ✓）。
+// 这里把 stdout 临时接到一个临时文件上，数"块头"（以 "──── conn " 开头 ✓）的行数 ✓。
+static void   *g_dump_ctx;
+static int     g_dump_conn, g_dump_clear;
+static void    do_dump(void) { ffrdp_dump(g_dump_ctx, g_dump_conn, g_dump_clear); }
+
+static int count_blocks(void *ctx, int conn, int clearhistory)
+{
+    FILE *f;
+    int   save, n = 0;
+    char  line[512];
+    g_dump_ctx = ctx; g_dump_conn = conn; g_dump_clear = clearhistory;
+    fflush(stdout);
+    save = dup(fileno(stdout));
+    f    = tmpfile();
+    if (save < 0 || !f) return -1;
+    dup2(fileno(f), fileno(stdout));
+    do_dump();
+    fflush(stdout);
+    dup2(save, fileno(stdout));
+    close(save);
+    rewind(f);
+    while (fgets(line, sizeof(line), f)) if (strncmp(line, "\xe2\x94\x80\xe2\x94\x80 conn ", 12) == 0) n++;
+    fclose(f);
+    return n;
+}
 static void drive(int steps, void *p_c1, void *p_srv)
 {
     int i;
@@ -49,6 +79,7 @@ int main(void)
     void *p_srv, *p_c1;
     FFRDPCONTEXT *srv;
     struct app a_srv, a_c1;
+    int   n;
 
     sim_reset(); sim_config(0.0, 0, 4, 0);
     memset(&a_srv, 0, sizeof(a_srv)); memset(&a_c1, 0, sizeof(a_c1));
@@ -77,7 +108,13 @@ int main(void)
     ffrdp_dump(NULL, 0, 0);                      check(1, "dump(NULL, 0) ⇒ 空 ctxt（以前会空指针解引用 ✗）");
     ffrdp_dump(NULL, -1, 0);                     check(1, "dump(NULL, -1) ⇒ 空 ctxt + 总状态 ✓");
 
-    printf("── 3 连接被放掉之后，对那个槽再 dump（最容易踩的一条 ✓）\n");
+    printf("── 3 conn 参数要真的选连接（不是『整个表都打一遍』✗）\n");
+    n = count_blocks(p_srv, -1, 0);              check(n == 2, "dump(ctxt, -1) 打出 2 块（0 号内嵌主连接 + accept 那条 ✓）");
+    n = count_blocks(p_srv, 0, 0);               check(n == 1, "dump(ctxt, 0) 只打 1 块（0 号槽 ✓）");
+    n = count_blocks(p_srv, a_srv.conn, 0);      check(n == 1, "dump(ctxt, accept 句柄) 只打 1 块 ✓");
+    n = count_blocks(p_srv, 3, 0);               check(n == 0, "dump(ctxt, 空槽) 一块都不打（提前 return ✓）");
+
+    printf("── 4 连接被放掉之后，对那个槽再 dump（最容易踩的一条 ✓）\n");
     sim_config(1.0, 0, 4, 0);                    // 之后谁都听不到谁
     drive(IDLE_MS * 3, p_c1, p_srv);
     check(a_srv.disconn_n == 1 && srv->table[a_srv.conn] == NULL, "连接已被 keepalive 判死并收摊 ✓");

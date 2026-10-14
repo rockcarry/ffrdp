@@ -102,7 +102,7 @@ ffrdps://0.0.0.0:8000,maxconn:16,handshake_ms:10000,idle_ms:5000,mss:1024,fec:0,
 |---|---|
 | `ffrdp_init` / `ffrdp_exit` | ✅ 已落地 ✓（`exit` 会关掉全部连接并 join 传输层线程 ✓）|
 | `ffrdp_send` / `ffrdp_recv`（带句柄 ✓）| ✅ 已落地 ✓（`send` 原子 ✓；`recv` 有序字节流、有数据就返回 ✓）|
-| `ffrdp_flush` / `ffrdp_dump`（`conn < 0` = 全局 ✓）| ✅ 已落地 ✓ |
+| `ffrdp_flush` / `ffrdp_dump`（`conn < 0` = 全局 ✓、`conn >= 0` = **只那一条** ✓；dump 每块带块头：句柄 + 对端 + 握手状态 ✓）| ✅ 已落地 ✓ |
 | `FFRDP_ACCEPT` / `CONNECT` / `DISCONN` | ✅ 已接线 ✓ |
 | `FFRDP_ENCRYPT` / `FFRDP_DECRYPT` | ✅ 已接线 ✓（协议**原样**交付载荷 ✓，长度不改 ✓；两条出口都挂 ✓，`t_crypto` 验收 ✓）|
 | `FFRDP_RECVDATA` | ✅ 已接线 ✓（`t_recvdata` 验收 ✓）——`FFRDP_CONSUMED` ⇒ 应用在回调里取走、协议不留 ✓；`NOT_CONSUMED` ⇒ 照旧留在缓冲里等 `ffrdp_recv` ✓ |

@@ -66,7 +66,7 @@ for cap in $CAPS; do
 
     log="sweep-$cap.log"
     ( sleep "$DURATION"; echo quit ) | ./test_ffrdp "$@" > "$log" 2>&1
-    grep -aE '^(build|elapsed|total_send|rtt_min|swnd|wait_snd|inflight|confirmed rate|queue test|probe trigger|probe rtt ref/best|fec_txredundancy|counter_(resend_|recv_ooo|ooo_d|mack_bits|send_err|send_failed|send_1sttime))' "$log" > "$log.key"
+    grep -aE '^(version & build|build|elapsed|total_send|rtt_min|swnd|wait_snd|inflight|confirmed rate|queue test|probe trigger|probe rtt ref/best|fec_txredundancy|counter_(resend_|recv_ooo|ooo_d|mack_bits|send_err|send_failed|send_1sttime))' "$log" > "$log.key"
 
     # 取最后一块的关键值
     row=$(awk '

@@ -9,6 +9,8 @@
 # 用法要点（与 docs/notes.md 5.23 一致）：
 #   · 停止请用 quit / exit（Ctrl+C 不会打印 verify 汇总，见 notes 5.21）；
 #   · dump 里的计数是**累计**的（test.c 传 ffrdp_dump(..., 0)）⇒ 本脚本只取"最后一块"看总量、
+#     （v2 起 dump 的块头是 `version & build :` ✓，且 ffrdp_dump(ctxt, 句柄, …) 只打那一条 ✓；
+#     老日志里的 `build :` 一样认 ✓）
 #     看逐块趋势，**绝不求和**；要增量请自己对相邻两块作差；
 #   · 一个日志里若混了多段运行，跨运行的数字不要互相比较（块数偏多时脚本会提醒）。
 set -u
@@ -16,7 +18,7 @@ set -u
 BLOCKSTEP="${BLOCKSTEP:-5}"
 
 # 只留这些行。想更窄就删几个字段；想更全就把 counter_ 那段放宽（例如改成 counter_）。
-KEY='^(build|elapsed|total_send|rtt_min|swnd|wait_snd|inflight|in-flight limit|probe trigger|probe rtt|queue test|confirmed rate|lap period|rto_floor|counter_(recv_ooo|ooo_d|ooo_64reach|ooo_128reach|mack_bits|resend_|ack_(mack|hole|dup)|recv_dup|timeout_evt|send_1sttime|send_failed|reach_maxrto|probe|giveback))'
+KEY='^(version & build|build|elapsed|total_send|rtt_min|swnd|wait_snd|inflight|in-flight limit|probe trigger|probe rtt|queue test|confirmed rate|lap period|rto_floor|counter_(recv_ooo|ooo_d|ooo_64reach|ooo_128reach|mack_bits|resend_|ack_(mack|hole|dup)|recv_dup|timeout_evt|send_1sttime|send_failed|reach_maxrto|probe|giveback))'
 
 summarize() {   # $1 = key 文件
     awk -v step="$BLOCKSTEP" '
@@ -30,7 +32,9 @@ summarize() {   # $1 = key 文件
                                el, pmb, m["rto"], m["fast"], m["ooo"], m["b2"], m["b3"], ifl)
     }
 
-    /^build  *:/ { sample(); blk++; b=$0; sub(/.*compiled /,"compiled ",b); sub(/\r/,"",b); next }
+    # 块头：v2 起是 `version & build : … `（把 version 与 build 合成一行 ✓）；
+    # v1 的二进制与旧日志仍是 `build  : … ` ⇒ 两种都认 ✓（否则这里一块都数不出来 ✗）。
+    /^(version & build|build)  *:/ { sample(); blk++; b=$0; sub(/.*compiled /,"compiled ",b); sub(/\r/,"",b); next }
     /^elapsed /  { el=val(); sub(/ .*/,"",el) }
 
     # 下面这些都是"最后出现的那个值"生效 —— 块内计数是累计的，所以最后一块 = 该进程的累计终点。
