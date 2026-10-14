@@ -1691,8 +1691,12 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             c->probe_first_seen  = firsts;
             // 见过的最好一秒（升就立刻记，降就每秒衰减 1/16，约 16 秒忘掉旧高水位）。keep 的速率参考要用它：
             // 只跟紧邻的一秒比，第一刀之后参考自己也掉，于是每一刀都通过，闸门被一路 keep 到地板。
+            // 衰减 1/16 → 1/4（记忆 ~11s → ~2.5s）：参考要从"历史峰值"变成"最近的能力" ✓
+            // 2026-10-14 慢 AP 日志：那条链路的确认速率在 0.31~0.63 MB/s（~250~500 帧/s）之间大幅起伏 ✗，
+            // 而 keep 的速率守卫拿"历史最高"比 ⇒ 只要守卫窗口没撞上最好的那一秒就过不去 ✗
+            // ⇒ 服务端连做 3 次探测、全部 revert ✗（rtt_down 其实成立：226→222 ✓），窗口永远降不下来。
             if (c->rate_now >= c->rate_best) c->rate_best = c->rate_now;
-            else                                     c->rate_best -= c->rate_best / 16;
+            else                             c->rate_best -= c->rate_best / 4;
             // 事后修复：被 keep 的闸门把确认速率拖到最好值的某个比例以下，就按秒翻倍还回去。
             if (c->cap_kept && c->cap_kept < (uint32_t)FFRDP_INFLIGHT_MAX && c->rate_best &&
                 c->rate_now * 100 < c->rate_best * FFRDP_PROBE_RATE_KEEP_PCT) {
