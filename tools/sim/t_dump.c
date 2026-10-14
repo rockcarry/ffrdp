@@ -16,6 +16,10 @@
 #include "simdefs.h"
 #include "../../ffrdp.c"
 
+// 块头前缀：ffrdp.c 打的是四个 U+2500 加 " conn " ✓。写死字节数最容易数错字符 ✗
+// （2026-10-14 就踩过：这里只写了两个 ─ ⇒ 计数恒为 0 ⇒ 三条断言假红 ✗），所以用转义字节 + strstr ✓。
+#define DUMP_HDR "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 conn "
+
 #define MKADDR(port) ((uint64_t)(0x7F000001ULL << 16) | (uint64_t)(port))
 #define A_SRV MKADDR(8001)
 #define A_C1  MKADDR(40001)
@@ -60,7 +64,7 @@ static int count_blocks(void *ctx, int conn, int clearhistory)
     dup2(save, fileno(stdout));
     close(save);
     rewind(f);
-    while (fgets(line, sizeof(line), f)) if (strncmp(line, "\xe2\x94\x80\xe2\x94\x80 conn ", 12) == 0) n++;
+    while (fgets(line, sizeof(line), f)) if (strstr(line, DUMP_HDR) != NULL) n++;
     fclose(f);
     return n;
 }
