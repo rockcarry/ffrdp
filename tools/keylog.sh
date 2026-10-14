@@ -16,7 +16,7 @@ set -u
 BLOCKSTEP="${BLOCKSTEP:-5}"
 
 # 只留这些行。想更窄就删几个字段；想更全就把 counter_ 那段放宽（例如改成 counter_）。
-KEY='^(build|elapsed|total_send|rtt_min|swnd|wait_snd|inflight|in-flight limit|probe trigger|probe rtt|queue test|confirmed rate|lap period|rto_floor|counter_(recv_ooo|ooo_d|ooo_64reach|ooo_128reach|mack_bits|resend_|ack_(mack|hole|dup)|recv_dup|timeout_evt|send_1sttime|send_failed|reach_maxrto|probe|giveback))'
+KEY='^(version & build|build|elapsed|total_send|rtt_min|swnd|wait_snd|inflight|in-flight limit|probe trigger|probe rtt|queue test|confirmed rate|lap period|rto_floor|counter_(recv_ooo|ooo_d|ooo_64reach|ooo_128reach|mack_bits|resend_|ack_(mack|hole|dup)|recv_dup|timeout_evt|send_1sttime|send_failed|reach_maxrto|probe|giveback))'
 
 summarize() {   # $1 = key 文件
     awk -v step="$BLOCKSTEP" '
@@ -30,7 +30,9 @@ summarize() {   # $1 = key 文件
                                el, pmb, m["rto"], m["fast"], m["ooo"], m["b2"], m["b3"], ifl)
     }
 
-    /^build  *:/ { sample(); blk++; b=$0; sub(/.*compiled /,"compiled ",b); sub(/\r/,"",b); next }
+    # 块头：dump 现在把 version 与 build 合成一行 `version & build : …` ✓；
+    # 老二进制与旧日志仍是 `build  : …` ⇒ 两种都认 ✓（否则这里一块都数不出来 ✗）。
+    /^(version & build|build)  *:/ { sample(); blk++; b=$0; sub(/.*compiled /,"compiled ",b); sub(/\r/,"",b); next }
     /^elapsed /  { el=val(); sub(/ .*/,"",el) }
 
     # 下面这些都是"最后出现的那个值"生效 —— 块内计数是累计的，所以最后一块 = 该进程的累计终点。
@@ -54,8 +56,8 @@ summarize() {   # $1 = key 文件
     /^counter_ooo_dgt64 /      { m["b3"]=num(val()) }
     /^counter_ooo_d65_128 /    { m["d65"]=num(val()) }
     /^counter_ooo_dgt128 /     { m["d128"]=num(val()) }
-    /^counter_mack_bits_sent/  { m["mbs"]=num(val()) }
-    /^counter_mack_bits_recv/  { m["mbr"]=num(val()) }
+    /^counter_mack_bits_tx/    { m["mbs"]=num(val()) }   # 计数器改名了（sent → tx ✓）
+    /^counter_mack_bits_rx/    { m["mbr"]=num(val()) }   # （recv → rx ✓）
     /^counter_ack_mack /       { m["amack"]=num(val()) }
     /^counter_ack_hole /       { m["ahole"]=num(val()) }
     /^counter_recv_dup /       { m["rdup"]=num(val()) }

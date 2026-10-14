@@ -74,8 +74,8 @@ int main(void)
     // the masked bytes are counted by population, not by frame: 0x07 has three bits set, 0x0a has two,
     // so a sender that counted what it actually received has to read five.
     printf("  mack_bits_recv=%u (expect 5 = 3 from 0x07 + 2 from 0x0a) -> %s\n",
-           c->counter_mack_bits_recv, c->counter_mack_bits_recv == 5 ? "PASS" : "FAIL");
-    if (c->counter_mack_bits_recv != 5) return 1;
+           c->counter_mack_bits_rx, c->counter_mack_bits_rx == 5 ? "PASS" : "FAIL");
+    if (c->counter_mack_bits_rx != 5) return 1;
 #endif
     return (c->counter_ack_recv == 3 && c->counter_ack_mack == 2 && c->counter_ack_hole == 1) ? 0 : 1;
 #else
