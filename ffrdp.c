@@ -264,12 +264,16 @@ typedef struct tagFFRDP_FRAME_NODE {
 // （连接句柄 = 表下标 ✓）。字段顺序保持原样 ✓ —— ffrdp_dump 的清零跨度
 // memset(&counter_send_bytes, 0, &reserved - &counter_send_bytes) 依赖它 ✓。
 typedef struct {
-    uint8_t  recv_buff[FFRDP_RECVBUF_SIZE];
+    // ①-38（路线 B）：这两块**大缓冲**从"内嵌数组"改成"**按需分配**"（指针 + 容量）——
+    // 为什么：服务端那条**内嵌主连接从不用于数据**（受理进来的连接从槽 1 起 ✓）⇒ 它的
+    // recv_buff(96×1280=120 KB) + app_tx_buff(32 KB) ≈ **152 KB 白占** ✗；改成按需之后
+    // 服务端进程省下它，而**容量、窗口、队列行为一字不变** ✓（仍由下面那两个源码常量定 ✓）。
+    uint8_t *recv_buff;   uint32_t recv_cap;   // 接收窗口缓冲（容量 = FFRDP_RECVBUF_SIZE）
     // 应用交给协议的数据（4 字节长度前缀 + 数据），协议在 tick 里取出并成帧。
     // 为什么要过这一道：成帧要碰的全是协议状态（cur_new_node / send_seq / 加密密钥），让应用线程直接
     // 去写它，就等于把协议的一半搬到应用线程上。放在这里之后，协议侧只被一个执行者碰；下一步协议搬
     // 到 lowlevel 的工作线程上时，这个队列就是两条线程之间唯一的界面（那时只需要给它加一把锁）。
-    uint8_t  app_tx_buff[FFRDP_APP_TX_SIZE];  // 环形（head/tail 由 ringbuf_write/read 推进），容量是常量
+    uint8_t *app_tx_buff; uint32_t app_tx_cap; // 应用队列环形（容量 = FFRDP_APP_TX_SIZE ✓）
     uint32_t app_tx_head;
     uint32_t app_tx_tail;
     uint32_t app_tx_size;
@@ -812,6 +816,26 @@ static long ffrdp_emit(FFRDPCONTEXT *ffrdp, int type, int conn, uint64_t addr, v
 
 // 一条连接的默认值：主连接与"按需分配的新连接"共用同一套（方案 A：每连接一个 calloc ✓，
 // 每连接仍用固定大小缓冲 ✓ —— 与 ffrdp.h 的设计说明 的"第一阶段不优化"一致 ✓）。
+// ①-38：两块大缓冲的按需分配 / 归还。容量仍取那两个源码常量 ⇒ 窗口与队列行为一字不变 ✓。
+// 幂等 ✓：已经在的就不重复分配 ✓（服务端 hs:0 的旧路径要"用时再分配"，见 lowlevel_cb ✓）。
+static int ffrdp_conn_bufs(FFRDPCONN *c)
+{
+    if (!c->recv_buff) {
+        if (!(c->recv_buff = calloc(1, FFRDP_RECVBUF_SIZE))) return -1;
+        c->recv_cap = FFRDP_RECVBUF_SIZE;
+    }
+    if (!c->app_tx_buff) {
+        if (!(c->app_tx_buff = calloc(1, FFRDP_APP_TX_SIZE))) return -1;
+        c->app_tx_cap = FFRDP_APP_TX_SIZE;
+    }
+    return 0;
+}
+static void ffrdp_conn_bufs_free(FFRDPCONN *c)
+{
+    if (c->recv_buff)   { free(c->recv_buff);   c->recv_buff   = NULL; c->recv_cap   = 0; }
+    if (c->app_tx_buff) { free(c->app_tx_buff); c->app_tx_buff = NULL; c->app_tx_cap = 0; }
+}
+
 static void ffrdp_conn_init(FFRDPCONN *c, int smss, int sfec)
 {
     c->swnd     = FFRDP_DEF_CWND_SIZE;
@@ -822,6 +846,9 @@ static void ffrdp_conn_init(FFRDPCONN *c, int smss, int sfec)
     c->rmss     = FFRDP_MAX_MSS;
     c->smss     = MAX(1, MIN(smss, FFRDP_MAX_MSS));
     c->fec_txredundancy = MAX(0, MIN(sfec, FFRDP_FRAME_TYPE_FEC32));
+    // ①-38：**这里不分配大缓冲** ✗ —— 分配交给真正的使用方（下面的 ffrdp_conn_bufs ✓）。
+    // 为什么：服务端那条内嵌主连接从不用于数据，若在这里分配、再在 init 里还回去，
+    // glibc 不会把 152 KB 还给 OS ⇒ RSS 一点不降 ✗（实测 3456 → 3712 KB ✓）。
 }
 
 // 按需分配一条新连接（方案 A）。句柄 = 表下标 ✓、**索引永不复用** ✓（见 ffrdp.h 的设计说明）：
@@ -834,6 +861,7 @@ static FFRDPCONN *ffrdp_conn_new(FFRDPCONTEXT *ffrdp, uint64_t addr, int *handle
     if (slot >= ffrdp->maxconn || slot >= FFRDP_MAXCONN) return NULL;
     if (!(c = calloc(1, sizeof(FFRDPCONN)))) return NULL;
     ffrdp_conn_init(c, ffrdp->conn.smss, ffrdp->conn.fec_txredundancy);
+    if (ffrdp_conn_bufs(c) != 0) { ffrdp_conn_bufs_free(c); free(c); return NULL; }   // ①-38：受理的新连接必须有缓冲
     c->peer_addr = addr;
     c->flags    |= FLAG_CONNECTED;  // 服务端：对端就是它（学到即连上 ✓）
     ffrdp->table[slot] = c;
@@ -851,6 +879,7 @@ static void ffrdp_conn_free(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     list_free(&c->send_list_head, &c->send_list_tail);
     list_free(&c->recv_list_head, &c->recv_list_tail);
     if (c->cur_new_node) { free(c->cur_new_node); c->cur_new_node = NULL; }
+    ffrdp_conn_bufs_free(c);   // ①-38：大缓冲按需分配 ⇒ 这里归还 ✓（内嵌主连接也一样安全 ✓）
     for (i = 0; i < ffrdp->nconn; i++) if (ffrdp->table[i] == c) ffrdp->table[i] = NULL;  // 槽不回收 ✓
     if (c != &ffrdp->conn) free(c);
 }
@@ -914,6 +943,10 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
     // 主连接（P4）：单连接阶段协议只跑在它上面；多连接按地址分发是下一步。
     FFRDPCONN *c = &ffrdp->conn;
     ffrdp_conn_init(c, smss, sfec);
+    // ①-38：**只有客户端**给内嵌主连接分配那两块大缓冲 ✓；
+    // 服务端在握手模式下不使用它（受理进来的连接自己分配 ✓）⇒ 服务端**根本不分配** ⇒ 省 ~152 KB ✓。
+    // （hs:0 的旧路径真要用到它时，由 lowlevel_cb 里那句按需分配 ✓）
+    if (!server && ffrdp_conn_bufs(c) != 0) { free(ffrdp); return NULL; }
     ffrdp->tick_ffrdp_dump = get_timestamp32_ms();
     ffrdp->tick_ffrdp_init = ffrdp->tick_ffrdp_dump;
     c->tick_rto_backoff    = ffrdp->tick_ffrdp_dump - c->rto; // allow the first timeout to backoff
@@ -1017,6 +1050,7 @@ void ffrdp_exit(void *ctxt)
     if (c->cur_new_node) free(c->cur_new_node);
     list_free(&c->send_list_head, &c->send_list_tail);
     list_free(&c->recv_list_head, &c->recv_list_tail);
+    ffrdp_conn_bufs_free(c);   // ①-38：内嵌主连接不经 conn_free ⇒ 这里归还它那两块大缓冲 ✓
     pthread_cond_destroy (&ffrdp->cond);
     pthread_mutex_destroy(&ffrdp->lock);
     free(ffrdp);
@@ -1064,15 +1098,15 @@ int ffrdp_send(void *ctxt, int conn, char *buf, int len, int timeout_ms)
     if ((len + c->smss - 1) / c->smss + c->pub_wait_snd > g_waitsnd) { c->counter_refuse_wnd++; goto out; }  // 只读（§26.30 ①-①）
     // 比队列还大的消息永远不可能被接纳（下面的字节判据会一直不成立）⇒ 直接拒，绝不在 cond 上空等：
     // 这一行是"FFRDP_APP_TX_SIZE 可以随意配小"的前提（配小后能发的单条消息上限就是它减 4）。
-    if ((uint32_t)len + 4 > FFRDP_APP_TX_SIZE) { c->counter_refuse_big++; rc = FFRDP_EINVAL; goto out; }  // 永远收不下 ⇒ 不是"重试就好"（只读 §26.30 ①-①）
+    if ((uint32_t)len + 4 > c->app_tx_cap) { c->counter_refuse_big++; rc = FFRDP_EINVAL; goto out; }  // 永远收不下 ⇒ 不是"重试就好"（只读 §26.30 ①-①）
     t0 = get_timestamp32_ms();
     for (;;) {
-        if ((uint32_t)len + 4 + c->app_tx_size <= FFRDP_APP_TX_SIZE) {
+        if ((uint32_t)len + 4 + c->app_tx_size <= c->app_tx_cap) {
             uint32_t l = (uint32_t)len;
             // 长度前缀和数据分两次写进环形 —— ringbuf_write 返回新的 tail，两次调用自然接上；
             // 回绕点落在哪里都不用管（这正是环形换掉 memmove 的地方）。
-            c->app_tx_tail = ringbuf_write(c->app_tx_buff, sizeof(c->app_tx_buff), c->app_tx_tail, (uint8_t*)&l, 4);
-            c->app_tx_tail = ringbuf_write(c->app_tx_buff, sizeof(c->app_tx_buff), c->app_tx_tail, (uint8_t*)buf, (uint32_t)len);
+            c->app_tx_tail = ringbuf_write(c->app_tx_buff, c->app_tx_cap, c->app_tx_tail, (uint8_t*)&l, 4);
+            c->app_tx_tail = ringbuf_write(c->app_tx_buff, c->app_tx_cap, c->app_tx_tail, (uint8_t*)buf, (uint32_t)len);
             c->app_tx_size += 4 + (uint32_t)len;
             rc = len;                                // 整条进去了：原子
             break;
@@ -1164,7 +1198,7 @@ static int ffrdp_frame_message(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, uint32_t head,
         }
         SET_FRAME_SEQ(c->cur_new_node, c->send_seq);
         size = MIN(n, (int)(c->smss - c->cur_new_size));
-        head = ringbuf_read(c->app_tx_buff, sizeof(c->app_tx_buff), head,
+        head = ringbuf_read(c->app_tx_buff, c->app_tx_cap, head,
                             c->cur_new_node->data + 4 + c->cur_new_size, (uint32_t)size);
         c->cur_new_size += size; n -= size;
         if (c->cur_new_size == c->smss) {
@@ -1218,7 +1252,7 @@ int ffrdp_recv(void *ctxt, int conn, char *buf, int len, int timeout_ms)
     for (;;) {
         ret = MIN(len, c->recv_size);
         if (ret > 0) {
-            c->recv_head = ringbuf_read(c->recv_buff, sizeof(c->recv_buff), c->recv_head, (uint8_t*)buf, ret);
+            c->recv_head = ringbuf_read(c->recv_buff, c->recv_cap, c->recv_head, (uint8_t*)buf, ret);
             c->recv_size-= ret; c->counter_recv_bytes += ret;
             break;
         }
@@ -1323,7 +1357,7 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         // ringbuf_write would take that as four billion bytes to copy. The recv path no longer lets such
         // a frame in (see ffrdp_recv_data_frame), and this keeps a future path from doing it silently.
         if (dist == 0 && (size = frame_payload_size(c->recv_list_head)) > 0 &&
-            size <= (int)(sizeof(c->recv_buff) - c->recv_size)) {
+            size <= (int)(c->recv_cap - c->recv_size)) {
             // 收侧：位置与 v1 的 AES 一致 ✓ —— 就在把载荷写进应用缓冲之前，
             // 而且只在这一帧**真的要交付**时解一次 ✓（乱序 / 重复帧在那之前就已经丢掉 ✓）。
             if (ffrdp->app_cb)
@@ -1335,7 +1369,7 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             // ⚠️ 回调返回后这块内存就还给协议了 ⇒ 要留就**在回调里搬走** ✓（拷贝或自行接管 ✓）。
             if (ffrdp_emit(ffrdp, FFRDP_RECVDATA, ffrdp_conn_handle(ffrdp, c),
                            c->peer_addr, c->recv_list_head->data + 4, size) != FFRDP_CONSUMED) {
-                c->recv_tail = ringbuf_write(c->recv_buff, sizeof(c->recv_buff), c->recv_tail, c->recv_list_head->data + 4, size);
+                c->recv_tail = ringbuf_write(c->recv_buff, c->recv_cap, c->recv_tail, c->recv_list_head->data + 4, size);
                 c->recv_size+= size;
             }
             c->recv_seq++; c->recv_seq &= 0xFFFFFF;
@@ -1354,7 +1388,7 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     for (i = 0; i < 24; i++) if (recv_mack & (1 << i)) c->counter_mack_bits_tx++;
     // rmss is a divisor learned from whatever arrived (ffrdp_recv_data_frame rejects the lengths that
     // cannot carry a payload; it starts at FFRDP_MAX_MSS). Never divide by it unconditionally.
-    recv_wnd = c->rmss ? (sizeof(c->recv_buff) - c->recv_size) / c->rmss : 0;
+    recv_wnd = c->rmss ? (c->recv_cap - c->recv_size) / c->rmss : 0;   // ①-38：容量取自字段（值不变 ✓）
     recv_wnd = MIN(recv_wnd, 255);
     *(uint32_t*)(data + 0) = (FFRDP_FRAME_TYPE_ACK << 0) | (c->recv_seq << 8);
     *(uint32_t*)(data + 4) = (recv_mack <<  0);
@@ -1452,7 +1486,7 @@ static void ffrdp_conf_hist(FFRDPCONN *c, uint32_t conf)
 static void ffrdp_drain_tx(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 {
     // ①-35c：抽空之后允许下一次 send 再叫醒（与 send 同一把锁 ⇒ 不漏醒 ✓）
-    uint32_t cap = (uint32_t)sizeof(c->app_tx_buff);
+    uint32_t cap = c->app_tx_cap;   // ①-38：容量取自字段（值不变 ✓）
     // 表里已经排着窗口那么多"已成帧、未确认"的帧时，这一轮不再往下喂：tick 的发送循环只从表头看
     // cwnd 个条目，喂得更长只会让表尾那些帧既发不出去、也等不到超时，wait_snd 于是只涨不落、应用被
     // 判满（真机 lo 实测：wait_snd 264->279->401，吞吐 16.8->7.4MB/s）。留在应用队列里的消息下一轮
@@ -2471,7 +2505,11 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
             FFRDPCONN *cc;
             // 服务端从第一个收到的包学会对端（旧版是在收包循环里做同一件事）。
             // 走握手的连接不在这里学：它的对端在收 SYN 建连接时就定了 ✓，FLAG_CONNECTED 在收到 ACK 时置 ✓。
-            if (ffrdp->is_server && !ffrdp->hs_enable && (c->flags & FLAG_CONNECTED) == 0) {
+            if (c && ffrdp->is_server && !ffrdp->hs_enable && (c->flags & FLAG_CONNECTED) == 0) {
+                // ①-38：握手关掉时服务端要靠这条内嵌主连接承接数据 ⇒ **这时**才分配它的缓冲 ✓
+                if (ffrdp_conn_bufs(c) != 0) c = NULL;   // 分配失败 ⇒ 当没有连接（下面记孤儿帧 ✓）
+            }
+            if (c && ffrdp->is_server && !ffrdp->hs_enable && (c->flags & FLAG_CONNECTED) == 0) {
                 c->flags |= FLAG_CONNECTED;
                 c->peer_addr = msg->addr;
             }
