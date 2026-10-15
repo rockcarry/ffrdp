@@ -1625,7 +1625,11 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     // keepalive：UP 的连接也要有人来叫醒（否则真 lowlevel 会一直睡到下次有数据 ✗）——
     // 半程探一次（周期跟 idle_ms 走 ⇒ 不会出现"探测周期比超时还长"的自相矛盾组合 ✓）。
     if (c->hs_state == HS_UP) {
-        x = c->tick_last_recv + (uint32_t)(ffrdp->idle_ms / 2);
+        // ⚠️ 2026-10-15（§26.40）：起点要取"最后听到对端"与"最后发 QUERY"里**较晚**的那个 ✓。
+        // 只取前者的话，对端静默之后这条期限**永远落在过去** ✗ ⇒ 被"过期 ⇒ 立刻"那条规则变成 now
+        // ⇒ 每圈都要求"现在" ✗（QUERY 本身是限速的（`tick_send_query` ✓），这条期限却不限速 ✗）
+        // ⇒ 与 tick 里那条 QUERY 判据对齐 ✓。（hs:0 走不到这里：hs_state 不是 HS_UP ✓）
+        x = MAX(c->tick_last_recv, c->tick_send_query) + (uint32_t)(ffrdp->idle_ms / 2);
         if (!due || (int32_t)(x - due) < 0) { due = x; tag = 5; }
     }
     // 查询窗口的期限：**只有真的欠信用时才需要它** ✓。tick 里那条查询分支长在
@@ -1661,7 +1665,20 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         // 路径都不刷新它 ⇒ ack 刚把槽位空出来、该马上补下一帧的那一刻，判据读到的是旧值 ⇒
         // 不叫醒 ⇒ 睡到下面 rate_tick+1000 那条期限上（真机 y-run1：小窗口 lap 最大 1002ms、
         // 两端只剩 32~48 帧/s；大窗口下 limit=128 让旧值几乎永远成立 ⇒ 循环自旋掩盖了它）。
-        if (c->swnd > 0 && (uint32_t)n_sent < limit) { due = now; armed_now = 1; tag = 0; }
+        // 2026-10-15（§26.39/§26.40）：**对端还在回话吗** ✓ —— 上面那三个条件（应用队列非空 ✓、
+        // 对端窗口 > 0 ✓、在途没到限 ✓）**全是本端的状态** ✗：对端一消失，它们就停在最后一次好日子里
+        //（收尾期实测：应用队列还压着 56 KB 没人清 ✓、`swnd` 停在 129 ✓、在途才 14 ✓）⇒ 每圈判
+        //"现在就有活" ⇒ arm now ⇒ 回环 258k 圈/s ✗（§26.39 ✓）。所以这里要求"最近还在收到对端的 ack"✓：
+        // 超过 `idle_ms / 2` 没收到 ⇒ 不再要"现在" ✓，收尾交给 keepalive / RTO 那些期限 ✓
+        //（`idle_ms/2` 正是 keepalive 发 QUERY 的时刻 ✓，语义一致 ✓）。
+        // 判据用 `tick_recv_ack`（ack 到达时刷新 ✓，**两种 hs 模式都有效** ✓）—— 不用 `tick_last_recv` ✗：
+        // 它只在 `hs_enable` 时刷新 ✓，老路径（hs:0 / v1 互通 ✓）会被误判成"静默" ✗。
+        // 还没收到过任何 ack（0 ✓）⇒ 当作"活着" ✓（起手阶段必须能要求"现在" ✓）。
+        {   uint32_t now_a = get_timestamp32_ms();
+            int quiet = (c->tick_recv_ack != 0) && (ffrdp->idle_ms > 0) &&
+                        ((int32_t)(now_a - c->tick_recv_ack) > (int32_t)(ffrdp->idle_ms / 2));
+            if (!quiet && c->swnd > 0 && (uint32_t)n_sent < limit) { due = now; armed_now = 1; tag = 0; }
+        }
     }
     // ⚠️ tick 判"到期要重传"用的是 `now - tick_timeout > 0`（**严格**大于 ✓）⇒ tick_timeout 恰好等于
     //    now 的帧，这一圈不会被重传 ✗。若把它当"现在"叫醒，就是在**同一个冻结的 tick 里**空转 ✓
