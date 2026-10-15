@@ -2320,10 +2320,18 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
 
     // 从未通信过的槽（服务端表里的内嵌主连接就是典型 ✓）只打一行：它的每一项都是 0 ✓，
     // 打满一百多行只会把真正在跑的那一条挤得看不见 ✗。
+    // ⚠️ 2026-10-15（①-7）：这道门原来只看"**没传过用户数据**"✗ —— 可这种槽**照样每圈被
+    //    ffrdp_tick_conn 跑一遍** ✓：它的 counter_upd_cnt / 期限分档 / 每圈产出 全都在涨 ✓，
+    //    却被这一行整块挡住 ✗。真机 + 回环实测（低层 fire 98.9 万 ✗，而被 dump 的那条连接
+    //    只跑了 4.8 万 ✓）⇒ 差的那 94 万就落在这种"看起来空闲"的槽上 ⇒ **账被这行挡住了** ✗。
+    //    所以"空闲"必须在**工作计数**上也为零 ✓ —— 只要它跑过圈、或期限模型给过任何一档，
+    //    就必须打全块 ✓。
     if (c->hs_state == 0 && !(c->flags & FLAG_CONNECTED) &&
         c->send_seq == 0 && c->recv_seq == 0 &&
-        c->counter_send_bytes == 0 && c->counter_recv_bytes == 0) {
-        printf("\n---- conn %d   %s   idle: never talked about (only this line) ----\n", handle, addr);
+        c->counter_send_bytes == 0 && c->counter_recv_bytes == 0 &&
+        c->counter_upd_cnt == 0 && c->counter_due_now_ack == 0 &&
+        c->counter_due_now_work == 0 && c->counter_due_now_stale == 0 && c->counter_due_future == 0) {
+        printf("\n---- conn %d   %s   idle: never talked about AND ran no lap (only this line) ----\n", handle, addr);
         goto done;
     }
 
