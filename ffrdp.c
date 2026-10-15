@@ -412,6 +412,10 @@ typedef struct {
     uint32_t counter_ssth_floor;  // ssthresh 被算到下限（1）的次数：此后只能 +1/ACK 爬
     // 2026-10-15（lo 调查 ①-2）：lowlevel 报"worker 空转"（期限=现在 ✗）时，协议这边到底
     // 把期限设成了什么。三种"要求现在"里，只有第三种是纯粹的空转 ✗：
+    uint32_t counter_now_src[8];  // 只读（§26.38 ①-19）：**出口口径** —— next_due 返回值 <= now 时按源记 ✓
+                                  // 为什么缺：①-2 只记了"stale（把过期的改写成 now）"那一种 ✗ ⇒
+                                  // 收尾期那 1.25M 次 `<=now` 的 arm 找不到源 ✗（①-18 把矛盾压到了
+                                  // "tick 之前 vs tick 之后"两次 next_due 之间 ✓ ⇒ 这里两端都记 ✓）。
     uint32_t counter_due_now_ack;    // ① 欠着对端一个 ack ⇒ 这一刻就该回（合法 ✓）
     uint32_t counter_due_now_work;   // ② 真有活可干（有队可发/有帧可首发 ✓）
     uint32_t counter_due_now_stale;  // ③ **没活可干却要求"现在"** ✗ ⇒ 这一项就是自旋来源
@@ -512,6 +516,17 @@ typedef struct {
     uint32_t   cb_other_calls;    // 其他类型 ✓
     uint32_t   cb_nconn_zero;     // 入口时 nconn==0 ✗（那一段循环体一次都不跑 ✓）
     uint32_t   cb_nconn_sum;      // 入口时 nconn 之和 ✓（配 timer_calls 看平均几条 ✓）
+    // 2026-10-15（§26.38 ①-18）：**中间那一跳**的账 ✓。为什么缺：每连接的 due 有账（①-2 / ①-3 ✓）、
+    // 低层收到的 arm 值也有账（①-17 ✓），唯独"`ffrdp_arm_timer` 取 min 之后到底是多少、是哪条连接
+    // 赢的"**没有账** ✗ ⇒ 收尾期那 17 万次/s 的 `≤now` arm（①-17 ✓）就卡在这一跳上 ✗。
+    uint32_t   arm_calls;         // arm_timer 被调用的次数（应 ≈ TIMER 回调数 ✓）
+    uint32_t   arm_d0;            // 算出的 due == 0（没有期限 ✓）
+    uint32_t   arm_dnow;          // due <= now（真的要求"现在" ✗）
+    uint32_t   arm_dnear;         // now+1..4
+    uint32_t   arm_dfar;          // > now+4
+    uint32_t   arm_win[FFRDP_MAXCONN];   // 是哪条连接的 x 赢了（赢家就是"要现在"的那条 ✗）
+    uint32_t   arm_ack_win;       // ACK_DUE 覆盖赢的次数 ✓
+    int        arm_samp;          // 只读（①-20）：收尾态采样打印的条数（8 条够用 ✓）
     uint32_t   tick_ffrdp_init;   // tick of ffrdp_init, for the elapsed time in the dump
     FFRDPCONN  conn;   // P1：内嵌的主连接（第一步的表 0 号就指向它 ⇒ 内存/行为与 P1 一致 ✓）
 
@@ -1666,6 +1681,9 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         if (armed_now) c->counter_due_now_work++;
         else { c->counter_due_now_stale++; c->counter_stale_src[tag < 0 || tag > 7 ? 0 : tag]++; }
     } else if (due) c->counter_due_future++;
+    // 只读（①-19）：出口口径 —— 返回值是"立刻"就记一次源（tag: 1 frame / 2 flush / 3 rate /
+    // 4 hs / 5 keepalive / 6 query / 7 probe / 0 其它=应用有活 ✓）⇒ 收尾期是谁在要"现在" ✓
+    if (due && (int32_t)(due - now) <= 0) c->counter_now_src[tag < 0 || tag > 7 ? 0 : tag]++;
     if (due && (int32_t)(due - now) <= 2) c->counter_arm_le2ms++;    // 只读（①-3）
     return due;
 }
@@ -1674,7 +1692,7 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 static void ffrdp_arm_timer(FFRDPCONTEXT *ffrdp)
 {
     uint32_t due = 0;
-    int      i;
+    int      i, win = -1;
     if (!ffrdp->lowlevel) return;
     // 取所有连接里最早的那个期限（只有一条连接时与 P4 之前逐字等价 ✓）。
     // 顺带：欠着对端 ack 的那条连接 = 这一刻就该做 ⇒ 它直接要求"现在"。
@@ -1683,8 +1701,32 @@ static void ffrdp_arm_timer(FFRDPCONTEXT *ffrdp)
         uint32_t   x;
         if (!c) continue;
         x = ffrdp_next_due(ffrdp, c);
-        if (c->flags & FLAG_ACK_DUE) { x = get_timestamp32_ms(); c->counter_due_now_ack++; }
-        if (!due || (int32_t)(x - due) < 0) due = x;
+        if (c->flags & FLAG_ACK_DUE) { x = get_timestamp32_ms(); c->counter_due_now_ack++; ffrdp->arm_ack_win++; }
+        if (!due || (int32_t)(x - due) < 0) { due = x; win = i; }
+    }
+    // 只读（§26.38 ①-18）：取 min 之后的那一跳 —— 分档 + 赢家 ✓（不改行为 ✗）
+    ffrdp->arm_calls++;
+    {   int32_t left = (int32_t)(due - get_timestamp32_ms());
+        if      (!due)       ffrdp->arm_d0++;
+        else if (left <= 0)  ffrdp->arm_dnow++;
+        else if (left <= 4)  ffrdp->arm_dnear++;
+        else                 ffrdp->arm_dfar++;
+    }
+    if (win >= 0 && win < FFRDP_MAXCONN) ffrdp->arm_win[win]++;
+    // 只读（①-20）：**只**在"收尾态"（nconn>1 且 1 号槽已空 ✓）采样 8 条原始值 ⇒ 指名那一跳 ✓
+    //（①-18/①-19 已把矛盾压到"arm_timer 的 due 与任何连接的 next_due 都不一致"✗ ⇒ 直接把值打出来 ✓）
+    if (ffrdp->arm_samp < 16 && win == 1 && due && (int32_t)(due - get_timestamp32_ms()) <= 0 &&
+        ffrdp->table[1] && (int32_t)(get_timestamp32_ms() - ffrdp->table[1]->tick_recv_ack) > 1000) {
+        // ①-20b：**1 号槽赢 + due <= now** ⇒ 那 1.26M 次 `<=now` 到底是谁要的 ✓（把原始值打出来 ✓）
+        FFRDPCONN *w1 = ffrdp->table[1];
+        printf("<3> arm_timer: win slot 1, due %d ms, hs %d, swnd %u, app_tx %u, wait_snd %u, "
+               "send_list %s, cwnd %u, inflight %u, ack_due %d\n",
+               (int)((int32_t)due - (int32_t)get_timestamp32_ms()), w1 ? (int)w1->hs_state : -1,
+               w1 ? w1->swnd : 0, w1 ? w1->app_tx_size : 0, w1 ? w1->wait_snd : 0,
+               (w1 && w1->send_list_head) ? "yes" : "no", w1 ? w1->cwnd : 0, w1 ? w1->inflight_used : 0,
+               w1 ? (int)(w1->flags & FLAG_ACK_DUE) : 0);
+        fflush(stdout);
+        ffrdp->arm_samp++;
     }
     ffrdp->lowlevel->timer(ffrdp->lowlevel, due);
 }
@@ -2465,6 +2507,9 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("ssthresh floor hits : %u (cwnd already at the floor, still recomputed => +1/ACK from here)\n", c->counter_ssth_floor);
     printf("due-now sources     : ack %u, work %u, STALE %u (stale = asks for \"now\" with nothing to do); future %u\n",
            c->counter_due_now_ack, c->counter_due_now_work, c->counter_due_now_stale, c->counter_due_future);
+    printf("now by source       : frame %u, flush %u, rate %u, hs %u, keepalive %u, query %u, probe %u, other %u\n",
+           c->counter_now_src[1], c->counter_now_src[2], c->counter_now_src[3], c->counter_now_src[4],
+           c->counter_now_src[5], c->counter_now_src[6], c->counter_now_src[7], c->counter_now_src[0]);
     printf("stale by source     : frame %u, flush %u, rate %u, hs %u, keepalive %u, query %u, probe %u, other %u\n",
            c->counter_stale_src[1], c->counter_stale_src[2], c->counter_stale_src[3], c->counter_stale_src[4],
            c->counter_stale_src[5], c->counter_stale_src[6], c->counter_stale_src[7], c->counter_stale_src[0]);
@@ -2662,6 +2707,14 @@ void ffrdp_dump(void *ctxt, int conn, int clearhistory)
     if (conn < 0) printf("---- lowlevel callbacks into protocol: timer %u, data %u, other %u | entry nconn==0: %u, sum %u ----\n",
                           ffrdp->cb_timer_calls, ffrdp->cb_data_calls, ffrdp->cb_other_calls,
                           ffrdp->cb_nconn_zero, ffrdp->cb_nconn_sum);
+    // ①-18：arm_timer 取 min 之后的 due 分档 + 赢家（把"每连接 due"与"低层收到值"中间那一跳补上 ✓）
+    if (conn < 0) {
+        int w;
+        printf("---- arm_timer due: calls %u, zero %u, <=now %u, now+1..4 %u, >now+4 %u | winner slots:",
+               ffrdp->arm_calls, ffrdp->arm_d0, ffrdp->arm_dnow, ffrdp->arm_dnear, ffrdp->arm_dfar);
+        for (w = 0; w < FFRDP_MAXCONN; w++) if (ffrdp->arm_win[w]) printf(" %d=%u", w, ffrdp->arm_win[w]);
+        printf(" | ack-override %u ----\n", ffrdp->arm_ack_win);
+    }
     ffrdp_dump_locked(ffrdp, conn, clearhistory);
     pthread_mutex_unlock(&ffrdp->lock);
 }
