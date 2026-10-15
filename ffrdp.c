@@ -1671,13 +1671,16 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     c->counter_upd_cnt++;
     {   // 只读（①-5）：结算**上一圈**的产出 —— 模型说"现在有活"时，它到底发出去了几帧 ✗
         uint32_t s_now = c->counter_send_1sttime + c->counter_resend_rto + c->counter_resend_fast;
-        if (c->lap_sent_ref) {
+        // ⚠️ 2026-10-15 修：原来拿 1 当 0 的哨兵（`s_now ? s_now : 1` ✗）⇒ 对**一帧都没发过的
+        //    内嵌槽**（服务端 0 号 ✓）会无符号下溢 ✗ ⇒ 它那行被打成 ">=2 帧"（真机实测过 ✓）。
+        //    现在：0 = 这个连接还没发过任何帧 ✓ ⇒ 两侧都非零才算一圈 ✓（丢掉第一圈，可忽略 ✓）。
+        if (s_now && c->lap_sent_ref) {
             uint32_t d = s_now - c->lap_sent_ref;
             if (d == 0)      c->counter_lap_sent0++;
             else if (d == 1) c->counter_lap_sent1++;
             else             c->counter_lap_sentN++;
         }
-        c->lap_sent_ref = s_now ? s_now : 1;   // 0 留给哨兵 ✓
+        c->lap_sent_ref = s_now;
     }
     if (c->tick_last_upd) {
         uint32_t gap = get_timestamp32_ms() - c->tick_last_upd;
