@@ -346,6 +346,11 @@ typedef struct {
     uint32_t counter_drain_block; // drain 因 wait_snd >= MAX_CWND_SIZE 而少喂一轮的 tick 数
     uint32_t counter_cwnd_back;   // cwnd 被 RTO/快速重传打回的次数（乱序误判的直接证据）
     uint32_t counter_cwnd_sfail;  // ... 被"内核没收下这一包"打回的次数（发送缓冲压力）
+    // 2026-10-15（B 案前置）：cwnd 已经塌在下限时再挨一刀，`ssthresh = MAX(cwnd/2, MIN)` 会把它
+    // 算成 1 ✗ ⇒ `cwnd < ssthresh` 永远不成立 ⇒ 慢启动那一档用不上，此后只剩 +1/ACK 一档。真机
+    // dump 里 cwnd<=2 的档位 14/277（≈5%，几乎都在 server 侧 ✓）⇒ 现象确实在发生 ✓；但它"贵不贵"
+    // 要看爬回去多久（t_cwnd 量这个 ✓）⇒ 这里先只计数，一个字节的行为都不动 ✓。
+    uint32_t counter_ssth_floor;  // ssthresh 被算到下限（1）的次数：此后只能 +1/ACK 爬
     // 2026-10-12 真机 n_*.log：33~55 次/秒的伪超时（resend_waste 99.7~100%），每次都把 cwnd
     // 打到 MIN。要修就得先知道它属于哪一种：等待期间一个 ack 都没到（ack 路径停摆/ack 丢了），
     // 还是收到过 ack 却没覆盖这一帧（洞上方的帧无法被确认，只能等洞补上）。纯计数，不改行为。
@@ -713,9 +718,9 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
     // 主连接（P4）：单连接阶段协议只跑在它上面；多连接按地址分发是下一步。
     FFRDPCONN *c = &ffrdp->conn;
     ffrdp_conn_init(c, smss, sfec);
-    ffrdp->tick_ffrdp_dump  = get_timestamp32_ms();
-    ffrdp->tick_ffrdp_init  = ffrdp->tick_ffrdp_dump;
-    c->tick_rto_backoff     = ffrdp->tick_ffrdp_dump - c->rto; // allow the first timeout to backoff
+    ffrdp->tick_ffrdp_dump = get_timestamp32_ms();
+    ffrdp->tick_ffrdp_init = ffrdp->tick_ffrdp_dump;
+    c->tick_rto_backoff    = ffrdp->tick_ffrdp_dump - c->rto; // allow the first timeout to backoff
     // 应用队列（app_tx_buff）是结构体里的静态环形：容量是 FFRDP_APP_TX_SIZE 常量，不用分配，
     // 也就不需要在这里初始化（结构体是 calloc 来的，head/tail/size 全 0 = 空队列）。
 
@@ -785,8 +790,8 @@ void ffrdp_exit(void *ctxt)
     FFRDPCONN      *c;
     FFRDP_LOWLEVEL *ll;
     int             i;
-    if (!ctxt) return;                       // 判空**必须**在最前：下面每句都要用 ctxt ✓
-    c = &ffrdp->conn;                        // 主连接（内嵌 ✓，由末尾那几行负责 ✓）
+    if (!ctxt) return;  // 判空**必须**在最前：下面每句都要用 ctxt ✓
+    c = &ffrdp->conn;   // 主连接（内嵌 ✓，由末尾那几行负责 ✓）
     // 顺序是有讲究的：先让等待中的应用线程醒过来（它们看到 closing 就返回），再停工作线程。反过来的话，
     // 一个卡在 cond 上的应用线程会等一个再也不会有人推进的队列，而 exit 又 join 工作线程 —— 两边互等。
     // exit 必须在锁外调用：它要 join 的正是那个每次回调都要拿这把锁的线程。
@@ -1164,11 +1169,13 @@ static void ffrdp_congestion_control(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int even
         c->counter_cwnd_back++;
         c->ssthresh = MAX(c->cwnd / 2, FFRDP_MIN_CWND_SIZE);
         c->cwnd     = FFRDP_MIN_CWND_SIZE;
+        if (c->ssthresh == FFRDP_MIN_CWND_SIZE) c->counter_ssth_floor++;   // 由已塌的 cwnd 推出 ⇒ 只剩 +1/ACK ✗
         break;
     case CEVENT_SEND_FAILED:
         c->counter_cwnd_sfail++;
         c->ssthresh = MAX(c->cwnd / 2, FFRDP_MIN_CWND_SIZE);
         c->cwnd     = FFRDP_MIN_CWND_SIZE;
+        if (c->ssthresh == FFRDP_MIN_CWND_SIZE) c->counter_ssth_floor++;   // 由已塌的 cwnd 推出 ⇒ 只剩 +1/ACK ✗
         break;
     case CEVENT_ACK_TIMEOUT_MISSED:
         // 伪超时：等待期间 ack 到过（只是没覆盖这一帧）⇒ **链路没丢，是估计器没看见** ⇒ 降半就够 ✓
@@ -1179,6 +1186,7 @@ static void ffrdp_congestion_control(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int even
         c->counter_cwnd_back++;
         c->ssthresh = MAX(c->cwnd / 2, FFRDP_MIN_CWND_SIZE);
         c->cwnd     = c->ssthresh;
+        if (c->ssthresh == FFRDP_MIN_CWND_SIZE) c->counter_ssth_floor++;   // 同上（快速重传/伪超时这一档 ✓）
         break;
     }
 }
@@ -2242,6 +2250,7 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("swnd, cwnd, ssthresh: %u, %u, %u\n", c->swnd, c->cwnd, c->ssthresh);
     // 三个判据一行打完：drain 早退（它随窗口宏缩放，之前没有计数器）、cwnd 被乱序误判打回、
     // 以及被内核丢包/缓冲压力打回。计数是累计的（测试驱动的 dump 传 clearhistory=0），看增量。
+    printf("ssthresh floor hits : %u (cwnd 已在下限仍被重算 ⇒ 此后只按 +1/ACK 爬)\n", c->counter_ssth_floor);
     printf("drain-block/backdrop: %u ticks (drain held), cwnd back %u (rto/fast) + %u (send fail)\n",
            c->counter_drain_block, c->counter_cwnd_back, c->counter_cwnd_sfail);
     printf("timeout diag        : no-ack-arrived %u, acks-arrived-but-missed %u, max wait %u ms\n",

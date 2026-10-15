@@ -100,7 +100,7 @@ gcc -O1 -w $HAVE_B -DSIMLL_BASE -c simll.c -o simll_base.o
 # utils.c lives one level up (run.sh works from tools/sim).
 # -I../..: the copy sits here, so its quoted includes ("utils.h") need the repo root on the path.
 gcc -O1 -w -I../.. -c utils_sim.c -o utils.o
-TESTS="${TESTS:-t_rto t_pseudo t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_keepalive t_init t_dump t_fec hs-e2e e2e-raw e2e}"
+TESTS="${TESTS:-t_rto t_pseudo t_cwnd t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_keepalive t_init t_dump t_fec hs-e2e e2e-raw e2e}"
 
 # 每一侧的输出同时进终端与一份日志：末尾的"判定汇总"从日志里读，免得靠人眼看统计数字。
 # 统计行（resend%、rto_floor、ooo 直方图……）随负载与旋钮变化，不是判据。
@@ -119,6 +119,7 @@ for t in $TESTS; do
         grep -q counter_recv_ooo ffrdp_$v.c && EXTRA="$EXTRA -DRECV_OOO"
         grep -q counter_recv_dup ffrdp_$v.c && EXTRA="$EXTRA -DDUP_REPORT"
           grep -q counter_to_hadack ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_TO_DIAG"
+        grep -q counter_ssth_floor ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_SSTH_FLOOR"
         grep -q counter_rto_spurious ffrdp_$v.c && EXTRA="$EXTRA -DSPUR"
         grep -q 'uint32_t rmss, smss, swnd, inflight' ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_INFLIGHT"
         grep -q counter_ooo_d1_24 ffrdp_$v.c && EXTRA="$EXTRA -DOOO_HIST"
@@ -160,6 +161,12 @@ for t in $TESTS; do
         echo "===== t_pseudo: 迟到的 ack 与拥塞判断 ====="
         echo "-- HEAD --" | tee -a "$SIMLOG"; run $RUN ./t_pseudo_base
         echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_pseudo_new ;;
+    t_cwnd)
+        # 塌陷恢复代价：ssthresh 被"已经塌掉的 cwnd"重算，值不值（两侧并排看 ✓）
+        echo
+        echo "===== t_cwnd: 塌陷之后的恢复代价 ====="
+        echo "-- HEAD --" | tee -a "$SIMLOG"; run $RUN ./t_cwnd_base
+        echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_cwnd_new ;;
     t_ack)
         echo
         echo "===== t_ack: ack diagnostics ====="
