@@ -61,8 +61,16 @@ typedef struct {
     uint32_t        stat_rx_fail;     // recvfrom <= 0 的次数（这些圈一个包都没读到 ✗）
     // 追加②：谁把期限 arm 成"已经到点"（<= now ✓）—— 这是上面那批 deadline 空圈的直接来源 ✗。
     // 分两类：跨线程（应用线程 send 后催一下 ✓）与循环内（协议 tick 返回下一个期限 ✓）。
-    uint32_t        stat_arm_now_other;  // 跨线程 arm 成 <= now 的次数
-    uint32_t        stat_arm_now_loop;   // 从循环自己线程 arm 成 <= now 的次数
+    uint32_t        stat_arm_now_other;  // 跨线程 arm 成 <= now 的次数（①-17 起：**不含** 0 ✓）
+    uint32_t        stat_arm_now_loop;   // 从循环自己线程 arm 成 <= now 的次数（同上 ✓）
+    // 2026-10-15（§26.37 ①-17）：arm 值分档 ✓。为什么缺这个数：收尾那 5 s 里 `arm-now from the
+    // loop` 1.32M ✗ 与同一份 dump 里 conn0 自己的 `due` 是"远"（1.33M ✓）**互相矛盾** ✗ ⇒ 而
+    // ①-2 那条判据 `(int32_t)(deadline_ms - now) <= 0` 会把 **0（= "无期限"的哨兵 ✓）也算成
+    // "要求现在"** ✗ —— 这就是矛盾的来源候选 ⇒ 必须把 0 单独分出来 ✓。
+    uint32_t        stat_arm_d0;         // arm 值 == 0（没有期限 ✓；不是"现在" ✗）
+    uint32_t        stat_arm_dnow;       // <= now（真的要求"现在" ✗）
+    uint32_t        stat_arm_dnear;      // now+1..4
+    uint32_t        stat_arm_dfar;       // > now+4
     int             stat_rx_errno;       // 第一次失败的 errno（0 = 还没失败过 ✓）
     // 追加③（①-4）：把"空圈"再往下一层拆 ✓ —— 协议侧四个桶对不上总圈数（真机 2026-10-15：
     // 服务端 laps 695849 vs 桶和 248908 ✗，有 ~45 万圈在协议账上根本不存在 ✗）⇒ 肇事者不在
@@ -243,8 +251,13 @@ static int ffrdp_udp_lowlevel_timer(void *fl, uint32_t deadline_ms)
     {   // 只读记账（①）："arm 成已到点"分两类 ✓
         int from_loop = (udp->mthread.hthread && udp->mthread.hthread == (void*)pthread_self());
         uint64_t t_arm0 = ffrdp_udp_us();                                  // 只读（④-13）：arm/wake 自己值多少 ✓
-        if ((int32_t)(deadline_ms - get_timestamp32_ms()) <= 0) {
-            if (from_loop) udp->stat_arm_now_loop++; else udp->stat_arm_now_other++;
+        // 只读（①-17）：分档 —— 0 是"没有期限"的哨兵，**不是**"现在" ✓（①-2 原来把它算进去 ✗）
+        {   int32_t left = (int32_t)(deadline_ms - get_timestamp32_ms());
+            if      (!deadline_ms)  udp->stat_arm_d0++;
+            else if (left <= 0)   { udp->stat_arm_dnow++;
+                                    if (from_loop) udp->stat_arm_now_loop++; else udp->stat_arm_now_other++; }
+            else if (left <= 4)     udp->stat_arm_dnear++;
+            else                    udp->stat_arm_dfar++;
         }
         if (wake && !from_loop) ffrdp_udp_notify(udp);
         {   uint32_t d_arm = (uint32_t)(ffrdp_udp_us() - t_arm0);
@@ -409,8 +422,11 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
            udp->stat_lap, udp->stat_lap_frame, udp->stat_lap_notify, udp->stat_lap_timeout,
            udp->stat_lap - udp->stat_lap_frame, udp->stat_rx_frames,
            udp->stat_rx_fail, udp->stat_rx_errno);
-    printf("udp lowlevel arm-now: %u from other threads, %u from the loop itself\n",
+    printf("udp lowlevel arm-now: %u from other threads, %u from the loop itself (only true '<=now' arms; the zero sentinel is out)\n",
            udp->stat_arm_now_other, udp->stat_arm_now_loop);
+    // ①-17：arm 值分档 —— zero 那一档就是"没有期限"（被 ①-2 误算成"现在"的那一批 ✗）
+    printf("udp lowlevel arm value: zero %u, <=now %u, now+1..4 %u, >now+4 %u\n",
+           udp->stat_arm_d0, udp->stat_arm_dnow, udp->stat_arm_dnear, udp->stat_arm_dfar);
     // ①-4：空圈往下一层拆 —— 睡下时的 left 分布 + tick 三分类 ✓
     printf("udp lowlevel sleep-left: expired %u, 0ms %u, 1-9ms %u, >=10ms %u, no-deadline %u\n",
            udp->stat_left_le0, udp->stat_left_0, udp->stat_left_1_9, udp->stat_left_ge10, udp->stat_sleep_none);
