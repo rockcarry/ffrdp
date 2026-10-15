@@ -1209,6 +1209,23 @@ static uint64_t ffrdp_us(void)
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
 }
 
+// ══ ①-25（本轮实验 ✓）：ack 的**时机**旋钮 ═══════════════════════════════════════════
+// 默认 0 = 保持现状：收到帧就在 RECV 回调里**当场回** ack（注释里写明这是为省一整圈 RTT ✓）。
+// 打开 FFRDP_ACK_COALESCE=1 ⇒ 退回"**一圈一个** ack"：只置 FLAG_ACK_DUE ✓，由 TIMER 那一支
+// 统一发（`ffrdp_apply_acks` 的注释本来就是这么写的："真正发出去的地方是 ffrdp_tick_conn ——
+// 与搬走之前'一次 update 一个 ack'同形" ✓）—— 那正是 v1.1 的形状 ✓。
+// 为什么要这个旋钮：lowlevel-udp.c 文件头那张表（批 6 → 19.1 MB/s、批 64 → 10.3 MB/s ✗）把
+// "批上限"与"ack 节奏"绑在一起 ✓ ⇒ 只动一个量不出因果 ✗，必须两个一起扫 ✓。
+static int g_ack_coalesce = -1;
+static int ffrdp_ack_coalesce(void)
+{
+    if (g_ack_coalesce < 0) {
+        const char *e = getenv("FFRDP_ACK_COALESCE");
+        g_ack_coalesce = (e && *e && atoi(e)) ? 1 : 0;
+    }
+    return g_ack_coalesce;
+}
+
 static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 {
     FFRDP_FRAME_NODE *p;
@@ -2346,7 +2363,7 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
                     // 收到帧就当场回 ack，别等下一圈 TIMER（以前那一步要花掉整整一圈，lap 平均 2~3ms），
                     // 对端看到的 RTT 里就含着我们这一圈。顺带把"收到帧→已交给内核"的耗时记下来：
                     // 服务端比老架构多等的那 5~7ms 若不在这一段，就一定在内核/驱动出队之后。
-                    if (cc->flags & FLAG_ACK_DUE) {
+                    if (!ffrdp_ack_coalesce() && (cc->flags & FLAG_ACK_DUE)) {   // ①-25：关掉就是留到 TIMER 那一支 ✓
                         cc->flags &= ~FLAG_ACK_DUE;
                         cc->counter_ack_ondata++;                 // 只读（④-14）：收到帧当场回的那一支 ✓
                         ffrdp_recvdata_and_sendack(ffrdp, cc);
@@ -2708,6 +2725,8 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
            c->counter_fire_ackonly, c->counter_fire_tick);
     printf("timer due given     : zero %u, <=now %u, now+1..4 %u, >now+4 %u (the '<=now' one asks to go now)\n",
            c->counter_fire_d0, c->counter_fire_dnow, c->counter_fire_dnear, c->counter_fire_dfar);
+    printf("ack mode            : %s (env FFRDP_ACK_COALESCE=%d; 0 = per-frame on receive, 1 = one per lap)\n",
+           ffrdp_ack_coalesce() ? "coalesced (one per lap)" : "immediate (on receive)", ffrdp_ack_coalesce());
     printf("counter_txfull      : %u\n"  , c->counter_txfull      );
     printf("counter_txshort     : %u\n"  , c->counter_txshort     );
     printf("counter_rxfull      : %u\n"  , c->counter_rxfull      );

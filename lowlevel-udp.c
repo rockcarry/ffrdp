@@ -71,6 +71,9 @@ typedef struct {
     uint32_t        stat_arm_dnow;       // <= now（真的要求"现在" ✗）
     uint32_t        stat_arm_dnear;      // now+1..4
     uint32_t        stat_arm_dfar;       // > now+4
+    // ①-25（本轮实验 ✓）：RX 批上限从宏改成**运行时可调**（env FFRDP_RX_BATCH ✓，默认仍是
+    // FFRDP_LOWLEVEL_RX_BATCH_MAX=2 ✓ —— 那个值是文件头那张实测表选出来的 ✓）。
+    int             rx_batch;             // 一圈最多收几帧（默认 2 ✓）
     int             stat_rx_errno;       // 第一次失败的 errno（0 = 还没失败过 ✓）
     // 追加③（①-4）：把"空圈"再往下一层拆 ✓ —— 协议侧四个桶对不上总圈数（真机 2026-10-15：
     // 服务端 laps 695849 vs 桶和 248908 ✗，有 ~45 万圈在协议账上根本不存在 ✗）⇒ 肇事者不在
@@ -350,7 +353,7 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
             // 而一圈只收一帧就等于一帧一个 ack，实测（差分仿真）是攒批行为的 6.7 倍。上限是给定了的：
             // 一个不停把 socket 灌满的发送方不该把下面的定时工作（重传、探测、速率采样）饿住。
             int frames = 0;
-            while (frames < FFRDP_LOWLEVEL_RX_BATCH_MAX) {
+            while (frames < udp->rx_batch) {                     // ①-25：运行时上限 ✓
                 uint8_t buf[FFRDP_LOWLEVEL_FRAME_MAX];
                 struct  sockaddr_in from;
                 socklen_t fromlen = sizeof(from);
@@ -387,7 +390,7 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
             // ⚠️ 光数"收满 2 帧就停"**证不出**积压 ✗（可能刚巧就是 2 帧 ✓）⇒ 收满时再问一次
             //    零超时 select ✓：它能读 ⇒ socket 里真的还有货 = 这一圈是被上限截断的 ✓。
             //    不消费任何数据报 ✓（不像再 recvfrom 一次 ✗ —— 那会把下一圈要的帧吃掉 ✓）。
-            if (frames >= FFRDP_LOWLEVEL_RX_BATCH_MAX) {
+            if (frames >= udp->rx_batch) {                       // ①-25 ✓
                 udp->stat_rx_batch_full++;
                 {   fd_set pf; struct timeval z; int pr;
                     FD_ZERO(&pf); FD_SET(udp->sockfd, &pf);
@@ -436,6 +439,8 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
     printf("udp lowlevel rx cost: batch-full %u, of which socket still had data %u, laps with 1 frame %u, with >=2 frames %u, callback %u us total, %u us max\n",
            udp->stat_rx_batch_full, udp->stat_rx_capped_more, udp->stat_lap_rx1, udp->stat_lap_rxmulti,
            udp->stat_cb_us_sum, udp->stat_cb_us_max);
+    printf("udp lowlevel rx batch: %d frames per lap (env FFRDP_RX_BATCH; default = %d)\n",
+           udp->rx_batch, FFRDP_LOWLEVEL_RX_BATCH_MAX);
     printf("udp lowlevel tx      : sendto %u calls, %u bytes (per frame = calls / frames in the ffrdp block)\n",
            udp->stat_tx_calls, udp->stat_tx_bytes);
     // ④-13（§26.30 第 2 步）：一圈的时间去向（采样 1/64 ✓；三段互斥、和 = 整圈 ✓）—— 除以采样圈数就是每圈 ✓
@@ -549,6 +554,11 @@ FFRDP_LOWLEVEL* ffrdp_udp_lowlevel_init(void *params, FFRDP_LOWLEVEL_CB callback
     udp->exit         = ffrdp_udp_lowlevel_exit;
     udp->sockfd       = -1;   // 0 is a valid descriptor, so "no socket yet" cannot be spelled with a zero
     udp->notify       = -1;
+    {   // ①-25：默认 = 宏（2 ✓）；env 可覆盖（1..64 ✓）
+        const char *e = getenv("FFRDP_RX_BATCH");
+        udp->rx_batch = FFRDP_LOWLEVEL_RX_BATCH_MAX;
+        if (e && *e) { int v = atoi(e); if (v >= 1 && v <= 64) udp->rx_batch = v; }
+    }
     udp->callback     = callback;
     udp->cbctx        = cbctx;
     udp->mthread.proc = ffrdp_udp_lowlevel_proc;
