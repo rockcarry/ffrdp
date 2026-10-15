@@ -16,9 +16,10 @@
 #include "simdefs.h"
 #include "../../ffrdp.c"
 
-// 块头前缀：ffrdp.c 打的是四个 U+2500 加 " conn " ✓。写死字节数最容易数错字符 ✗
-// （2026-10-14 就踩过：这里只写了两个 ─ ⇒ 计数恒为 0 ⇒ 三条断言假红 ✗），所以用转义字节 + strstr ✓。
-#define DUMP_HDR "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 conn "
+// 块头前缀：ffrdp.c 打的是四个 ASCII 连字符加 " conn "（2026-10-15 起 dump 全改 ASCII ✓）。
+// 改到这里要同步 ✓：它按 dump 的**文本**数块 ⇒ 前缀一变、计数立刻归零 ⇒ 三条断言假红 ✗
+// （2026-10-14 已经踩过一次同类坑：当时只写了两个 ─ ⇒ 计数恒为 0 ✓）。别写死字节数，用 strstr ✓。
+#define DUMP_HDR "---- conn "
 
 #define MKADDR(port) ((uint64_t)(0x7F000001ULL << 16) | (uint64_t)(port))
 #define A_SRV MKADDR(8001)

@@ -2236,20 +2236,20 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     // —— 服务端那个"从未通信的 0 号内嵌主连接"尤其容易被当成同一台机器的另一个时刻 ✗。
     if (c->peer_addr) {
         ffrdp_addr_split(c->peer_addr, &ip, &port);
-        snprintf(addr, sizeof(addr), "对端 %u.%u.%u.%u:%u",
+        snprintf(addr, sizeof(addr), "peer %u.%u.%u.%u:%u",
                  (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF, (unsigned)port);
-    } else snprintf(addr, sizeof(addr), "对端未指定（还没学到）");
+    } else snprintf(addr, sizeof(addr), "peer not set (not learned yet)");
 
     // 从未通信过的槽（服务端表里的内嵌主连接就是典型 ✓）只打一行：它的每一项都是 0 ✓，
     // 打满一百多行只会把真正在跑的那一条挤得看不见 ✗。
     if (c->hs_state == 0 && !(c->flags & FLAG_CONNECTED) &&
         c->send_seq == 0 && c->recv_seq == 0 &&
         c->counter_send_bytes == 0 && c->counter_recv_bytes == 0) {
-        printf("\n──── conn %d   %s   空闲：从未通信（只打这一行 ✓）────\n", handle, addr);
+        printf("\n---- conn %d   %s   idle: never talked about (only this line) ----\n", handle, addr);
         goto done;
     }
 
-    printf("\n──── conn %d   %s   %s%s ────\n", handle, addr, dump_hs_name(c->hs_state),
+    printf("\n---- conn %d   %s   %s%s ----\n", handle, addr, dump_hs_name(c->hs_state),
            (c->flags & FLAG_CONNECTED) ? "（已连接 ✓）" : "");
     printf("total_send, total_recv: %.2fMB, %.2fMB\n"    , c->counter_send_bytes / (1024.0 * 1024), c->counter_recv_bytes / (1024.0 * 1024));
     // secs 是距上一次 dump 的秒数：刚起来的第一次 dump 可能不足一秒，别拿 0 当除数。
@@ -2265,7 +2265,7 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
            c->rtt_min, dump_u32(c->rtts, b2, (int)sizeof(b2)), c->rttd);
     // elapsed 是"自 init 起"（tick_ffrdp_init ✓）；括号里那个是"自上次清零"（clearhistory=1 时才会推进 ✓）。
     // 旧标签写成 dump interval ✗ —— test.c 传的是 clearhistory=0 ⇒ 两个块里它都一样大，更容易误读 ✓。
-    printf("elapsed             : %d s（自 init 起）/ %d s（自上次清零 ✓）\n", ((int32_t)get_timestamp32_ms() - (int32_t)ffrdp->tick_ffrdp_init) / 1000, secs);
+    printf("elapsed             : %d s (since init) / %d s (since last clear)\n", ((int32_t)get_timestamp32_ms() - (int32_t)ffrdp->tick_ffrdp_init) / 1000, secs);
     printf("recv_size           : %d\n"  , c->recv_size           );
     printf("flags               : %x\n"  , c->flags               );
     printf("send_seq            : %u\n"  , c->send_seq            );
@@ -2275,7 +2275,7 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("swnd, cwnd, ssthresh: %u, %u, %u\n", c->swnd, c->cwnd, c->ssthresh);
     // 三个判据一行打完：drain 早退（它随窗口宏缩放，之前没有计数器）、cwnd 被乱序误判打回、
     // 以及被内核丢包/缓冲压力打回。计数是累计的（测试驱动的 dump 传 clearhistory=0），看增量。
-    printf("ssthresh floor hits : %u (cwnd 已在下限仍被重算 ⇒ 此后只按 +1/ACK 爬)\n", c->counter_ssth_floor);
+    printf("ssthresh floor hits : %u (cwnd already at the floor, still recomputed => +1/ACK from here)\n", c->counter_ssth_floor);
     printf("drain-block/backdrop: %u ticks (drain held), cwnd back %u (rto/fast) + %u (send fail)\n",
            c->counter_drain_block, c->counter_cwnd_back, c->counter_cwnd_sfail);
     printf("timeout diag        : no-ack-arrived %u, acks-arrived-but-missed %u, max wait %u ms\n",
@@ -2398,7 +2398,7 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("counter_ack_dup     : %u\n"  , c->counter_ack_dup     );
     // rtt_tail 是这一版"让 RTO 自己够到延迟尾部"的那个学习量（见 FFRDP_MIN_RTO 的注释）；它应当收敛到
     // 这条链路的确认延迟尾部（真机上是 85~92 ms 那一档），并在链路变好后每秒衰减 1/16。
-    printf("conf waits (ms)     : <=16 %u, <=32 %u, <=64 %u, <=128 %u, <=256 %u, <=512 %u, <=1024 %u, more %u (max %u)\n",
+    printf("confirm-wait hist(ms): <=16 %u, <=32 %u, <=64 %u, <=128 %u, <=256 %u, <=512 %u, <=1024 %u, more %u (max %u)\n",
            c->counter_conf_16, c->counter_conf_32, c->counter_conf_64, c->counter_conf_128,
            c->counter_conf_256, c->counter_conf_512, c->counter_conf_1024, c->counter_conf_more,
            c->counter_conf_max);
@@ -2432,7 +2432,7 @@ void ffrdp_dump(void *ctxt, int conn, int clearhistory)
     // 要打印的全是协议状态，而协议现在跑在工作线程里：拿住同一把锁再读，打印出来的一整套数不会是被
     // 拆散的一半（这正是旧版单线程下不用操心、换线程后必须补上的一件小事）。
     pthread_mutex_lock(&ffrdp->lock);
-    if (conn < 0) printf("%s──── 连接表：%d 个槽，下面每条一块 ✓ ────\n", (ffrdp->nconn > 1 ? "\n" : ""), ffrdp->nconn);
+    if (conn < 0) printf("%s---- connection table: %d slots, one block each below ----\n", (ffrdp->nconn > 1 ? "\n" : ""), ffrdp->nconn);
     ffrdp_dump_locked(ffrdp, conn, clearhistory);
     pthread_mutex_unlock(&ffrdp->lock);
 }
