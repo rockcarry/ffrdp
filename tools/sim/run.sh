@@ -120,6 +120,7 @@ for t in $TESTS; do
         grep -q counter_recv_dup ffrdp_$v.c && EXTRA="$EXTRA -DDUP_REPORT"
           grep -q counter_to_hadack ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_TO_DIAG"
         grep -q counter_ssth_floor ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_SSTH_FLOOR"
+        grep -q counter_conf_max ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_CONF_HIST"
         grep -q counter_rto_spurious ffrdp_$v.c && EXTRA="$EXTRA -DSPUR"
         grep -q 'uint32_t rmss, smss, swnd, inflight' ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_INFLIGHT"
         grep -q counter_ooo_d1_24 ffrdp_$v.c && EXTRA="$EXTRA -DOOO_HIST"

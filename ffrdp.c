@@ -351,6 +351,13 @@ typedef struct {
     // dump 里 cwnd<=2 的档位 14/277（≈5%，几乎都在 server 侧 ✓）⇒ 现象确实在发生 ✓；但它"贵不贵"
     // 要看爬回去多久（t_cwnd 量这个 ✓）⇒ 这里先只计数，一个字节的行为都不动 ✓。
     uint32_t counter_ssth_floor;  // ssthresh 被算到下限（1）的次数：此后只能 +1/ACK 爬
+    // 2026-10-15（A 案收尾）：把"被重传过的帧**最后**被确认时等了多久"（conf = now - tick_send ✓）
+    // 的**原始**分布记下来。为什么缺这个数：rtt_tail 只留了**限速后**的值 ✗、maxwait 只留了
+    // "超时瞬间"的年龄 ✗ ⇒ 两者都分不清"ack 真的迟到"与"洞挡在前面、对端没法确认"✓。
+    // 纯计数：不参与任何判据 ✗、不改控制流 ✗（只读诊断 ✓）。
+    uint32_t counter_conf_16, counter_conf_32, counter_conf_64, counter_conf_128;
+    uint32_t counter_conf_256, counter_conf_512, counter_conf_1024, counter_conf_more;
+    uint32_t counter_conf_max;    // 见过的最大原始 confirm 等待（ms ✓）
     // 2026-10-12 真机 n_*.log：33~55 次/秒的伪超时（resend_waste 99.7~100%），每次都把 cwnd
     // 打到 MIN。要修就得先知道它属于哪一种：等待期间一个 ack 都没到（ack 路径停摆/ack 丢了），
     // 还是收到过 ack 却没覆盖这一帧（洞上方的帧无法被确认，只能等洞补上）。纯计数，不改行为。
@@ -1191,6 +1198,23 @@ static void ffrdp_congestion_control(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int even
     }
 }
 
+// 确认等待的原始分布（纯计数 ✓、不参与任何判据 ✗）：桶 16/32/64/128/256/512/1024ms ✓。
+// 数据来源见下面那个"被重传过的帧"分支：conf = 现在 - p->tick_send ✓（首发到被确认的整段等待 ✓，
+// 里面含 RTO 本身 ✓）。它回答的是"这条链路的确认停顿时长分布长什么样"✓ —— 这正是决定
+// 要不要动 rtt_tail/rto_floor 的那个数 ✗（单看限速后的 rtt_tail 看不出来 ✓）。
+static void ffrdp_conf_hist(FFRDPCONN *c, uint32_t conf)
+{
+    if      (conf <= 16)   c->counter_conf_16++;
+    else if (conf <= 32)   c->counter_conf_32++;
+    else if (conf <= 64)   c->counter_conf_64++;
+    else if (conf <= 128)  c->counter_conf_128++;
+    else if (conf <= 256)  c->counter_conf_256++;
+    else if (conf <= 512)  c->counter_conf_512++;
+    else if (conf <= 1024) c->counter_conf_1024++;
+    else                   c->counter_conf_more++;
+    if (conf > c->counter_conf_max) c->counter_conf_max = conf;
+}
+
 // 把应用队列里的消息取出来成帧。队列是环形的，所以这里不需要 memmove 压实：
 //   1) 先"窥看"4 字节长度前缀（ringbuf_read 会给新 head，丢掉即可 = 只读不推进）；
 //   2) 成帧（ffrdp_frame_message 只读）；
@@ -1417,6 +1441,7 @@ static void ffrdp_apply_acks(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_RX_BATCH *
                     // 真丢包时这个样本 ≈ RTO + RTT（Karn 担心的那个），限速之后它不可能一次把尾部推飞，
                     // 而每秒 1/16 的衰减会把它拉回来 ⇒ 收敛到"这条路径真实的确认延迟尾部"。
                     uint32_t conf  = get_timestamp32_ms() - p->tick_send;
+                    ffrdp_conf_hist(c, conf);   // 只记账 ✓（限速前 ✓，要的就是原始分布 ✓）
                     uint32_t allow = c->rtt_tail ? c->rtt_tail + c->rtt_tail / 2 + 25 : 64;
                     if (allow > (uint32_t)FFRDP_MAX_RTO) allow = (uint32_t)FFRDP_MAX_RTO;
                     if (conf  > allow) conf = allow;
@@ -2373,6 +2398,10 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("counter_ack_dup     : %u\n"  , c->counter_ack_dup     );
     // rtt_tail 是这一版"让 RTO 自己够到延迟尾部"的那个学习量（见 FFRDP_MIN_RTO 的注释）；它应当收敛到
     // 这条链路的确认延迟尾部（真机上是 85~92 ms 那一档），并在链路变好后每秒衰减 1/16。
+    printf("conf waits (ms)     : <=16 %u, <=32 %u, <=64 %u, <=128 %u, <=256 %u, <=512 %u, <=1024 %u, more %u (max %u)\n",
+           c->counter_conf_16, c->counter_conf_32, c->counter_conf_64, c->counter_conf_128,
+           c->counter_conf_256, c->counter_conf_512, c->counter_conf_1024, c->counter_conf_more,
+           c->counter_conf_max);
     printf("rto_floor           : %u, rtt_tail %u ms\n"  , c->rto_floor, c->rtt_tail); // 白费率见上面的 counter_resend_waste（同一个量，不再打两遍）
     printf("counter_rto_behind  : %u\n"  , c->counter_rto_behind  );
     printf("lap period avgmax   : %u, %u ms (%u laps, cost max %u ms)\n",
