@@ -109,7 +109,7 @@
                                       // cap 在 16~64 之间漂、rtts 77~116ms ✗；把 giveback 关掉当对照则稳在
                                       // 4 帧、rtts 9ms ✓✓（算术也对得上：4 帧⇒9ms、16⇒60、32⇒120 ✓）。
                                       // 见 notes §26.18。
-#define FFRDP_PROBE_ENABLE        1
+#define FFRDP_PROBE_ENABLE          1
                                       // —— 把在途砍半，若 rtts 明显下降且确认速率没掉，就保留更小的上限（同吞吐、低延迟）。
                                       // 真机上它曾走过一次"单向棘轮"✗：参考取紧邻的前一秒，第一刀之后参考自己也掉 ⇒
                                       // 每一刀都通过 ⇒ 上限被一路 keep 到地板。现在三处安全网就位：
@@ -462,6 +462,14 @@ typedef struct {
     pthread_cond_t    cond;          // 协议侧腾出空间或送来数据时叫醒应用侧
 
     uint32_t   tick_ffrdp_dump;
+    // 2026-10-15（①-9）：回调入口分档 ✓。为什么缺这个数：回环实测低层 fire 131 万 ✗，
+    // 而表里两条连接的 TIMER 段各只跑了 5.6 万 ✓ ⇒ 多出的 126 万次回调**没有进入**
+    // "按连接遍历"那一段 ✗ ⇒ 只能在这里按类型与入口时的 nconn 分开量 ✓。纯计数 ✓。
+    uint32_t   cb_timer_calls;    // 入口 type==TIMER ✓
+    uint32_t   cb_data_calls;     // 入口 type==RECV ✓
+    uint32_t   cb_other_calls;    // 其他类型 ✓
+    uint32_t   cb_nconn_zero;     // 入口时 nconn==0 ✗（那一段循环体一次都不跑 ✓）
+    uint32_t   cb_nconn_sum;      // 入口时 nconn 之和 ✓（配 timer_calls 看平均几条 ✓）
     uint32_t   tick_ffrdp_init;  // tick of ffrdp_init, for the elapsed time in the dump
     FFRDPCONN  conn;   // P1：内嵌的主连接（第一步的表 0 号就指向它 ⇒ 内存/行为与 P1 一致 ✓）
 
@@ -2126,6 +2134,12 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
     long          ret  = 0;
     if (!ffrdp) return -1;
     pthread_mutex_lock(&ffrdp->lock);
+    // 只读（①-9）：入口分档 —— 放在拿锁之后 ⇒ nconn 读到的是一致值 ✓
+    if (type == FFRDP_LOWLEVEL_TYPE_TIMER)     ffrdp->cb_timer_calls++;
+    else if (type == FFRDP_LOWLEVEL_TYPE_RECV) ffrdp->cb_data_calls++;
+    else                                       ffrdp->cb_other_calls++;
+    ffrdp->cb_nconn_sum += (uint32_t)ffrdp->nconn;
+    if (ffrdp->nconn == 0) ffrdp->cb_nconn_zero++;
     if (ffrdp->closing) { ret = -1; goto out; }
     FFRDPCONN *c = ffrdp->table[0];   // RECV 的处理连接：单连接阶段就是主连接
                                       // （多连接时这里改成"按 msg->addr 查表/建半开连接"）
@@ -2540,6 +2554,10 @@ void ffrdp_dump(void *ctxt, int conn, int clearhistory)
     // 拆散的一半（这正是旧版单线程下不用操心、换线程后必须补上的一件小事）。
     pthread_mutex_lock(&ffrdp->lock);
     if (conn < 0) printf("%s---- connection table: %d slots, one block each below ----\n", (ffrdp->nconn > 1 ? "\n" : ""), ffrdp->nconn);
+    // ①-9：入口分档 —— 与低层 fire 对照 ⇒ 多出的回调是哪种类型 / 是否发生在 nconn==0 时 ✓
+    if (conn < 0) printf("---- lowlevel callbacks into protocol: timer %u, data %u, other %u | entry nconn==0: %u, sum %u ----\n",
+                          ffrdp->cb_timer_calls, ffrdp->cb_data_calls, ffrdp->cb_other_calls,
+                          ffrdp->cb_nconn_zero, ffrdp->cb_nconn_sum);
     ffrdp_dump_locked(ffrdp, conn, clearhistory);
     pthread_mutex_unlock(&ffrdp->lock);
 }
