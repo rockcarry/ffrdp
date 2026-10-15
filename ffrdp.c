@@ -351,6 +351,14 @@ typedef struct {
     // dump 里 cwnd<=2 的档位 14/277（≈5%，几乎都在 server 侧 ✓）⇒ 现象确实在发生 ✓；但它"贵不贵"
     // 要看爬回去多久（t_cwnd 量这个 ✓）⇒ 这里先只计数，一个字节的行为都不动 ✓。
     uint32_t counter_ssth_floor;  // ssthresh 被算到下限（1）的次数：此后只能 +1/ACK 爬
+    // 2026-10-15（lo 调查 ①-2）：lowlevel 报"worker 空转"（期限=现在 ✗）时，协议这边到底
+    // 把期限设成了什么。三种"要求现在"里，只有第三种是纯粹的空转 ✗：
+    uint32_t counter_due_now_ack;    // ① 欠着对端一个 ack ⇒ 这一刻就该回（合法 ✓）
+    uint32_t counter_due_now_work;   // ② 真有活可干（有队可发/有帧可首发 ✓）
+    uint32_t counter_due_now_stale;  // ③ **没活可干却要求"现在"** ✗ ⇒ 这一项就是自旋来源
+    uint32_t counter_due_future;     // 正常：期限落在未来 ✓
+    // STALE 时是哪个期限源赢的（7 个候选按下面的顺序 ✓）；[0] 未分类 ✓
+    uint32_t counter_stale_src[8];
     // 2026-10-15（A 案收尾）：把"被重传过的帧**最后**被确认时等了多久"（conf = now - tick_send ✓）
     // 的**原始**分布记下来。为什么缺这个数：rtt_tail 只留了**限速后**的值 ✗、maxwait 只留了
     // "超时瞬间"的年龄 ✗ ⇒ 两者都分不清"ack 真的迟到"与"洞挡在前面、对端没法确认"✓。
@@ -1475,6 +1483,7 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 {
     const FFRDP_FRAME_NODE *q;
     uint32_t now = get_timestamp32_ms(), due = 0, x;
+    int      tag = 0;                 // 只读（①-2）：当前 due 是哪个源赢的
     int      n_sent = 0;
     int      entry  = 0;              // 表项序号（与 tick 的 i 同坐标系 ✓）
     int      armed_now = 0;           // due 是"立刻就要发东西"（不是某帧的 RTO 到期 ✓）
@@ -1497,30 +1506,39 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         //     叫醒了、没人干活、期限又停在 now ⇒ 自旋 ✓（实测：cwnd=1 时表头没到期、后面那帧过期，
         //     忠实模型一个 tick 里转 60 万次 ✓）。
         //     n_sent 仍然按**全表**数 ✓：它的语义是"在途帧数"，和可见窗口是两件事 ✓。
-        if (entry < (int)c->cwnd && (!due || (int32_t)(q->tick_timeout - due) < 0)) due = q->tick_timeout;
+        if (entry < (int)c->cwnd && (!due || (int32_t)(q->tick_timeout - due) < 0)) { due = q->tick_timeout; tag = 1; }
     }
     if (c->cur_new_node) {
         x = c->cur_new_tick + FFRDP_FLUSH_TIMEOUT;
-        if (!due || (int32_t)(x - due) < 0) due = x;
+        if (!due || (int32_t)(x - due) < 0) { due = x; tag = 2; }
     }
     x = c->rate_tick + 1000;
-    if (!due || (int32_t)(x - due) < 0) due = x;
+    if (!due || (int32_t)(x - due) < 0) { due = x; tag = 3; }
     // 握手期的重传期限（与 tick 里那条重传判据同一个值 ✓）。
     // ⚠️ 少了它，真 lowlevel 在"没有期限"时是**永久 select** ✓ ⇒ 没人来重传 ⇒ SYN 发不出去就永远发不出去 ✗
     //    （客户端建 lowlevel 用 "none"，socket 由它自己的工作线程懒建 ⇒ ffrdp_init 里第一发很可能
     //     撞上 sockfd < 0 ⇒ 静默失败 ✓）—— 仿真里假 lowlevel 没有这层懒建，所以永远看不见 ✗。
     if (c->hs_state == HS_SYN_SENT || c->hs_state == HS_SYN_RCVD || c->hs_state == HS_FIN_WAIT) {
         x = c->hs_tick + FFRDP_HS_RETRY_MS;
-        if (!due || (int32_t)(x - due) < 0) due = x;
+        if (!due || (int32_t)(x - due) < 0) { due = x; tag = 4; }
     }
     // keepalive：UP 的连接也要有人来叫醒（否则真 lowlevel 会一直睡到下次有数据 ✗）——
     // 半程探一次（周期跟 idle_ms 走 ⇒ 不会出现"探测周期比超时还长"的自相矛盾组合 ✓）。
     if (c->hs_state == HS_UP) {
         x = c->tick_last_recv + (uint32_t)(ffrdp->idle_ms / 2);
-        if (!due || (int32_t)(x - due) < 0) due = x;
+        if (!due || (int32_t)(x - due) < 0) { due = x; tag = 5; }
     }
-    if (c->tick_send_query) { x = c->tick_send_query + FFRDP_QUERY_CYCLE; if (!due || (int32_t)(x - due) < 0) due = x; }
-    if (c->probe_next)      { x = c->probe_next;                          if (!due || (int32_t)(x - due) < 0) due = x; }
+    // 查询窗口的期限：**只有真的欠信用时才需要它** ✓。tick 里那条查询分支长在
+    // `c->swnd == 0` 那一段里（没信用、还有帧等着首发才会问对端）⇒ swnd 充足时这条期限根本不可达 ✗
+    // ⇒ 它会永远落在过去 ⇒ 每圈都要求"现在" ⇒ worker 空转 ✗（2026-10-15 实测：坏轮 STALE 122~132 万次、
+    // 全部来自这条 ✓，吞吐 42 → 29 MB/s ✗；低层同时看到 260~910 万次 deadline 空圈 ✗）。
+    // 另外"到点"也不该要求"现在"✗：到点后交给下一次 tick（帧超时/keepalive/速率采样必然会来 ✓）
+    // 去发那个查询 ✓ —— 它在 500ms 内提前醒来仍然保留 ✓，避免查询被拖到下一次帧超时才做 ✓。
+    if (c->tick_send_query && c->swnd == 0) {
+        x = c->tick_send_query + FFRDP_QUERY_CYCLE;
+        if ((int32_t)(x - now) > 0 && (!due || (int32_t)(x - due) < 0)) { due = x; tag = 6; }
+    }
+    if (c->probe_next)      { x = c->probe_next;                          if (!due || (int32_t)(x - due) < 0) { due = x; tag = 7; } }
     // 还差一条最容易漏、也最贵的：**现在就有发得出去的东西**（应用排了队，或者发送表里有还没首发的帧），
     // 而且发得出去（有信用、在途数没到限）⇒ 立刻叫一次。
     //   * 少了"应用队列"那一半：应用排完队要等某个 ack 或 RTO 到期才有人来发（实测 50 -> 10 MB/s）；
@@ -1543,7 +1561,7 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         // 路径都不刷新它 ⇒ ack 刚把槽位空出来、该马上补下一帧的那一刻，判据读到的是旧值 ⇒
         // 不叫醒 ⇒ 睡到下面 rate_tick+1000 那条期限上（真机 y-run1：小窗口 lap 最大 1002ms、
         // 两端只剩 32~48 帧/s；大窗口下 limit=128 让旧值几乎永远成立 ⇒ 循环自旋掩盖了它）。
-        if (c->swnd > 0 && (uint32_t)n_sent < limit) { due = now; armed_now = 1; }
+        if (c->swnd > 0 && (uint32_t)n_sent < limit) { due = now; armed_now = 1; tag = 0; }
     }
     // ⚠️ tick 判"到期要重传"用的是 `now - tick_timeout > 0`（**严格**大于 ✓）⇒ tick_timeout 恰好等于
     //    now 的帧，这一圈不会被重传 ✗。若把它当"现在"叫醒，就是在**同一个冻结的 tick 里**空转 ✓
@@ -1554,6 +1572,11 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     // 兜底：有未确认的帧、或应用队列非空时最多睡 4ms。上面那条判据修好后它不该再触发；
     // 真机上 lap 最大曾到 59/114/222ms，每漏一次小窗口就少送好几帧，而多醒几次只费一点 CPU。
     if (c->send_list_head || c->app_tx_size) { if (!due || (int32_t)(due - (now + 4)) > 0) due = now + 4; }
+    // 只读记账（①-2）：这一轮把期限设成了什么 ✓
+    if (due && (int32_t)(due - now) <= 0) {
+        if (armed_now) c->counter_due_now_work++;
+        else { c->counter_due_now_stale++; c->counter_stale_src[tag < 0 || tag > 7 ? 0 : tag]++; }
+    } else if (due) c->counter_due_future++;
     return due;
 }
 
@@ -1570,7 +1593,7 @@ static void ffrdp_arm_timer(FFRDPCONTEXT *ffrdp)
         uint32_t   x;
         if (!c) continue;
         x = ffrdp_next_due(ffrdp, c);
-        if (c->flags & FLAG_ACK_DUE) x = get_timestamp32_ms();
+        if (c->flags & FLAG_ACK_DUE) { x = get_timestamp32_ms(); c->counter_due_now_ack++; }
         if (!due || (int32_t)(x - due) < 0) due = x;
     }
     ffrdp->lowlevel->timer(ffrdp->lowlevel, due);
@@ -2276,6 +2299,11 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     // 三个判据一行打完：drain 早退（它随窗口宏缩放，之前没有计数器）、cwnd 被乱序误判打回、
     // 以及被内核丢包/缓冲压力打回。计数是累计的（测试驱动的 dump 传 clearhistory=0），看增量。
     printf("ssthresh floor hits : %u (cwnd already at the floor, still recomputed => +1/ACK from here)\n", c->counter_ssth_floor);
+    printf("due-now sources      : ack %u, work %u, STALE %u (stale = asks for \"now\" with nothing to do); future %u\n",
+           c->counter_due_now_ack, c->counter_due_now_work, c->counter_due_now_stale, c->counter_due_future);
+    printf("stale by source      : frame %u, flush %u, rate %u, hs %u, keepalive %u, query %u, probe %u, other %u\n",
+           c->counter_stale_src[1], c->counter_stale_src[2], c->counter_stale_src[3], c->counter_stale_src[4],
+           c->counter_stale_src[5], c->counter_stale_src[6], c->counter_stale_src[7], c->counter_stale_src[0]);
     printf("drain-block/backdrop: %u ticks (drain held), cwnd back %u (rto/fast) + %u (send fail)\n",
            c->counter_drain_block, c->counter_cwnd_back, c->counter_cwnd_sfail);
     printf("timeout diag        : no-ack-arrived %u, acks-arrived-but-missed %u, max wait %u ms\n",
