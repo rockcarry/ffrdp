@@ -46,6 +46,24 @@ typedef struct {
     int             asleep;    // 1 while the loop is inside select(); written and read under this lock
     pthread_mutex_t lock;      // guards deadline and asleep, which are written from other threads
     uint32_t        deadline;  // absolute ms on the get_timestamp32_ms() clock, 0 = nothing due
+    // 2026-10-15（lo 结构性代价调查 ①）：只读统计 —— 这个 worker 一圈一圈到底在干什么 ✓。
+    // 为什么要它：协议侧只看得见"圈数"（counter_upd_cnt ✓）与"收到多少帧"✗，分不出**空圈**
+    // 是"被通知叫醒却没数据"✗ 还是"期限到点"✓ —— 而 lo 上 master 的疑点正是"≈2.2 圈/帧"✗
+    // （参考实现 ≈1.05 ✓）⇒ 先把这个数拆开，再决定动不动 timer 的唤醒条件 ✓。纯计数，不改行为 ✗。
+    uint32_t        stat_lap;         // 圈数：每次 select 归来算一圈 ✓
+    uint32_t        stat_lap_frame;   // 其中收到 >=1 帧的圈数 ✓
+    uint32_t        stat_lap_notify;  // 其中通知 fd 可读的圈数（跨线程 timer 叫醒 ✓）
+    uint32_t        stat_lap_timeout; // 其中 select 返回 0（期限到点 ✓）
+    uint32_t        stat_rx_frames;   // 收到的帧总数（直接用来算"帧/圈"✓）
+    // 追加①：select 说"数据 fd 可读"、而 recvfrom 立刻失败的那一类空圈 ✗
+    // （实测某一轮里空圈 60 万、吞吐同时掉下来 ✓，而通知只占 3 万 ⇒ 不是通知引起的 ✗，
+    //  典型是套接字上的非数据可读事件 ✓，例如 ICMP 错误 ✓）⇒ 单独记账 + 记首次 errno ✓。
+    uint32_t        stat_rx_fail;     // recvfrom <= 0 的次数（这些圈一个包都没读到 ✗）
+    // 追加②：谁把期限 arm 成"已经到点"（<= now ✓）—— 这是上面那批 deadline 空圈的直接来源 ✗。
+    // 分两类：跨线程（应用线程 send 后催一下 ✓）与循环内（协议 tick 返回下一个期限 ✓）。
+    uint32_t        stat_arm_now_other;  // 跨线程 arm 成 <= now 的次数
+    uint32_t        stat_arm_now_loop;   // 从循环自己线程 arm 成 <= now 的次数
+    int             stat_rx_errno;    // 第一次失败的 errno（0 = 还没失败过 ✓）
 } UDP_LOWLEVEL;
 
 // 跨 API 的 addr 是 uint64：布局是两条层共同的约定（见 utils.h 的 ffrdp_addr_make），不是本文件的私事。
@@ -165,7 +183,13 @@ static int ffrdp_udp_lowlevel_timer(void *fl, uint32_t deadline_ms)
     wake          = (old == 0) || ((int32_t)(deadline_ms - old) < 0) || udp->asleep;
     pthread_mutex_unlock(&udp->lock);
     // The same "am I the loop?" test exit() uses: a callback is running on the loop's own thread.
-    if (wake && !(udp->mthread.hthread && udp->mthread.hthread == (void*)pthread_self())) ffrdp_udp_notify(udp);
+    {   // 只读记账（①）："arm 成已到点"分两类 ✓
+        int from_loop = (udp->mthread.hthread && udp->mthread.hthread == (void*)pthread_self());
+        if ((int32_t)(deadline_ms - get_timestamp32_ms()) <= 0) {
+            if (from_loop) udp->stat_arm_now_loop++; else udp->stat_arm_now_other++;
+        }
+        if (wake && !from_loop) ffrdp_udp_notify(udp);
+    }
     return 0;
 }
 
@@ -222,6 +246,10 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
             if (socket_errno() == EINTR) continue;     // a signal is not an error, and not a reason to sleep
             printf("select error !\n"); fflush(stdout); usleep(100 * 1000); continue;
         }
+        // 只读记账（①）：一圈一笔 ✓
+        udp->stat_lap++;
+        if (ret == 0) udp->stat_lap_timeout++;
+        if (ret > 0 && FD_ISSET(udp->notify, &rfds)) udp->stat_lap_notify++;
 
         if (ret > 0 && FD_ISSET(udp->notify, &rfds)) ffrdp_udp_notify_drain(udp);
         // No stop test here, nor in the receive loop below: the condition at the top is enough, because every
@@ -242,8 +270,12 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
                 // (void *): Winsock declares recvfrom's buffer as char*, POSIX as void* -- the buffer is
                 // bytes either way, and the cast is what keeps -Wall -Werror clean on both.
                 ret = recvfrom(udp->sockfd, (void*)buf, sizeof(buf), 0, (struct sockaddr*)&from, &fromlen);
-                if (ret <= 0) break;   // zero length datagram, an empty socket, or a socket error
-                frames++;
+                if (ret <= 0) {        // zero length datagram, an empty socket, or a socket error
+                    udp->stat_rx_fail++;
+                    if (udp->stat_rx_errno == 0) udp->stat_rx_errno = socket_errno();
+                    break;
+                }
+                frames++; udp->stat_rx_frames++; if (frames == 1) udp->stat_lap_frame++;
                 if (udp->callback) {
                     // The message carries where the frame came from, so a reply goes straight back out through
                     // send() with the very same addr -- that is the only reason this layer reports an address
@@ -263,6 +295,13 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
         ffrdp_udp_tick(udp);
     }
 
+    // ① 的读出点：这一行 ASCII，任何控制台都不乱码 ✓。空圈 = 总圈 - 带帧圈 ✓。
+    printf("udp lowlevel laps: %u total, %u with frames, %u notify-woken, %u deadline, %u empty, %u frames, %u rx-fail (errno %d)\n",
+           udp->stat_lap, udp->stat_lap_frame, udp->stat_lap_notify, udp->stat_lap_timeout,
+           udp->stat_lap - udp->stat_lap_frame, udp->stat_rx_frames,
+           udp->stat_rx_fail, udp->stat_rx_errno);
+    printf("udp lowlevel arm-now: %u from other threads, %u from the loop itself\n",
+           udp->stat_arm_now_other, udp->stat_arm_now_loop);
     closesocket(udp->sockfd); udp->sockfd = -1;
     {   int fd = udp->notify;
         udp->notify = -1;              // 先摘引用、再关：晚到的 timer() 只会看到"没有"，不会发到已关的 fd 上
