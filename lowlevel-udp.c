@@ -76,6 +76,39 @@ typedef struct {
     uint32_t        stat_tick_fire;   // tick 真的到点并跑了回调 ✓
     uint32_t        stat_tick_none;   // tick 进去发现没期限（没有回调 ✗）
     uint32_t        stat_tick_early;  // tick 进去发现期限还没到（没有回调 ✗）
+    // 2026-10-15（§26.30 步骤1-③）：收包侧 —— "一圈最多收 FFRDP_LOWLEVEL_RX_BATCH_MAX 帧"与
+    // "每收一帧一次回调"到底值多少 ✓。为什么缺这个数：RX_BATCH_MAX=2 是吞吐旋钮（见文件头的实测表 ✓），
+    // 但没有任何计数说它**真的挡在瓶颈上**（batch 被上限截断 = socket 里还有货 ✗），也没有数说一次回调
+    // 值多少微秒 ✓；另外"每帧 sendto 次数"（v1.1 很可能一次发多帧 ✗，本架构是一帧一个数据报 ✓）
+    // 也一直没量过 ✓。纯计数 ✓，不改行为 ✗。
+    uint32_t        stat_rx_batch_full; // 一圈收满上限就停了（还没有证明后面真有货 ✗）
+    uint32_t        stat_rx_capped_more; // 上面那批里，**零超时 select 说"还有可读"**的次数 ⇒ 真积压 ✓
+    uint32_t        stat_lap_rx1;       // 这一圈只收 1 帧（没批起来 ✓）
+    uint32_t        stat_lap_rxmulti;   // 这一圈收了 >= 2 帧（批起来了 ✓）
+    uint32_t        stat_cb_us_sum;     // 收包回调耗时之和（微秒 ✓）
+    uint32_t        stat_cb_us_max;     // 单次最长（微秒 ✓）
+    uint32_t        stat_tx_calls;      // sendto 调用次数（本架构一帧一个数据报 ⇒ 与帧数比就是"每帧 sendto 次数"✓）
+    uint32_t        stat_tx_bytes;      // 送出去的字节数 ✓
+    // 2026-10-15（§26.30 第 2 步 ④-13）：一圈的**时间去向** ✓ + arm/wake 自己值多少 ✓。
+    // 为什么缺这个数：①-12 只给了"回调值 4.3 µs/次"✗，而"一圈的固定开销 × 97k 圈/s"到底占多少
+    // 一直没拆开 ✗ —— 这是"4.6 倍差距"剩下的两个候选之一 ✓（另一个是 ack 节奏 = ④-14 ✓）。
+    // 采样口径：每 64 圈采一次 ✓（4 次时钟/采样圈 ⇒ 摊薄到全部圈上 ≈ 1.5 ns/圈 ✓，量不出代价 ✓）。
+    // 三段互斥、和 = 整圈 ✓：pre = arm/算期限/select ✓、mid = 记账/notify/收包（含回调 ✓）、tick = 期限 + 协议圈 ✓。
+    uint32_t        stat_cost_n;        // 采样到的圈数（分母 ✓）
+    uint32_t        stat_cost_pre_us;   // 三段之和（微秒 ✓）
+    uint32_t        stat_cost_mid_us;
+    uint32_t        stat_cost_tick_us;
+    uint32_t        stat_cost_all_us;   // 整圈（t0→t3 ✓）
+    uint32_t        stat_cost_max_us;   // 采到的圈里最长的一个 ✓
+    // ⚠️ 口径补严（④-13b）：收尾空闲圈（客户端已走、没有期限 ⇒ select 永久睡 ✓）会混进采样，
+    //    实测一个这样的圈就是 **1.47 s** ✗ ⇒ 把"每圈均值"带偏 6 倍（和 §26.27b 那三次盲点同一类病 ✓）。
+    //    单独把它们记出来 ⇒ 均值 = (all - slow_us) / (n - slow_n) ✓ 一眼能扣 ✓。
+    uint32_t        stat_cost_slow_n;   // 采到的慢圈数（> 100 ms ✓）
+    uint32_t        stat_cost_slow_us;  // 它们的时长之和 ✓
+    uint32_t        stat_arm_n_loop;    // 循环内 arm 的次数（协议在回调里定下次期限 ✓）
+    uint32_t        stat_arm_us_loop;   // 它们花掉的微秒 ✓
+    uint32_t        stat_arm_n_other;   // 跨线程 arm 的次数（应用 send 后催一下 ✓）
+    uint32_t        stat_arm_us_other;
 } UDP_LOWLEVEL;
 
 // 跨 API 的 addr 是 uint64：布局是两条层共同的约定（见 utils.h 的 ffrdp_addr_make），不是本文件的私事。
@@ -162,6 +195,14 @@ static void ffrdp_udp_sleep_end(UDP_LOWLEVEL *udp)
     pthread_mutex_unlock(&udp->lock);
 }
 
+// §26.30 ①-③ / ④-13 用的微秒时钟：量"每收一帧一次回调"与"一圈三段"都要它 ✓
+//（与 ffrdp.c 里量 ack 延迟那个同源 ✓）。放在 timer() 之前：④-13 的 arm 计时也要用它 ✓。
+static uint64_t ffrdp_udp_us(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
+}
+
 // Deliver a tick that has come due. The deadline is consumed BEFORE the callback runs, so a callback that
 // arms its next one is not overwritten by this, and a callback that arms nothing stops the clock rather
 // than being called again on every lap.
@@ -201,10 +242,15 @@ static int ffrdp_udp_lowlevel_timer(void *fl, uint32_t deadline_ms)
     // The same "am I the loop?" test exit() uses: a callback is running on the loop's own thread.
     {   // 只读记账（①）："arm 成已到点"分两类 ✓
         int from_loop = (udp->mthread.hthread && udp->mthread.hthread == (void*)pthread_self());
+        uint64_t t_arm0 = ffrdp_udp_us();                                  // 只读（④-13）：arm/wake 自己值多少 ✓
         if ((int32_t)(deadline_ms - get_timestamp32_ms()) <= 0) {
             if (from_loop) udp->stat_arm_now_loop++; else udp->stat_arm_now_other++;
         }
         if (wake && !from_loop) ffrdp_udp_notify(udp);
+        {   uint32_t d_arm = (uint32_t)(ffrdp_udp_us() - t_arm0);
+            if (from_loop) { udp->stat_arm_n_loop++;  udp->stat_arm_us_loop  += d_arm; }
+            else           { udp->stat_arm_n_other++; udp->stat_arm_us_other += d_arm; }
+        }
     }
     return 0;
 }
@@ -240,6 +286,10 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
             }
         }
 
+        // 只读（§26.30 ④-13）：一圈三段计时 —— 每 64 圈采一次 ✓（代价量不出 ✓，见字段注释）
+        int      cost  = ((udp->stat_lap & 63) == 0);
+        uint64_t t_c0 = 0, t_c1 = 0, t_c2 = 0, t_c3 = 0;
+        if (cost) t_c0 = ffrdp_udp_us();
         // Sleep until a frame arrives, the deadline passes, or someone wakes us -- and when there is no
         // deadline at all, sleep indefinitely. The old fixed 100ms wakeup both capped what precision the
         // layer above could ask for and kept an idle endpoint waking ten times a second.
@@ -265,6 +315,7 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
         FD_SET(udp->notify, &rfds);
         ret = select(MAX(udp->sockfd, udp->notify) + 1, &rfds, NULL, NULL, tvp);
         ffrdp_udp_sleep_end(udp);       // awake again, whatever select() answered
+        if (cost) t_c1 = ffrdp_udp_us();                                              // 只读（④-13）：pre 段结束 ✓
         if (ret == -1) {
             if (socket_errno() == EINTR) continue;     // a signal is not an error, and not a reason to sleep
             printf("select error !\n"); fflush(stdout); usleep(100 * 1000); continue;
@@ -309,13 +360,48 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
                     msg.addr = ffrdp_udp_addr_pack(&from);
                     msg.buf  = buf;
                     msg.len  = ret;
-                    udp->callback(udp->cbctx, FFRDP_LOWLEVEL_TYPE_RECV, &msg, sizeof(msg));
+                    {   // 只读（§26.30 ①-③）：给这一次回调标价 ✓（两次 clock_gettime，量的是协议侧一段 ✓）
+                        uint64_t t_cb = ffrdp_udp_us();
+                        udp->callback(udp->cbctx, FFRDP_LOWLEVEL_TYPE_RECV, &msg, sizeof(msg));
+                        {   uint32_t dt = (uint32_t)(ffrdp_udp_us() - t_cb);
+                            udp->stat_cb_us_sum += dt;
+                            if (dt > udp->stat_cb_us_max) udp->stat_cb_us_max = dt;
+                        }
+                    }
                 }
             }
+            // 只读（§26.30 ①-③）：这一圈是"被上限截断"还是"socket 真收空了"✗
+            // ⚠️ 光数"收满 2 帧就停"**证不出**积压 ✗（可能刚巧就是 2 帧 ✓）⇒ 收满时再问一次
+            //    零超时 select ✓：它能读 ⇒ socket 里真的还有货 = 这一圈是被上限截断的 ✓。
+            //    不消费任何数据报 ✓（不像再 recvfrom 一次 ✗ —— 那会把下一圈要的帧吃掉 ✓）。
+            if (frames >= FFRDP_LOWLEVEL_RX_BATCH_MAX) {
+                udp->stat_rx_batch_full++;
+                {   fd_set pf; struct timeval z; int pr;
+                    FD_ZERO(&pf); FD_SET(udp->sockfd, &pf);
+                    z.tv_sec = 0; z.tv_usec = 0;
+                    pr = select(udp->sockfd + 1, &pf, NULL, NULL, &z);
+                    if (pr > 0 && FD_ISSET(udp->sockfd, &pf)) udp->stat_rx_capped_more++;
+                }
+            }
+            if (frames == 1) udp->stat_lap_rx1++; else if (frames >= 2) udp->stat_lap_rxmulti++;
         }
+        if (cost) t_c2 = ffrdp_udp_us();                                              // 只读（④-13）：mid 段结束 ✓
         // Received work first, then the clock, so the two are never handed over interleaved. A tick armed
         // from inside a receive callback is therefore delivered in the same lap rather than the next one.
         ffrdp_udp_tick(udp);
+        if (cost) {                                                                   // 只读（④-13）：tick 段结束 ⇒ 记账 ✓
+            t_c3 = ffrdp_udp_us();
+            udp->stat_cost_n++;
+            udp->stat_cost_pre_us  += (uint32_t)(t_c1 - t_c0);
+            udp->stat_cost_mid_us  += (uint32_t)(t_c2 - t_c1);
+            udp->stat_cost_tick_us += (uint32_t)(t_c3 - t_c2);
+            udp->stat_cost_all_us  += (uint32_t)(t_c3 - t_c0);
+            if ((uint32_t)(t_c3 - t_c0) > udp->stat_cost_max_us) udp->stat_cost_max_us = (uint32_t)(t_c3 - t_c0);
+            if ((t_c3 - t_c0) > 100000) {   // > 100 ms ⇒ 慢圈（收尾空闲 ✓）：单独记，别混进均值 ✓
+                udp->stat_cost_slow_n++;
+                udp->stat_cost_slow_us += (uint32_t)(t_c3 - t_c0);
+            }
+        }
     }
 
     // ① 的读出点：这一行 ASCII，任何控制台都不乱码 ✓。空圈 = 总圈 - 带帧圈 ✓。
@@ -330,6 +416,21 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
            udp->stat_left_le0, udp->stat_left_0, udp->stat_left_1_9, udp->stat_left_ge10, udp->stat_sleep_none);
     printf("udp lowlevel tick kind: fire %u, none %u, early %u (the two 'none/early' are laps that ran no callback)\n",
            udp->stat_tick_fire, udp->stat_tick_none, udp->stat_tick_early);
+    // ①-③（§26.30 步骤1）：收包侧代价 —— 批有没有被上限截断 ✓、一次回调多少微秒 ✓、送出多少个数据报 ✓
+    printf("udp lowlevel rx cost: batch-full %u, of which socket still had data %u, laps with 1 frame %u, with >=2 frames %u, callback %u us total, %u us max\n",
+           udp->stat_rx_batch_full, udp->stat_rx_capped_more, udp->stat_lap_rx1, udp->stat_lap_rxmulti,
+           udp->stat_cb_us_sum, udp->stat_cb_us_max);
+    printf("udp lowlevel tx      : sendto %u calls, %u bytes (per frame = calls / frames in the ffrdp block)\n",
+           udp->stat_tx_calls, udp->stat_tx_bytes);
+    // ④-13（§26.30 第 2 步）：一圈的时间去向（采样 1/64 ✓；三段互斥、和 = 整圈 ✓）—— 除以采样圈数就是每圈 ✓
+    printf("udp lowlevel lap cost: %u sampled laps, pre(arm+sleep+select) %u us, mid(book+notify+rx) %u us, tick(deadline+proto) %u us, all %u us, max %u us\n",
+           udp->stat_cost_n, udp->stat_cost_pre_us, udp->stat_cost_mid_us, udp->stat_cost_tick_us,
+           udp->stat_cost_all_us, udp->stat_cost_max_us);
+    // ④-13b：扣掉慢圈才是"每圈" ✓（每圈 = (all - slow_us) / (n - slow_n) ✓）
+    printf("udp lowlevel lap cost slow (>100ms): %u laps, %u us  => per lap = (all - slow) / (n - slow)\n",
+           udp->stat_cost_slow_n, udp->stat_cost_slow_us);
+    printf("udp lowlevel arm cost: from loop %u calls %u us, from other threads %u calls %u us\n",
+           udp->stat_arm_n_loop, udp->stat_arm_us_loop, udp->stat_arm_n_other, udp->stat_arm_us_other);
     closesocket(udp->sockfd); udp->sockfd = -1;
     {   int fd = udp->notify;
         udp->notify = -1;              // 先摘引用、再关：晚到的 timer() 只会看到"没有"，不会发到已关的 fd 上
@@ -346,6 +447,10 @@ static int ffrdp_udp_lowlevel_send(void *fl, uint64_t addr, uint8_t *buf, int le
     if (!udp || !buf || len <= 0 || udp->sockfd < 0) return -1;
     ffrdp_udp_addr_unpack(addr, &to);
     int ret = (int)sendto(udp->sockfd, (void*)buf, len, 0, (struct sockaddr*)&to, sizeof(to));
+    // 只读（§26.30 ①-③）：每帧 sendto 次数 —— 本架构是"一帧一个数据报"✓，这个调用数就是分子 ✓
+    // （分母是 ffrdp 那一块里的帧数：首发+两种重传 ✓）。ack / query 也走这里 ✓，所以它 >= 帧数 ✓。
+    udp->stat_tx_calls++;
+    if (ret > 0) udp->stat_tx_bytes += (uint32_t)ret;
     if (ret == len) return 0;
     // The socket is non blocking, so a full send buffer is a normal answer on a busy link and is not worth
     // a line of output on every frame; the caller decides what to do with the failure. Anything else is a

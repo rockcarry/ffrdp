@@ -156,6 +156,14 @@ typedef struct {
     uint32_t seq_gap, seq_missing;    // 序号缺口次数 / 累计缺失条数
     uint32_t crc_err, len_err, partial_err;
     uint32_t log_seq, log_crc, log_len, log_part; // 每类错误的打印计数（限流用）
+    // 2026-10-15（§26.30 步骤1-①）：应用侧在队列闸门上**等了多久** ✓。为什么缺这个数：ffrdp_send
+    // 传的是 0（不等待 ✓），"等待"在这里表现为"同一条消息被下一轮原样重试"✗ ⇒ 从第一次被拒到最后
+    // 被接受的那段时间，就是应用真实付出的代价 ✓（重试节拍由那次带超时的 recv 提供 = 10ms ✓）。
+    // 纯计数 ✓，不改行为 ✗。
+    uint32_t send_retries;      // 被拒的总次数（同一条消息可能被拒多次 ✓）
+    uint32_t send_wait_msgs;    // 等过（被拒 >= 1 次）的消息条数 ✓
+    uint32_t send_wait_ms;      // 等待时长之和（ms ✓）
+    uint32_t send_wait_max_ms;  // 单条最长等待（ms ✓）
 } TEST_VERIFY;
 
 static void verify_log(const char *name, const char *peer, const char *what,
@@ -232,6 +240,7 @@ static int link_loop(struct link_arg *a)
     int      send_max = *peer->send_size;
     uint8_t *sendbuf = NULL, *stream = NULL;
     uint32_t tick_dump, tick_recv = 0, tick_speed, tokens, rnd = 0x12345678u, seq = 1;
+    uint32_t tick_msg_first = 0, msg_retries = 0;   // 只读（§26.30 ①-①）：这一条消息的首次尝试时刻 / 被拒次数 ✓
     int      ret, connected = 0, stream_len = 0, msg_len = 0, max_payload, hb = 0, lost = 0;
     TEST_VERIFY v;
 
@@ -268,6 +277,7 @@ static int link_loop(struct link_arg *a)
             }
             if (room) msg_len = msg_build(sendbuf, send_max, seq, max_payload, &rnd);
             if (msg_len < 0) msg_len = 0;   // 不该发生；当作"这轮不发"，下一轮重来（绝不能留成负数）
+            if (msg_len > 0) { tick_msg_first = get_timestamp32_ms(); msg_retries = 0; }   // 只读（§26.30 ①-①）：新一条的起点 ✓
         }
 
         if (msg_len > 0) {
@@ -275,6 +285,13 @@ static int link_loop(struct link_arg *a)
             // 重试的节拍由下面那次带超时的 ffrdp_recv 提供 ✓。
             ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
             if (ret == msg_len) {                       // 整条被接受
+                // 只读（§26.30 ①-①）：这条被拒过 ⇒ 把"从第一次尝试到被接受"的时长记下来 ✓
+                if (msg_retries) {
+                    uint32_t d = get_timestamp32_ms() - tick_msg_first;
+                    v.send_wait_msgs++; v.send_wait_ms += d;
+                    if (d > v.send_wait_max_ms) v.send_wait_max_ms = d;
+                    msg_retries = 0;
+                }
                 v.sent_msgs++; v.sent_bytes += (uint32_t)msg_len;
                 if (quota) tokens -= (uint32_t)msg_len;
                 seq++; msg_len = 0;
@@ -285,6 +302,7 @@ static int link_loop(struct link_arg *a)
                 msg_len = 0;                            // 没法安全重发，丢掉这一条（并留下告警）
             }
             // ret == -1 / -2：队列满或连接已断 ⇒ 什么都不动，下一轮原样重试这一条
+            else { v.send_retries++; msg_retries++; }   // 只读（§26.30 ①-①）：这一轮被拒了 ✓
         }
 
         if (stream_len < TEST_STREAM_MAX) {
@@ -343,6 +361,9 @@ done:
     printf("[%s] verify: sent %u msgs / %u B, recv %u msgs / %u B | seq_gap %u (missing %u), crc_err %u, len_err %u, partial_err %u\n",
            peer->name, v.sent_msgs, v.sent_bytes, v.recv_msgs, v.recv_bytes,
            v.seq_gap, v.seq_missing, v.crc_err, v.len_err, v.partial_err);
+    // §26.30 ①-①：应用侧在队列闸门上的等待（累计值 ✓；配合 ffrdp 那块的 refuse 分档看"谁挡的"✓）
+    printf("[%s] app send gate: refused %u times, waited on %u msgs, %u ms total, %u ms max (retry = next loop, ~%dms)\n",
+           peer->name, v.send_retries, v.send_wait_msgs, v.send_wait_ms, v.send_wait_max_ms, TEST_RECV_WAIT_MS);
     if (v.crc_err || v.len_err || v.partial_err || v.seq_gap) {
         printf("[%s] verify: *** CHECK FAILED ***\n", peer->name);
     } else if (v.recv_msgs) {
