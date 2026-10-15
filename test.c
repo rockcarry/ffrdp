@@ -42,6 +42,12 @@ static int  g_use_hs             = 1;   // 本侧是否走握手（FFRDP_HS=0 �
 // ≈65 KB、v2 只有 ≈8.2 KB ✗，分不清是"应用节拍"还是"协议容量"✗。这个开关就是把前者拆出来 ✓。
 // 默认 0 ⇒ 一个字节的行为都不动 ✓（下面那段整段不执行 ✓）。
 static int  g_app_burst          = 0;
+// 2026-10-15（①-32b）：**应用侧的等待点本身**做成旋钮 ✓。为什么：①-26 之后卡点转回应用 ——
+// 那个"造一条 + 发一条 + 阻塞进带超时的 recv"的节拍里，recv 的超时是最硬的一段 ✗（①-23：
+// 501 次 × 10 ms = 5.1 s / 15 s ✗）。`TEST_APP_RECVWAIT_MS=0` ⇒ 非阻塞 ✓（配 `TEST_APP_SPIN_US`
+// 在没有数据时短睡 ✓，避免空转成 100% CPU ✗）。默认 10 / 0 ⇒ 与现状逐字一致 ✓。
+static int  g_recv_wait_ms       = TEST_RECV_WAIT_MS;
+static int  g_spin_us            = 0;
 static pthread_mutex_t g_mutex;
 
 // 2026-10-15（①-23）：应用侧的 **µs** 时钟。为什么缺这个数：test.c 只有 ms 口径 ✗，而应用循环
@@ -358,7 +364,8 @@ static int link_loop(struct link_arg *a)
         if (stream_len < TEST_STREAM_MAX) {
             // 应用侧唯一的等待点：一有数据立刻返回，没有数据最多等 TEST_RECV_WAIT_MS。
             t_w = app_us();                 // ①-23：应用侧唯一的等待点 ✓
-            ret = ffrdp_recv(ffrdp, handle, (char*)stream + stream_len, TEST_STREAM_MAX - stream_len, TEST_RECV_WAIT_MS);
+            ret = ffrdp_recv(ffrdp, handle, (char*)stream + stream_len, TEST_STREAM_MAX - stream_len, g_recv_wait_ms);   // ①-32b
+            if (ret <= 0 && g_spin_us > 0) usleep((useconds_t)g_spin_us);   // ①-32b：没数据就短睡，别空转 ✓
             {   uint32_t d = app_us() - t_w;   // ①-23："等到数据"与"空转到超时"分开记 ✓
                 if (ret > 0) { rd_n++; rd_us += d; } else { re_n++; re_us += d; }
             }
@@ -629,6 +636,14 @@ int main(int argc, char *argv[])
             if (sh && *sh) g_use_hs = atoi(sh) ? 1 : 0;   // 与 ffrdp_init 拼串时的判断保持同一口径 ✓
         }
         if (sc && *sc) g_do_close = atoi(sc) ? 1 : 0;
+        {   const char *rw = getenv("TEST_APP_RECVWAIT_MS");   // ①-32b
+            const char *su = getenv("TEST_APP_SPIN_US");
+            if (rw && *rw) { g_recv_wait_ms = atoi(rw); if (g_recv_wait_ms < 0) g_recv_wait_ms = 0; }
+            if (su && *su) { g_spin_us = atoi(su); if (g_spin_us < 0) g_spin_us = 0; }
+            if (g_recv_wait_ms != TEST_RECV_WAIT_MS || g_spin_us)
+                printf("app recv wait       : %d ms, spin %d us when idle (diagnostic; default %d ms / 0)\n",
+                       g_recv_wait_ms, g_spin_us, TEST_RECV_WAIT_MS);
+        }
         {   const char *sb = getenv("TEST_APP_BURST");   // ①-22：应用侧突发上限（0/不设 = 旧行为 ✓）
             if (sb && *sb) { g_app_burst = atoi(sb); if (g_app_burst < 0) g_app_burst = 0; }
             if (g_app_burst > 1) printf("app burst           : %d messages per recv tick (diagnostic; default 1 = old behaviour)\n", g_app_burst);
