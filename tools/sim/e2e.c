@@ -222,7 +222,7 @@ int main(int argc, char *argv[])
            s0.d1, s0.d25, s0.mbs, s0.mbr);
 #endif
 #endif
-    printf("       air loss c0->c1=%.2f%% (%u/%u)  c1->c0=%.2f%% (%u/%u)\n",
+    printf("       delivered loss after repair c0->c1=%.2f%% (%u/%u)  c1->c0=%.2f%% (%u/%u)\n",
            100.0 * (s0.tx - s0.rx) / (s0.tx ? s0.tx : 1), s0.rx, s0.tx,
            100.0 * (s1.tx - s1.rx) / (s1.tx ? s1.tx : 1), s1.rx, s1.tx);
 #ifdef HAVE_INFLIGHT
@@ -232,13 +232,16 @@ int main(int argc, char *argv[])
     // ---- 判定（负载无关）----
     // 1) 一切都要还回去：ctx / 帧 / 乱序队列，残留就是泄漏
     check(sim_alloc() == sim_freed(), "leaked bytes (a context or a frame was not returned)");
-    // 2) 丢包模型：配了丢包率、又没有加 shaper/policer 时，实测的"空中丢失"应当接近配置值。
+    // 2) 丢包模型：配了丢包率、又没加 shaper/policer 时，模型**自己**该按配置的比率丢。
     //    容差给得宽（10 个百分点）—— 这一条是用来抓"模型坏了"的，不是用来卡统计波动的。
-    if (loss > 0.0 && cap == 0 && pcap == 0 && s0.tx > 0 && s1.tx > 0) {
-        double l01 = 100.0 * (s0.tx - s0.rx) / s0.tx;   // c0 -> c1 实际丢了多少
-        double l10 = 100.0 * (s1.tx - s1.rx) / s1.tx;   // c1 -> c0
-        check(l01 >= loss * 100.0 - 10.0 && l01 <= loss * 100.0 + 10.0, "observed loss c0->c1 far from the configured rate");
-        check(l10 >= loss * 100.0 - 10.0 && l10 <= loss * 100.0 + 10.0, "observed loss c1->c0 far from the configured rate");
+    //    ⚠ 这里量的是**模型**（sim_offered/sim_dropped ✓），不是端侧计数 ✗：协议会重传，
+    //    被网丢掉的帧最后还是会到 ⇒ 拿 (counter_txfull - counter_rxfull) 当"空中丢失"是错的 ✗
+    //    （那量的是"协议没修好多少"，与模型无关 ⇒ 2026-10-15 之前它恒为假红 ✗）。
+    if (loss > 0.0 && cap == 0 && pcap == 0 && s0.tx > 0 && s1.tx > 0 && sim_offered(1) && sim_offered(0)) {
+        double l01 = 100.0 * sim_dropped(1) / sim_offered(1);   // 目的 slot 1 = c0 -> c1 方向 ✓
+        double l10 = 100.0 * sim_dropped(0) / sim_offered(0);   // 目的 slot 0 = c1 -> c0 方向 ✓
+        check(l01 >= loss * 100.0 - 10.0 && l01 <= loss * 100.0 + 10.0, "model dropped c0->c1 far from the configured rate");
+        check(l10 >= loss * 100.0 - 10.0 && l10 <= loss * 100.0 + 10.0, "model dropped c1->c0 far from the configured rate");
     }
     // 3) 交付上界：收到的不可能比发出的多（两边都发，所以用各自的对端）
     //    **握上手了**就必须真的传过数据 ✓：判据用"服务端拿到了 accept 句柄"（app1.conn != 0）

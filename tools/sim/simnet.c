@@ -33,6 +33,9 @@ static int    g_plast = 0;    // tick of the last refill
 static int    g_spikep = 0;   // percent of packets hit by a delay spike
 static int    g_spikems = 0;  // extra delay of a spike, ms
 static unsigned long g_alloc = 0, g_freed = 0;
+// 模型**自己**丢了多少包（按目的 slot 分 ✓）：供测试核对"配了丢包率就该丢这么多" ✓。
+// 为什么要它：端侧计数做不到这件事 ✗ —— 协议会重传，被网丢掉的帧最后还是会到 ✓
+static unsigned long g_offered[SIMNET_SLOTS], g_dropped[SIMNET_SLOTS];
 
 uint32_t sim_tick(void) { return g_vtick; } // replaces the timestamp in utils.c
 
@@ -47,6 +50,8 @@ void *sim_calloc(size_t n, size_t s) { g_alloc++; return calloc(n, s); }
 void  sim_free(void *p) { if (!p) return; g_freed++; free(p); }
 unsigned long sim_alloc(void) { return g_alloc; }
 unsigned long sim_freed(void) { return g_freed; }
+unsigned long sim_offered(int idx) { return (idx >= 0 && idx < SIMNET_SLOTS) ? g_offered[idx] : 0; }
+unsigned long sim_dropped(int idx) { return (idx >= 0 && idx < SIMNET_SLOTS) ? g_dropped[idx] : 0; }
 
 void sim_reset(void)
 {
@@ -57,6 +62,7 @@ void sim_reset(void)
     g_pcap = 0; g_pburst = 0; g_ptok = 0; g_plast = 0;
     g_spikep = 0; g_spikems = 0;
     g_alloc = g_freed = 0;
+    for (i = 0; i < SIMNET_SLOTS; i++) g_offered[i] = g_dropped[i] = 0;
 }
 
 void sim_config(double loss, int burst, int delay, int jitter)
@@ -150,6 +156,7 @@ int sim_send_from(int dst, uint64_t src, void *buf, int len)
     int idx = dst, drop = 0;
     unsigned k;
     if (idx < 0 || idx >= SIMNET_SLOTS) return len;
+    g_offered[idx]++;
     k = ++gpn[idx];
     unsigned r = hash(k, idx) % 100000u;
     if (g_pcap > 0 && cursid == 0) { // token bucket on the uplink of side 0
@@ -165,7 +172,8 @@ int sim_send_from(int dst, uint64_t src, void *buf, int len)
         if (gburstleft[idx] > 0) { gburstleft[idx]--; drop = 1; }
         else if (r < (unsigned)(gloss[idx] * 100000)) { gburstleft[idx] = gburst - 1; drop = 1; }
     } else if (r < (unsigned)(gloss[idx] * 100000)) drop = 1;
-    if (!drop) push(idx, src, buf, len, k);
+    if (drop) g_dropped[idx]++;
+    else      push(idx, src, buf, len, k);
     return len;
 }
 

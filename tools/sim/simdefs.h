@@ -41,5 +41,8 @@ int   sim_queued(int idx);
 void  sim_ll_run(int idx, void *ctxt); // drive the fake lowlevel: one RECV per queued packet, then one TIMER
 unsigned long sim_alloc(void);
 unsigned long sim_freed(void);
+// 模型自己的收发/丢包计数（按目的 slot ✓）：测试用它核对丢包模型，而不是端侧计数 ✗
+unsigned long sim_offered(int idx);
+unsigned long sim_dropped(int idx);
 
 #endif
