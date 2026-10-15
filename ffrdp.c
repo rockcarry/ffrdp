@@ -333,6 +333,14 @@ typedef struct {
     uint32_t counter_upd_cnt;     // number of laps
     uint32_t counter_upd_gap;     // sum of the gaps between laps, in ms
     uint32_t counter_upd_gap_max; // longest gap between two laps, in ms
+    // 2026-10-15（①-5）：上一圈**发出去几帧** ✓。为什么缺这个数：真机服务端 656k 次 fire
+    //（期限说"现在有活"）却只发了约 70k 帧 ✗ ⇒ 90% 的整 tick 一帧都发不出去 ✗，而
+    // `ffrdp_next_due` 的 `armed_now` 判据却一直判"有活" ⇒ 两者并不真的对齐（同 §26.21 那类病 ✓）。
+    // 纯计数 ✓：lap_sent_ref 是上一圈的快照（0 当哨兵 ✓），四个桶只加不清 ✓。
+    uint32_t counter_lap_sent0;   // 上一圈一帧都没发出去 ✗（模型却要求"现在"）
+    uint32_t counter_lap_sent1;   // 上一圈发出去 1 帧 ✓
+    uint32_t counter_lap_sentN;   // 上一圈发出去 >= 2 帧 ✓
+    uint32_t lap_sent_ref;        // 上一圈结束时的(首发+重传)计数快照（0 = 还没结算过 ✓）
     uint32_t counter_upd_cost_max;// longest time spent inside one lap, in ms
     uint32_t counter_ack_una_dup; // ack frames whose una is the same as the previous one: the peer reports no progress
     uint32_t counter_rto_head ;   // rto retransmits of the send list head, the frame that blocks the stream
@@ -1644,6 +1652,16 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     // how fast the work thread comes round: a starved lap delays acks and retransmits exactly
     // like a congested network does, and the two need to be told apart.
     c->counter_upd_cnt++;
+    {   // 只读（①-5）：结算**上一圈**的产出 —— 模型说"现在有活"时，它到底发出去了几帧 ✗
+        uint32_t s_now = c->counter_send_1sttime + c->counter_resend_rto + c->counter_resend_fast;
+        if (c->lap_sent_ref) {
+            uint32_t d = s_now - c->lap_sent_ref;
+            if (d == 0)      c->counter_lap_sent0++;
+            else if (d == 1) c->counter_lap_sent1++;
+            else             c->counter_lap_sentN++;
+        }
+        c->lap_sent_ref = s_now ? s_now : 1;   // 0 留给哨兵 ✓
+    }
     if (c->tick_last_upd) {
         uint32_t gap = get_timestamp32_ms() - c->tick_last_upd;
         c->counter_upd_gap += gap;
@@ -2462,6 +2480,9 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("lap period avgmax   : %u, %u ms (%u laps, cost max %u ms)\n",
            c->counter_upd_gap / MAX(c->counter_upd_cnt - 1, 1), c->counter_upd_gap_max,
            c->counter_upd_cnt, c->counter_upd_cost_max);
+    // ①-5：每圈产出 —— sent0 就是"期限说现在有活、却一帧没发"的那类圈 ✗
+    printf("lap output sent     : 0 frames %u, 1 frame %u, >=2 frames %u (0 means a lap that was asked to go now and put nothing on the wire)\n",
+           c->counter_lap_sent0, c->counter_lap_sent1, c->counter_lap_sentN);
     printf("counter_txfull      : %u\n"  , c->counter_txfull      );
     printf("counter_txshort     : %u\n"  , c->counter_txshort     );
     printf("counter_rxfull      : %u\n"  , c->counter_rxfull      );
