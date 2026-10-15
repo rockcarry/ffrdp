@@ -192,11 +192,20 @@ static void ffrdp_read_knobs(void)
 #define FFRDP_WASTE_HI       80   // % of our retransmits the peer already had => the rto is sitting too short
 #define FFRDP_WASTE_LO       40   // % below which the repairs are real and the floor is given back
 
-#define FFRDP_RECVBUF_SIZE  (128 * (FFRDP_MAX_MSS + 0))
+// ①-36（2026-10-15）：**128 → 96 帧**（186 KB → 140 KB）。它是**接收窗口的缓冲**
+// （recv_wnd = (sizeof(recv_buff) - recv_size) / rmss ⇒ 就是我们在 ack 里通告给对端的窗口）。
+// 判据：它必须**大于我方在途上限**（FFRDP_INFLIGHT_MAX = 64）并留余量，否则窗口反成瓶颈。
+// 实测（lo，各两轮，应用队列 32 KB）：sizeof(conn) 260576 → **180064 B（-31%）**，
+// 吞吐 40.9/37.9 → **38.2/39.0 MB/s**（同带），通告窗口 101~110 帧。
+// 再往下的 80 帧（156 KB）吞吐也同带，但实测有一轮窗口掉到 66 帧（贴住 64）⇒ 不取。
+#define FFRDP_RECVBUF_SIZE  (96 * (FFRDP_MAX_MSS + 0))
 // 应用发送队列容量：编译期常量、内联在结构体里 ⇒ 没有 calloc，也没有"分配失败"这条路 ✓。
 // 它只决定两件事：① 能发的**单条消息**上限 = 这个数 − 4（4 字节长度前缀，超过就返回 -1，不空等 ✓）；
 // ② 背压何时出现（配小 ⇒ 更早出现，调用方按契约重试 ✓）。
-#define FFRDP_APP_TX_SIZE   (64 * 1024)   // 64 KiB：**与 FFRDP_MAX_WAITSND 解耦**
+#define FFRDP_APP_TX_SIZE   (32 * 1024)   // ①-36：**64 → 32 KiB**（省 32 KB/连接）
+                                  //   判据（§26.54 实测）：应用队列 64/192/384 KB ⇒ 吞吐
+                                  //   22.4/23.0/23.1 MB/s（**与容量无关**），应用拒都是 49（队列压根没满）
+                                  //   ⇒ 它只是"背压出现得多早"的旋钮，真正的管道是在途窗口。
                                   // （v1.1.0 里是 WAITSND×(MSS+4) = 374 KiB ✓）。WAITSND 现在只是"在途/受理"的帧数闸门，
                                   // 与这块纯应用侧缓冲无关；旧的乘法把两者捆在一起 ⇒ "省内存"必然"掉吞吐"，是个假取舍 ✗
                                   // （真机实测：WAITSND 64→256 ⇒ 两侧吞吐 ×3，而队列容量本可以不动 ✓）。对吞吐中性 ✓。
