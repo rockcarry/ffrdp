@@ -1731,7 +1731,11 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             // 事后修复：被 keep 的闸门把确认速率拖到最好值的某个比例以下，就按秒翻倍还回去。
             if (c->cap_kept && c->cap_kept < (uint32_t)FFRDP_INFLIGHT_MAX && c->rate_best &&
                 c->rate_now * 100 < c->rate_best * FFRDP_PROBE_RATE_KEEP_PCT) {
-                c->cap_kept = MIN(c->cap_kept * 2, (uint32_t)FFRDP_INFLIGHT_MAX);
+                // 原来这里是 *2：从被证明的 4 翻到 32 只要 3 秒 ✗ ⇒ 一步就能追上下探（探测每 10 秒才问一次 ✗），
+                // 于是"刚降下来又被抬回去"。改成 +25%：4→5→6→8→10→13→16→20→25→32 约十秒 = 一个探测周期 ✓
+                // （2026-10-15 慢 AP 实测：nogiveback 那个候选只关掉了另一处 giveback，这一处仍在 ⇒ 三轮
+                //  9ms/9ms/116ms 的波动就是它 ✗）。安全网不变：速率掉到 85% 以下照样还 ✓，只是不再翻倍 ✓。
+                c->cap_kept = MIN(c->cap_kept + MAX(c->cap_kept / 4, 1), (uint32_t)FFRDP_INFLIGHT_MAX);
                 c->counter_giveback++;
             }
         }
