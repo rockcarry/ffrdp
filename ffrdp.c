@@ -1729,13 +1729,21 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             if (c->rate_now >= c->rate_best) c->rate_best = c->rate_now;
             else                             c->rate_best -= c->rate_best / 4;
             // 事后修复：被 keep 的闸门把确认速率拖到最好值的某个比例以下，就按秒翻倍还回去。
+            // 频率与探测对齐 ✓：一次 giveback 之后至少隔 FFRDP_PROBE_GAP_MS 才允许下一次（两处共用
+            // c->last_giveback 这一个预算 ✓）。2026-10-15 慢 AP 实测：这一处原来每秒都能还一次，
+            // 用 +25% 的步长十秒内就能把 4 抬回 32 ✗（三轮 10/41/39ms 的波动就是它）。
+            // 而那一轮 10ms 与 41ms 的吞吐完全相同（0.30/0.73、0.71/0.29 ✓）⇒ 在这条链路上低窗口
+            // 不花吞吐 ⇒ 这种"急着还"是纯损失 ✗。安全网仍在：第一刀立刻给（速率掉到 85% 以下就还 ✓），
+            // 只是不再一秒一刀 ✓。
             if (c->cap_kept && c->cap_kept < (uint32_t)FFRDP_INFLIGHT_MAX && c->rate_best &&
-                c->rate_now * 100 < c->rate_best * FFRDP_PROBE_RATE_KEEP_PCT) {
+                c->rate_now * 100 < c->rate_best * FFRDP_PROBE_RATE_KEEP_PCT &&
+                (int32_t)get_timestamp32_ms() - (int32_t)c->last_giveback >= (int32_t)FFRDP_PROBE_GAP_MS) {
                 // 原来这里是 *2：从被证明的 4 翻到 32 只要 3 秒 ✗ ⇒ 一步就能追上下探（探测每 10 秒才问一次 ✗），
                 // 于是"刚降下来又被抬回去"。改成 +25%：4→5→6→8→10→13→16→20→25→32 约十秒 = 一个探测周期 ✓
                 // （2026-10-15 慢 AP 实测：nogiveback 那个候选只关掉了另一处 giveback，这一处仍在 ⇒ 三轮
                 //  9ms/9ms/116ms 的波动就是它 ✗）。安全网不变：速率掉到 85% 以下照样还 ✓，只是不再翻倍 ✓。
                 c->cap_kept = MIN(c->cap_kept + MAX(c->cap_kept / 4, 1), (uint32_t)FFRDP_INFLIGHT_MAX);
+                c->last_giveback = get_timestamp32_ms();   // 记时刻 ⇒ 两处共用同一个"还的预算" ✓
                 c->counter_giveback++;
             }
         }
