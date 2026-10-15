@@ -368,6 +368,21 @@ typedef struct {
     uint32_t counter_ack_cov2;     // 2 个 ✓（真攒上了 ✓）
     uint32_t counter_ack_covN;     // >= 3 个 ✓
     uint32_t rx_frames_ref;        // 上一条 ack 时的 counter_rxfull 快照 ✓
+    // 2026-10-15（§26.30 第 2 步 ④-15）：在途闸门"紧不紧" ✓。为什么缺这个数：真机 server 的
+    // cap-block 占 98.4% 圈 ✗，但**光看次数分不出**"贴着上限跑（⇒ 门就是工作点 ✓）"还是
+    // "上限远高于实际在途、只是偶尔碰到（⇒ 门根本没在干活 ✓）" ✗ ⇒ 只能量**占用率**。
+    // 口径：每圈重数在途量时同时累加"在途量"与"当圈上限"（两个和 + 一个计数 ⇒ 均值对均值 ✓）。
+    uint32_t counter_inflight_sum; // Σ 每圈在途帧数 ✓
+    uint32_t counter_limit_sum;    // Σ 每圈生效的上限（MAX(inflight_max, INFLIGHT_MIN) ✓）
+    uint32_t counter_inflight_n;   // 圈数（分母 ✓）
+    uint32_t counter_capb_floor;   // 被挡时上限**在地板上**（<= FFRDP_INFLIGHT_MIN ⇒ 探测压到底了 ✗）
+    uint32_t counter_capb_above;   // ... 在地板之上 ✓
+    uint32_t counter_capb_nosend;  // 被挡的圈里，**一帧都没出去**的圈数（= 闸门直接掐住 ✓ 最硬的证据 ✓）
+    uint32_t cap_ref;              // 上一圈结算时的 counter_capblock 快照 ✓
+    uint32_t counter_cap_wait_ep;  // "被闸门挡住的帧"等多久才真出去（episode ✓）
+    uint32_t counter_cap_wait_ms;  // ... 之和（ms ✓）
+    uint32_t counter_cap_wait_max; // ... 最长（ms ✓）
+    uint32_t tick_cap_starve;      // 当前 episode 的起点（0 = 不在 episode 里 ✓）
     // 2026-10-15（①-6）：TIMER 分支到底走了哪一支、期限模型给的是哪一档 ✓。为什么缺这个数：
     // 真机 server fire÷收帧 ≈ 6.6 ✗，而回环只有 1.3 ✓ ⇒ 不是这条路径本身有问题（它是故意的优化 ✓），
     // 而是真机上有东西在**反复把期限设成"现在"** ✗ ⇒ 只能在这一支里按来源分档量 ✓。纯计数 ✓。
@@ -1717,7 +1732,10 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             if (d == 0)      c->counter_lap_sent0++;
             else if (d == 1) c->counter_lap_sent1++;
             else             c->counter_lap_sentN++;
+            // 只读（§26.30 ④-15）：这一圈被闸门挡过、而且**一帧都没出去** ⇒ 闸门直接掐住 ✓（最硬的证据 ✓）
+            if (c->counter_capblock != c->cap_ref && d == 0) c->counter_capb_nosend++;
         }
+        c->cap_ref = c->counter_capblock;
         c->lap_sent_ref = s_now;
     }
     if (c->tick_last_upd) {
@@ -1740,6 +1758,10 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     {   // count what is really on the wire, fresh every pass, so no counter can drift or leak
         FFRDP_FRAME_NODE *q;
         for (c->inflight_used = 0, q = c->send_list_head; q; q = q->next) if (q->flags & FLAG_FIRST_SEND) c->inflight_used++;
+        // 只读（§26.30 ④-15）：占用率 —— 在途量与当圈上限一起累加（均值对均值才说明"紧不紧" ✓）
+        c->counter_inflight_sum += c->inflight_used;
+        c->counter_limit_sum    += MAX(c->inflight_max ? c->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX, (uint32_t)FFRDP_INFLIGHT_MIN);
+        c->counter_inflight_n++;
     }
     for (i = 0, p = c->send_list_head; i < (int32_t)c->cwnd && p; i++, p = p->next) {
         if (!(p->flags & FLAG_FIRST_SEND)) { // first send
@@ -1751,6 +1773,10 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                 // only stops adding new frames to a wire that already holds FFRDP_INFLIGHT_MAX of them.
                 if (c->inflight_used >= MAX(c->inflight_max ? c->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX, (uint32_t)FFRDP_INFLIGHT_MIN)) {
                     c->counter_capblock++;
+                    // 只读（§26.30 ④-15）：被挡这一刻 —— 上限在不在地板 ✓、episode 起点 ✓
+                    if (c->inflight_max && c->inflight_max > FFRDP_INFLIGHT_MIN) c->counter_capb_above++;
+                    else                                                      c->counter_capb_floor++;
+                    if (c->tick_cap_starve == 0) c->tick_cap_starve = get_timestamp32_ms();
                     break;
                 }
                 if (ffrdp_send_data_frame(ffrdp, c, p) != 0) { ffrdp_congestion_control(ffrdp, c, CEVENT_SEND_FAILED); break; }
@@ -1767,6 +1793,14 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                     c->counter_swnd_wait_ms += d;
                     if (d > c->counter_swnd_wait_max) c->counter_swnd_wait_max = d;
                     c->tick_swnd_starve = 0;
+                }
+                // 只读（§26.30 ④-15）：同一帧也解开了"被在途闸门挡住"的 episode ✓（与上面同终点 ✓）
+                if (c->tick_cap_starve) {
+                    uint32_t d2 = p->tick_send - c->tick_cap_starve;
+                    c->counter_cap_wait_ep++;
+                    c->counter_cap_wait_ms += d2;
+                    if (d2 > c->counter_cap_wait_max) c->counter_cap_wait_max = d2;
+                    c->tick_cap_starve = 0;
                 }
             } else {
                 c->counter_swnd0++;                        // 有帧等着首发、却没信用（这一项按帧计）
@@ -2458,6 +2492,13 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("ack coverage        : sent %u (on data %u, on tick %u), frames covered 0/1/2/>=3 = %u/%u/%u/%u\n",
            c->counter_ack_sent, c->counter_ack_ondata, c->counter_ack_ontick,
            c->counter_ack_cov0, c->counter_ack_cov1, c->counter_ack_cov2, c->counter_ack_covN);
+    // §26.30 ④-15：在途闸门"紧不紧" —— 占用率（均值对均值 ✓）、挡住的圈里有没有一帧没发的 ✓
+    printf("in-flight occupancy : %u laps, sum used %u, sum limit %u (per lap: used/limit; near 1.00 = the gate is the working point)\n",
+           c->counter_inflight_n, c->counter_inflight_sum, c->counter_limit_sum);
+    printf("cap-block detail    : limit at floor %u, above floor %u; laps blocked with 0 frames sent %u\n",
+           c->counter_capb_floor, c->counter_capb_above, c->counter_capb_nosend);
+    printf("cap wait per frame  : %u episodes, %u ms total, %u ms max\n",
+           c->counter_cap_wait_ep, c->counter_cap_wait_ms, c->counter_cap_wait_max);
     printf("ack latency         : %u us avg, %u us max (%u acks)\n",
            c->ack_lat_n ? (uint32_t)(c->ack_lat_sum_us / c->ack_lat_n) : 0,
            c->ack_lat_max_us, c->ack_lat_n);
