@@ -299,7 +299,7 @@ static int link_loop(struct link_arg *a)
                 tick_recv = get_timestamp32_ms();
                 if ((int32_t)get_timestamp32_ms() - (int32_t)tick_dump > TEST_DUMP_INTERVAL_MS) {
                     pthread_mutex_lock(&g_mutex);
-                    ffrdp_dump(ffrdp, handle, 0);
+                    ffrdp_dump(ffrdp, -1, 0)   /* ①-8：打全表 —— 服务端 0 号内嵌槽的计数原来完全不可见 ✗ */;
                     pthread_mutex_unlock(&g_mutex);
                     tick_dump = get_timestamp32_ms();
                 }
@@ -328,12 +328,12 @@ static int link_loop(struct link_arg *a)
                 fflush(stdout);
                 tick_dump = nowi;
                 if (++hb % 5 == 0) {   // 每 5s 打一次协议状态（连接数 / 握手状态 / 计数器）
-                    pthread_mutex_lock(&g_mutex); ffrdp_dump(ffrdp, handle, 0); pthread_mutex_unlock(&g_mutex);
+                    pthread_mutex_lock(&g_mutex); ffrdp_dump(ffrdp, -1, 0)   /* ①-8：打全表 —— 服务端 0 号内嵌槽的计数原来完全不可见 ✗ */; pthread_mutex_unlock(&g_mutex);
                 }
             }
         } else if (connected && peer_is_lost(ffrdp, handle, tick_recv)) {
             printf("%s lost ! (handle %d)\n", peer->peer, handle);
-            if (ffrdp) { printf("%s --- dump ---\n", peer->name); fflush(stdout); ffrdp_dump(ffrdp, handle, 0); }
+            if (ffrdp) { printf("%s --- dump ---\n", peer->name); fflush(stdout); ffrdp_dump(ffrdp, -1, 0)   /* ①-8：打全表 —— 服务端 0 号内嵌槽的计数原来完全不可见 ✗ */; }
             lost = 1;
             break;                        // 这条连接完了；要不要重建由调用方决定 ✓
         }
