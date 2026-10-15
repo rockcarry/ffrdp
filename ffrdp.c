@@ -1858,6 +1858,13 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                     c->probe_waste_ref = c->probe_waste;
                     c->cap           = c->probe_cap;
                     c->counter_probe++;
+                    // ⚠️ 探测**进行中**时，`probe_next` 必须跟着推到未来 ✗：刷新它的两处都在"探测结束"
+                    // （keep → now + probe_hold ✓ / revert → now + probe_gap ✓），而这段时间外层
+                    // `if (c->probe_state == 0)` 又把整段跳过 ⇒ 它会一直停在启动那一刻（过去）✗
+                    // ⇒ 最后一律被压成 `due = now` ⇒ `ffrdp_next_due` 每圈都要求"现在" ⇒ worker 空转 ✗。
+                    // 2026-10-15 真机实测：每次探测约 14 秒（= probe_hold ✓）都在空转 ⇒ STALE 187~234 万次/轮、
+                    // 低层 94~97% 的圈是空的 ✗（probes 7~9 次/轮 ⇒ 整轮大半时间都在自旋 ✓）。
+                    c->probe_next = now + c->probe_hold;
                 } else if (waste < FFRDP_PROBE_HEALTHY_PCT && c->cap_kept && idle &&
                            c->giveback_idle >= FFRDP_PROBE_GIVEBACK_IDLE_S &&
                            (int32_t)now - (int32_t)c->last_giveback >= (int32_t)FFRDP_PROBE_GAP_MS) {
