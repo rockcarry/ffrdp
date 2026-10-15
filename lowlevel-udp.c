@@ -64,6 +64,18 @@ typedef struct {
     uint32_t        stat_arm_now_other;  // 跨线程 arm 成 <= now 的次数
     uint32_t        stat_arm_now_loop;   // 从循环自己线程 arm 成 <= now 的次数
     int             stat_rx_errno;    // 第一次失败的 errno（0 = 还没失败过 ✓）
+    // 追加③（①-4）：把"空圈"再往下一层拆 ✓ —— 协议侧四个桶对不上总圈数（真机 2026-10-15：
+    // 服务端 laps 695849 vs 桶和 248908 ✗，有 ~45 万圈在协议账上根本不存在 ✗）⇒ 肇事者不在
+    // ffrdp_next_due 那一层 ⇒ 只能在这里量：睡下去时期限离现在多远 ✓、tick 进去时是什么情形 ✓。
+    // 纯计数，不改行为 ✗。
+    uint32_t        stat_left_le0;    // 睡下时期限已过期（left<0 ⇒ 实睡 0ms ✗ 自旋圈）
+    uint32_t        stat_left_0;      // left == 0（0ms，但确实等到点了 ✓）
+    uint32_t        stat_left_1_9;    // 1~9ms
+    uint32_t        stat_left_ge10;   // >= 10ms（正常睡眠 ✓）
+    uint32_t        stat_sleep_none;  // 睡下时没有期限（deadline 0 ⇒ 永久睡 ✓）
+    uint32_t        stat_tick_fire;   // tick 真的到点并跑了回调 ✓
+    uint32_t        stat_tick_none;   // tick 进去发现没期限（没有回调 ✗）
+    uint32_t        stat_tick_early;  // tick 进去发现期限还没到（没有回调 ✗）
 } UDP_LOWLEVEL;
 
 // 跨 API 的 addr 是 uint64：布局是两条层共同的约定（见 utils.h 的 ffrdp_addr_make），不是本文件的私事。
@@ -157,7 +169,11 @@ static void ffrdp_udp_tick(UDP_LOWLEVEL *udp)
 {
     uint32_t now = get_timestamp32_ms();
     pthread_mutex_lock(&udp->lock);
-    if (!udp->deadline || (int32_t)(udp->deadline - now) > 0) { pthread_mutex_unlock(&udp->lock); return; }
+    if (!udp->deadline || (int32_t)(udp->deadline - now) > 0) {
+        if (!udp->deadline) udp->stat_tick_none++; else udp->stat_tick_early++;   // 只读（①-4）
+        pthread_mutex_unlock(&udp->lock); return;
+    }
+    udp->stat_tick_fire++;                                                        // 只读（①-4）
     udp->deadline = 0;
     pthread_mutex_unlock(&udp->lock);
     if (udp->callback) udp->callback(udp->cbctx, FFRDP_LOWLEVEL_TYPE_TIMER, NULL, 0);
@@ -231,10 +247,17 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
         uint32_t dl = ffrdp_udp_sleep_begin(udp);
         if (dl) {
             int32_t left = (int32_t)(dl - get_timestamp32_ms());
+            // 只读（①-4）：left<0 就是"实睡 0ms"的那种自旋圈 ✗（select 返回 0 ⇒ 又是一圈）
+            if (left < 0)       udp->stat_left_le0++;
+            else if (left == 0) udp->stat_left_0++;
+            else if (left <= 9) udp->stat_left_1_9++;
+            else                udp->stat_left_ge10++;
             if (left < 0) left = 0;                    // due already: come straight back
             tv.tv_sec  = left / 1000;
             tv.tv_usec = (left % 1000) * 1000;
             tvp = &tv;
+        } else {
+            udp->stat_sleep_none++;                    // 只读（①-4）：没有期限 ⇒ 永久睡 ✓
         }
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -302,6 +325,11 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
            udp->stat_rx_fail, udp->stat_rx_errno);
     printf("udp lowlevel arm-now: %u from other threads, %u from the loop itself\n",
            udp->stat_arm_now_other, udp->stat_arm_now_loop);
+    // ①-4：空圈往下一层拆 —— 睡下时的 left 分布 + tick 三分类 ✓
+    printf("udp lowlevel sleep-left: expired %u, 0ms %u, 1-9ms %u, >=10ms %u, no-deadline %u\n",
+           udp->stat_left_le0, udp->stat_left_0, udp->stat_left_1_9, udp->stat_left_ge10, udp->stat_sleep_none);
+    printf("udp lowlevel tick kind: fire %u, none %u, early %u (the two 'none/early' are laps that ran no callback)\n",
+           udp->stat_tick_fire, udp->stat_tick_none, udp->stat_tick_early);
     closesocket(udp->sockfd); udp->sockfd = -1;
     {   int fd = udp->notify;
         udp->notify = -1;              // 先摘引用、再关：晚到的 timer() 只会看到"没有"，不会发到已关的 fd 上
