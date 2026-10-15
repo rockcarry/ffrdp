@@ -391,8 +391,12 @@ report() {   # $1=日志 $2=角色
         printf '  %-7s %s\n' "" "CPU: $(tr '\n' ' ' < "$LOGDIR/${TAG}_${role}_${STAMP}.cpu")"
     fi
     # 顺手记一行到 logs/summary.csv，扫完一串二进制可以直接列成表
+    # ⚠ 空字段必须写成 "-"：写成空的话 `column -t` 会把后面几列顶到前面，看着像"列错位/工具坏了" ✗
+    #   （2026-10-15 实测：链路 600ms 时一轮只发了 49 条消息 ⇒ 不少字段没有 ⇒ 表面上看成了"结果不对"）。
+    #   另外 rtts 的 4294967295 是协议自己的哨兵（= 本轮还没有任何 RTT 采样）⇒ 标成 none 更好认 ✓。
+    [ "$rtts" = "4294967295" ] && rtts="none"
     printf '%s,%s,%s,%s,%s,%s,%s\n' "$STAMP" "$TAG" "$role" \
-        "${res%\%}" "${waste%\%}" "${rtts:-}" "${spd:-}" >> "$LOGDIR/summary.csv"
+        "${res:--}" "${waste:--}" "${rtts:--}" "${spd:--}" >> "$LOGDIR/summary.csv"
 }
 if [ -s "${PINGP:-/nonexistent}" ]; then
     printf '链路 ping   : %s\n' "$(tr '\n' ' ' < "$PINGP")"
