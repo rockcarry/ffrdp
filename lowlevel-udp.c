@@ -74,6 +74,9 @@ typedef struct {
     // ①-25（本轮实验 ✓）：RX 批上限从宏改成**运行时可调**（env FFRDP_RX_BATCH ✓，默认仍是
     // FFRDP_LOWLEVEL_RX_BATCH_MAX=2 ✓ —— 那个值是文件头那张实测表选出来的 ✓）。
     int             rx_batch;             // 一圈最多收几帧（默认 2 ✓）
+    int             bufsize;              // ①-30：套接字缓冲请求值（字节 ✓；env 可调 ✓）
+    int             buf_rcv_eff;          // 内核实际给的（getsockopt ✓，dump 里打 ✓）
+    int             buf_snd_eff;
     int             stat_rx_errno;       // 第一次失败的 errno（0 = 还没失败过 ✓）
     // 追加③（①-4）：把"空圈"再往下一层拆 ✓ —— 协议侧四个桶对不上总圈数（真机 2026-10-15：
     // 服务端 laps 695849 vs 桶和 248908 ✗，有 ~45 万圈在协议账上根本不存在 ✗）⇒ 肇事者不在
@@ -293,8 +296,15 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
             // non blocking, the same contract this project's own socket has: a frame that cannot be handed
             // to the kernel must come back as an error to the caller, not as a stall in a receive loop.
             socket_setopt(udp->sockfd, "nonblock_io", 1);
-            socket_setopt(udp->sockfd, "send_buffer", FFRDP_LOWLEVEL_BUFFER_SIZE);
-            socket_setopt(udp->sockfd, "recv_buffer", FFRDP_LOWLEVEL_BUFFER_SIZE);
+            socket_setopt(udp->sockfd, "send_buffer", udp->bufsize);   // ①-30
+            socket_setopt(udp->sockfd, "recv_buffer", udp->bufsize);   // ①-30
+            {   // ①-30：把内核**实际**给的值记下来（Linux 会翻倍后再夹到 rmem_max/wmem_max ✓）
+                socklen_t sl = sizeof(int);
+                udp->buf_rcv_eff = udp->buf_snd_eff = 0;
+                getsockopt(udp->sockfd, SOL_SOCKET, SO_RCVBUF, (void*)&udp->buf_rcv_eff, &sl);
+                sl = sizeof(int);
+                getsockopt(udp->sockfd, SOL_SOCKET, SO_SNDBUF, (void*)&udp->buf_snd_eff, &sl);
+            }
             if (udp->sockfd < 0) { printf("<2> ffrdp-udp failed to create socket !\n"); usleep(100 * 1000); continue; }
             if ((udp->flags & FLAG_BIND_ADDR) && bind(udp->sockfd, (struct sockaddr*)&udp->addr, sizeof(udp->addr)) < 0) {
                 printf("<2> udpproxy failed to bind socket to port %d !\n", ntohs(udp->addr.sin_port));
@@ -441,6 +451,8 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
            udp->stat_cb_us_sum, udp->stat_cb_us_max);
     printf("udp lowlevel rx batch: %d frames per lap (env FFRDP_RX_BATCH; default = %d)\n",
            udp->rx_batch, FFRDP_LOWLEVEL_RX_BATCH_MAX);
+    printf("udp lowlevel buffers : requested %d B, kernel gave rcv %d B / snd %d B (①-30; env FFRDP_BUFSIZE in KB; rmem_max caps it)\n",
+           udp->bufsize, udp->buf_rcv_eff, udp->buf_snd_eff);
     printf("udp lowlevel tx      : sendto %u calls, %u bytes (per frame = calls / frames in the ffrdp block)\n",
            udp->stat_tx_calls, udp->stat_tx_bytes);
     // ④-13（§26.30 第 2 步）：一圈的时间去向（采样 1/64 ✓；三段互斥、和 = 整圈 ✓）—— 除以采样圈数就是每圈 ✓
@@ -558,6 +570,11 @@ FFRDP_LOWLEVEL* ffrdp_udp_lowlevel_init(void *params, FFRDP_LOWLEVEL_CB callback
         const char *e = getenv("FFRDP_RX_BATCH");
         udp->rx_batch = FFRDP_LOWLEVEL_RX_BATCH_MAX;
         if (e && *e) { int v = atoi(e); if (v >= 1 && v <= 64) udp->rx_batch = v; }
+    }
+    {   // ①-30：缓冲请求值（KB ✓）；默认 = 源码常量 ✓
+        const char *e = getenv("FFRDP_BUFSIZE");
+        udp->bufsize = FFRDP_LOWLEVEL_BUFFER_SIZE;
+        if (e && *e) { int v = atoi(e); if (v >= 4 && v <= 65536) udp->bufsize = v * 1024; }
     }
     udp->callback     = callback;
     udp->cbctx        = cbctx;

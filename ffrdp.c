@@ -92,10 +92,14 @@ static uint32_t g_waitsnd      = FFRDP_MAX_WAITSND;
 // acks-arrived-but-missed 1350 ✓），而每来一个就把 cwnd 减半 ⇒ 窗口被钉在地板 ⇒ 吞吐塌 ✓。
 // 默认 0 = 保持原行为（与快速重传同一档：乘性减半 ✓）⇒ 零行为变化 ✓。
 static int      g_pseudo_nocut = 0;
-// ①-29：`ffrdp_apply_acks` 里"洞等够久"那条分支，**同一帧只许减半一次** ✓（默认关 = 原行为 ✓）。
-// 为什么：那条分支在**每次 ack** 都会重新走一遍发送表 ✓，而 CC 调用没有"已经减过"的守卫 ✗ ⇒
-// 同一个帧每当 hole_wait 到点就被再判一次 ✓ —— 这正是 `cwnd-back` 远多于三类触发事件的原因 ✓。
-static int      g_hole_cut_once = 0;
+// ①-29（**①-30 起转正：默认 ON** ✓）：`ffrdp_apply_acks` 里"洞等够久"那条分支，
+// **同一帧只许减半一次** ✓。为什么：那条分支在**每次 ack** 都会重新走一遍发送表 ✓，而 CC 调用
+// 没有"已经减过"的守卫 ✗ ⇒ 同一个帧每当 hole_wait 到点就被再判一次 ✓。
+// 实测（§26.49 ✓ lo ✓ burst=8）：守卫关 ⇒ 770 次分支里 **729 次是重复减半** ✗、单帧最多 **62** 次 ✗
+// （窗口抬到 256 时 **16 707/17 409** ✗、单帧最多 **238** 次 ✗✗）；开了之后真调 CC 770→**104** ✓、
+// `cwnd-back` 829→**212** ✓，而同档吞吐 31.6 → **34.8/36.2 MB/s** ✓（两次复测同向 ✓，仍在单跑噪声带边缘 ✓）。
+// 保留 env：`FFRDP_HOLE_CUT_ONCE=0` 可关回原行为（复现对照用 ✓）。
+static int      g_hole_cut_once = 1;
 static int      g_knobs_read   = 0;
 static void ffrdp_read_knobs(void)
 {
@@ -1656,7 +1660,7 @@ static void ffrdp_apply_acks(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_RX_BATCH *
                 if ((int32_t)get_timestamp32_ms() - (int32_t)p->tick_send >= (int32_t)c->hole_wait) {
                     c->counter_cc_hole++;                                   // ①-29（只读 ✓）
                     // ⚠️ 这一分支在**每次 ack** 都会重走发送表 ✗ ⇒ 原来同一帧会被反复判减半 ✓；
-                    //    开了守卫（默认关 ✓）就只认第一次（那一帧的 FLAG_FAST_RESEND 由重传路径清 ✓）。
+                    //    守卫从 ①-30 起**默认开** ✓ ⇒ 只认第一次（那一帧的 FLAG_FAST_RESEND 由重传路径清 ✓）。
                     if (!g_hole_cut_once || !(p->flags & FLAG_FAST_RESEND)) {
                         ffrdp_congestion_control(ffrdp, c, CEVENT_FAST_RESEND);
                         p->flags |= FLAG_FAST_RESEND;
