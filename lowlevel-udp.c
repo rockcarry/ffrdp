@@ -575,7 +575,14 @@ FFRDP_LOWLEVEL* ffrdp_udp_lowlevel_init(void *params, FFRDP_LOWLEVEL_CB callback
     }
     {   // ①-30：缓冲请求值（KB ✓）；默认 = 源码常量 ✓
         const char *e = getenv("FFRDP_BUFSIZE");
-        udp->bufsize = FFRDP_LOWLEVEL_BUFFER_SIZE;
+        // ①-37（2026-10-15）：**188 KB → 96 KB**。判据是用户给的"lo 25 MB/s 就够" +
+        //   "省内存优先" ⇒ 这个值只在**够用**的前提下取最小。实测膝点（lo，各两轮，内核把请求翻倍）：
+        //     请求 64 KB ⇒ 实给 128 KB ⇒ 15.5 / 20.2 MB/s（**不足 25** ✗）
+        //     请求 96 KB ⇒ 实给 192 KB ⇒ **42.0 / 29.8 MB/s** ✓（重传 0.24 / 0.35% ✓）
+        //     请求 188 KB（旧值）⇒ 实给 376 KB ⇒ 38.1 / 40.1 MB/s（同带 ✓）但内存翻倍 ✗
+        //   ⇒ 取 96 KB：**每 socket 省 368 KB** ✓，而实给 192 KB 仍在默认 rmem_max（208 KB）之内
+        //     ⇒ **部署端不必改 sysctl** ✓（旧值 188 KB 反而要求把上限抬高 ✓）。
+        udp->bufsize = 96 * 1024;
         if (e && *e) { int v = atoi(e); if (v >= 4 && v <= 65536) udp->bufsize = v * 1024; }
     }
     udp->callback     = callback;
