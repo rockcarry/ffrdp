@@ -107,7 +107,7 @@ gcc -Wall -Werror test.c libffrdp.a -lpthread -o test_ffrdp
 
 ```
 [client] verify: sent 285 msgs / 1638311 B, recv 285 msgs / 1638311 B | seq_gap 0 (missing 0), crc_err 0, len_err 0, partial_err 0
-[client] verify: OK —— 收到的 285 条消息 seq 连续、crc 全部正确 ✓
+[client] verify: OK -- received 285 messages, seq contiguous and crc all correct
 ```
 
 说明：
