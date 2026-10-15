@@ -1861,7 +1861,7 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                 uint32_t del_during    = c->counter_delivered - c->probe_del_ref;
                 uint32_t waste_during  = del_during ? (uint32_t)(1000.0 * resend_during / del_during) : 0;
                 uint32_t waste_down    = waste_during + waste_during / 4 < c->probe_waste_ref;   // 低 20% 以上才认 ✓
-                // 2026-10-15 定稿：保留更小窗口**不再要求"看到 RTT 下降"** ✗ —— 那条最不稳。
+                // 2026-10-15 定稿（真机三轮 8/11/20ms ✓，见 notes §26.18）：保留更小窗口**不再要求"看到 RTT 下降"** ✗。
                 // 依据：慢 AP 同批对照里，10ms 与 40ms 两轮的吞吐完全相同（0.30/0.73、0.71/0.29 ✓）
                 // ⇒ 低窗口在这条链路上不花吞吐 ✓；而 rtt_down 依赖的 rtts 是滑窗、突发链路上会踩空 ✗
                 // （§26.16：日志 ref/best = 79/79，而实际 227↔79ms 在跳 ✓）⇒ 它只带来"中不中"的运气：
