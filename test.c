@@ -121,7 +121,7 @@ static void verify_log(const char *name, const char *peer, const char *what,
     if (*slot < 3) {
         printf("[%s] VERIFY %s: %s (a=%u b=%u)\n", name, peer, what, a, b);
     } else if (*slot == 3) {
-        printf("[%s] VERIFY %s: %s ... > 3 次，后续同类不再逐条打印（见退出汇总）\n", name, peer, what);
+        printf("[%s] VERIFY %s: %s ... more than 3 times; further ones of the same kind are not printed one by one (see the exit summary)\n", name, peer, what);
     }
     (*slot)++;
 }
@@ -285,9 +285,9 @@ done:
            peer->name, v.sent_msgs, v.sent_bytes, v.recv_msgs, v.recv_bytes,
            v.seq_gap, v.seq_missing, v.crc_err, v.len_err, v.partial_err);
     if (v.crc_err || v.len_err || v.partial_err || v.seq_gap) {
-        printf("[%s] verify: *** 校验未通过 *** ✗\n", peer->name);
+        printf("[%s] verify: *** CHECK FAILED ***\n", peer->name);
     } else if (v.recv_msgs) {
-        printf("[%s] verify: OK —— 收到的 %u 条消息 seq 连续、crc 全部正确 ✓\n", peer->name, v.recv_msgs);
+        printf("[%s] verify: OK -- received %u messages, seq contiguous and crc all correct\n", peer->name, v.recv_msgs);
     }
     free(sendbuf);
     free(stream);
