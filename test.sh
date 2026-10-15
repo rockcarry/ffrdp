@@ -26,6 +26,9 @@
 #                    日志：第 1 个是 <tag>_client_<stamp>.log ✓、第 2..N 个是它加 _c2.._cN ✓；
 #                    互通自测那几条用 ASCII 名（v1ref_v1srv_v2cli_hs0_* ✓），漂亮的 ①②③ 只在终端 ✓
 #     CPUWATCH=1     同时采样本地客户端进程的 CPU（单核百分比），写进 *.cpu
+#     PINGWATCH=1    同时量**链路本身**：整轮 1 秒一次 ping 对端，写 min/avg/max + 丢包到 *.ping
+#                    （真机每轮之间能差 100 倍 ✗：2026-10-15 实测同一份二进制 rtts 12ms ↔ 441ms、
+#                     而当时 ping 对端就是 375/441/508ms ⇒ 没有这条读数就分不清"代码还是链路" ✓）
 #     KEEP_MUX=1     跑完不关 SSH 复用连接（连跑多个二进制时少输几次密码）
 #     CLEAN=1        跑完删掉远端 /tmp 里的二进制与日志
 #     DRY=1          只打印将要做什么，不碰网络（用来检查参数/语法）
@@ -46,7 +49,7 @@ PORT="${PORT:-8111}"
 LOGDIR="${LOGDIR:-$PWD/logs}"
 # STAMP 决定日志与 CSV 的每轮标识。一次扫描想共享一个标识（便于成组比较）就设 SESSION=xxx。
 STAMP="${STAMP:-${SESSION:-$(date +%m%d-%H%M%S)}}"
-DRY="${DRY:-0}"; CLEAN="${CLEAN:-0}"
+DRY="${DRY:-0}"; CLEAN="${CLEAN:-0}"; PINGWATCH="${PINGWATCH:-0}"
 
 # 把二进制路径转成**绝对路径**再往下用 ✓ —— 后面所有执行都过 env / stdbuf，
 # 而 stdbuf 对不含 "/" 的名字会走 PATH 查找 ⇒ 裸名字（test_ffrdp）会 127 失败 ✗。
@@ -178,6 +181,22 @@ cpu_watch() {   # $1 = timeout 的 pid（客户端是它的子进程），$2 = �
     printf 'avg_pct_of_one_core=%s\npeak_pct_of_one_core=%s\n' "$cur" "$peak" > "$out"
 }
 
+# PINGWATCH=1 时同时量"链路本身"：整轮按 1 秒间隔 ping 对端，结束从 ping 自己的汇总里抽数字。
+# 为什么需要它：真机每轮之间链路能差 100 倍 ✗（2026-10-15：同一份二进制 rtts 12ms ↔ 441ms、
+# resend_perMB 0.24 ↔ 51.9 ✗），光看协议数字分不清"代码变了"还是"链路变了" ⇒ 每轮带一条环境读数 ✓。
+# 注意它必须**独立于协议**：所以用 ping，而不是用我们自己的统计 ✓。
+ping_watch() {   # $1 = 对端地址（不含 user@）$2 = 输出前缀 $3 = 秒数
+    command -v ping >/dev/null 2>&1 || return 1
+    ping -c "$3" -i 1 -W 2 "$1" > "$2.raw" 2>&1 &
+    PINGPID=$!
+}
+ping_note() {    # $1 = 原始输出 $2 = 摘要输出（key=value，与 *.cpu 同风格 ✓）
+    local raw="$1" out="$2" loss rtt
+    loss="$(grep -o '[0-9.]*% packet loss' "$raw" 2>/dev/null | tail -1 | cut -d% -f1)"
+    rtt="$(grep -o 'rtt min/avg/max[^=]*= *[0-9./]*' "$raw" 2>/dev/null | tail -1 | sed 's/.*= *//')"
+    printf 'loss_pct=%s\nrtt_min_avg_max_ms=%s\n' "${loss:-?}" "${rtt:-?}" > "$out"
+}
+
 # ---------- ssh / scp 封装 ----------
 SSH_OPTS=(-o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=10 -o ServerAliveCountMax=2)
 # 复用连接的路径固定（不塞进 $$），这样连跑多个二进制时也只输一次密码；KEEP_MUX=1 时退出也不关它。
@@ -283,6 +302,10 @@ fi
 
 say "[4/6] 本地起客户端（${DUR}s × ${CLIENTS} 个）"
 CPUF="$LOGDIR/${TAG}_client_${STAMP}.cpu"
+PINGP="$LOGDIR/${TAG}_ping_${STAMP}.txt"
+if [ "$PINGWATCH" = 1 ] && [ "$DRY" != 1 ]; then
+    ping_watch "$HOST" "$PINGP" "$((DUR+5))" && say "      PINGWATCH：同时对 $HOST 打 $((DUR+5)) 发（写 $PINGP）"
+fi
 if [ "$DRY" = 1 ]; then
     say "      (DRY) ( sleep $DUR; echo quit ) | stdbuf -oL $BIN --client=$HOST:$PORT > $LOCAL_LOG   ×${CLIENTS}"
 else
@@ -304,6 +327,12 @@ else
         wait "$p" 2>/dev/null || RC=$?
     done
     say "      ${CLIENTS} 个客户端都结束（最后一个退出码 $RC）→ $(client_logs_hint)"
+fi
+
+if [ "$PINGWATCH" = 1 ] && [ "$DRY" != 1 ] && [ -n "${PINGPID:-}" ]; then
+    wait "$PINGPID" 2>/dev/null
+    ping_note "${PINGP}.raw" "$PINGP"
+    say "      链路读数 → $PINGP（$(tr '\n' ' ' < "$PINGP")）"
 fi
 
 say "[5/6] 等服务端收尾，把日志取回本地"
@@ -365,6 +394,9 @@ report() {   # $1=日志 $2=角色
     printf '%s,%s,%s,%s,%s,%s,%s\n' "$STAMP" "$TAG" "$role" \
         "${res%\%}" "${waste%\%}" "${rtts:-}" "${spd:-}" >> "$LOGDIR/summary.csv"
 }
+if [ -s "${PINGP:-/nonexistent}" ]; then
+    printf '链路 ping   : %s\n' "$(tr '\n' ' ' < "$PINGP")"
+fi
 [ -f "$LOGDIR/summary.csv" ] || echo 'stamp,tag,role,resend_pct,waste_pct,rtts_ms,send_recv_MBps' > "$LOGDIR/summary.csv"
 c=1
 while [ "$c" -le "$CLIENTS" ]; do
