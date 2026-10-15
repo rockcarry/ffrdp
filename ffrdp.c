@@ -1861,7 +1861,14 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                 uint32_t del_during    = c->counter_delivered - c->probe_del_ref;
                 uint32_t waste_during  = del_during ? (uint32_t)(1000.0 * resend_during / del_during) : 0;
                 uint32_t waste_down    = waste_during + waste_during / 4 < c->probe_waste_ref;   // 低 20% 以上才认 ✓
-                if (rate_kept && (rtt_down || waste_down)) {
+                // 2026-10-15 定稿：保留更小窗口**不再要求"看到 RTT 下降"** ✗ —— 那条最不稳。
+                // 依据：慢 AP 同批对照里，10ms 与 40ms 两轮的吞吐完全相同（0.30/0.73、0.71/0.29 ✓）
+                // ⇒ 低窗口在这条链路上不花吞吐 ✓；而 rtt_down 依赖的 rtts 是滑窗、突发链路上会踩空 ✗
+                // （§26.16：日志 ref/best = 79/79，而实际 227↔79ms 在跳 ✓）⇒ 它只带来"中不中"的运气：
+                // 同一条链路上，停在 40ms ✗ 与落到 11ms ✓ 各占一半。保留的两条都更硬：
+                //   rate_kept  —— 速率没掉（快 AP 上继续减半就会掉 ⇒ 它自己挡回来 ✓，即"窗口 = 链路 BDP" ✓）
+                //   waste_down —— 重传强度明显下来了（慢 AP 上真正的收益就在这里 ✓）
+                if (rate_kept || waste_down) {
                     c->cap_kept  = c->probe_cap;
                     c->probe_gap = FFRDP_PROBE_GAP_MS;
                     // the experiment just proved there is more to win, so do not sit out a whole back off
