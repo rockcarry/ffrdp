@@ -164,7 +164,7 @@ static void verify_log(const char *name, const char *peer, const char *what,
     if (*slot < 3) {
         printf("[%s] VERIFY %s: %s (a=%u b=%u)\n", name, peer, what, a, b);
     } else if (*slot == 3) {
-        printf("[%s] VERIFY %s: %s ... > 3 次，后续同类不再逐条打印（见退出汇总）\n", name, peer, what);
+        printf("[%s] VERIFY %s: %s ... more than 3 times; further ones of the same kind are not printed one by one (see the exit summary)\n", name, peer, what);
     }
     (*slot)++;
 }
@@ -324,7 +324,7 @@ static int link_loop(struct link_arg *a)
                 printf("[%s] idle: conn=%d isdead=%d app_silent=%ums%s\n",
                        peer->name, handle, dead, (unsigned)silent,
                        (dead == 0 && (int32_t)silent > TEST_PEER_SILENCE_MS)
-                           ? "  <- 应用层的静默超时本会误报，协议侧没判死 ✓" : "");
+                           ? "  <- the application-level silence would have been a false alarm; the protocol side did not declare it dead" : "");
                 fflush(stdout);
                 tick_dump = nowi;
                 if (++hb % 5 == 0) {   // 每 5s 打一次协议状态（连接数 / 握手状态 / 计数器）
@@ -344,9 +344,9 @@ done:
            peer->name, v.sent_msgs, v.sent_bytes, v.recv_msgs, v.recv_bytes,
            v.seq_gap, v.seq_missing, v.crc_err, v.len_err, v.partial_err);
     if (v.crc_err || v.len_err || v.partial_err || v.seq_gap) {
-        printf("[%s] verify: *** 校验未通过 *** ✗\n", peer->name);
+        printf("[%s] verify: *** CHECK FAILED ***\n", peer->name);
     } else if (v.recv_msgs) {
-        printf("[%s] verify: OK —— 收到的 %u 条消息 seq 连续、crc 全部正确 ✓\n", peer->name, v.recv_msgs);
+        printf("[%s] verify: OK -- received %u messages, seq contiguous and crc all correct\n", peer->name, v.recv_msgs);
     }
     if (g_do_close && ffrdp) {
         // 主动关闭（验四次挥手）：ffrdp_close ⇒ 我方发 FIN ⇒ 对端回 FIN ⇒ 双方各自 DISCONN ✓。
@@ -354,22 +354,22 @@ done:
         int r = ffrdp_close(ffrdp, handle);
         int t0 = (int)get_timestamp32_ms();
         char tmp[512];
-        printf("[%s] close(conn=%d) -> %d，等对端 FIN（最多 2000ms）...\n", peer->name, handle, r);
+        printf("[%s] close(conn=%d) -> %d, waiting for the peer's FIN (up to 2000ms) ...\n", peer->name, handle, r);
         fflush(stdout);
         while (r == 0 && (int)get_timestamp32_ms() - t0 < 2000) {
             int rd = ffrdp_recv(ffrdp, handle, tmp, sizeof(tmp), 50);
             if (ffrdp_isdead(ffrdp, handle)) {
-                printf("[%s] close: 连接已断（收到对端 FIN / DISCONN ✓），%d ms\n",
+                printf("[%s] close: peer FIN received, connection closed, %d ms\n",
                        peer->name, (int)get_timestamp32_ms() - t0);
                 break;
             }
             if (rd == 0) {
-                printf("[%s] close: recv 报 CLOSED ⇒ 连接已断 ✓\n", peer->name);
+                printf("[%s] close: recv reported CLOSED, connection is gone\n", peer->name);
                 break;
             }
         }
         if (r == 0 && !ffrdp_isdead(ffrdp, handle))
-            printf("[%s] close: 2s 内没等到对端 FIN（对端已退 / 或 hs:0 ⇒ 仅本地拆除 ✓）\n", peer->name);
+            printf("[%s] close: no peer FIN within 2s (peer already exited, or hs:0 => local teardown only)\n", peer->name);
         fflush(stdout);
     }
     free(sendbuf);
@@ -527,8 +527,8 @@ int main(int argc, char *argv[])
             if (sh && *sh) g_use_hs = atoi(sh) ? 1 : 0;   // 与 ffrdp_init 拼串时的判断保持同一口径 ✓
         }
         if (sc && *sc) g_do_close = atoi(sc) ? 1 : 0;
-        if (g_idle_sec > 0) printf("idle mode           : on（不发应用数据，只验 keepalive 不误杀 ✓）\n");
-        if (g_do_close)     printf("close on exit       : on（退出前 ffrdp_close ⇒ 验四次挥手 ✓）\n");
+        if (g_idle_sec > 0) printf("idle mode           : on (no application data; only checks that keepalive does not misfire)\n");
+        if (g_do_close)     printf("close on exit       : on (calls ffrdp_close before exit; checks the four-way handshake)\n");
     }
     printf("send_speed          : %d KB/s%s\n", send_speed, send_speed ? "" : " (unlimited)");
     if (server_en) {

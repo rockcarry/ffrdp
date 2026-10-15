@@ -140,7 +140,7 @@ pair_run() {   # $1=标签（只给人看 ✓）$2=env $3=期望(通|空闲) $4=
         PAIR_NOTE="两侧 verify OK=${cs}/${ss}，客户端 rc=$rc"
     else
         grep -q 'idle mode *: on' "$OUT/pair_${slug}_client.log" 2>/dev/null || PAIR_OK=0
-        grep -q 'close: 连接已断'  "$OUT/pair_${slug}_client.log" 2>/dev/null || PAIR_OK=0
+        grep -q 'close: peer FIN received' "$OUT/pair_${slug}_client.log" 2>/dev/null || PAIR_OK=0
         grep -q 'lost !'          "$OUT/pair_${slug}_client.log" 2>/dev/null && PAIR_OK=0
         PAIR_NOTE="'lost !' $(grep -c 'lost !' "$OUT/pair_${slug}_client.log" 2>/dev/null || true) 次（要 0 ✓），DISCONN $(grep -c 'DISCONN' "$OUT/pair_${slug}_client.log" 2>/dev/null || true) 次"
     fi
