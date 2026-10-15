@@ -348,6 +348,14 @@ typedef struct {
     uint32_t counter_refuse_wnd;   // 帧数闸：ceil(len/smss) + pub_wait_snd > FFRDP_MAX_WAITSND
     uint32_t counter_refuse_bytes; // 字节闸：队列放不下（4 + len + app_tx_size > FFRDP_APP_TX_SIZE）
     uint32_t counter_refuse_big;   // 单条就比队列大（EINVAL：永远收不下 ⇒ 不是"重试就好"）
+    // 2026-10-15（①-24）：**其余**拒绝出口的账。为什么缺这个数：上面三条 gate 之外，ffrdp_send 还有
+    // 几条裸 return/goto（表槽已空 / closing / 服务端未连上 / 握手失败 / 握手未完成 ✗）——实测 burst=8
+    // 时应用侧 refused 7046 ✓ 而三条 gate 里只有 queue-bytes 6996 ✓ ⇒ 对上了 ✓；但"没有计数"这件事
+    // 本身让分账不安全 ✗（下一个人照样只能猜 ✓）。纯计数 ✓，一个字节行为不动 ✗。
+    uint32_t counter_ref_closing;  // ffrdp->closing ⇒ CLOSED
+    uint32_t counter_ref_notconn;  // 服务端、对端还没连上 ⇒ CLOSED
+    uint32_t counter_ref_hsfail;   // 握手超时 ⇒ CLOSED
+    uint32_t counter_ref_hsdown;   // 客户端、握手还没成 ⇒ EAGAIN
     // 2026-10-15（§26.30 步骤1-②）：信用侧 —— swnd 回补到"能再发一帧"要等多久 ✓。为什么缺这个
     // 数：counter_swnd0 只数"没信用的**次数**"✗，分不出那是一瞬间（下一圈 ack 就到 ✓）还是被饿住
     // 很久 ✗ —— 而"发送被饿死"正是 lo 与 v1.1 差距的候选根因 ✓。
@@ -528,6 +536,9 @@ typedef struct {
     uint32_t   arm_ack_win;       // ACK_DUE 覆盖赢的次数 ✓
     int        arm_samp;          // 只读（①-20）：收尾态采样打印的条数（8 条够用 ✓）
     uint32_t   tick_ffrdp_init;   // tick of ffrdp_init, for the elapsed time in the dump
+    // ①-24：在"查表"之前就被拒的两条（还没有 c ⇒ 只能记在上下文上 ✓）
+    uint32_t   stat_ref_noarg;    // !ffrdp / !buf / len<=0 ⇒ EINVAL
+    uint32_t   stat_ref_noconn;   // conn 越界 / 表槽空 ⇒ CONN_INVALID
     FFRDPCONN  conn;   // P1：内嵌的主连接（第一步的表 0 号就指向它 ⇒ 内存/行为与 P1 一致 ✓）
 
     // ── 连接表（P2 第一步）──────────────────────────────────────────────────
@@ -939,32 +950,32 @@ int ffrdp_send(void *ctxt, int conn, char *buf, int len, int timeout_ms)
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     uint32_t      t0;
     int           rc = FFRDP_EAGAIN;   // 默认：暂时收不下（队列满/在途满）⇒ 稍后重试
-    if (!ffrdp || !buf || len <= 0) return FFRDP_EINVAL;
-    if (conn < 0 || conn >= ffrdp->nconn || !ffrdp->table[conn]) return FFRDP_CONN_INVALID;
+    if (!ffrdp || !buf || len <= 0) { if (ffrdp) ffrdp->stat_ref_noarg++; return FFRDP_EINVAL; }          // ①-24（只读 ✓）
+    if (conn < 0 || conn >= ffrdp->nconn || !ffrdp->table[conn]) { ffrdp->stat_ref_noconn++; return FFRDP_CONN_INVALID; }  // ①-24（只读 ✓）
     pthread_mutex_lock(&ffrdp->lock);
     FFRDPCONN *c = ffrdp->table[conn]; // 这句就是"句柄 ⇒ 连接"的查表（v2 的分发入口之一）
     // ⚠️ 锁外那次判空**不够** ✗：上面到这里的几行之间没拿锁 ✓，协议线程可能正好在收 FIN /
     //    keepalive 判死时把这条连接收掉（表槽清空 + free ✓）⇒ 这里再读就是 NULL ✓。
     //    真机上这就是空指针解引用 ⇒ SIGSEGV（对端主动关连接后，应用照旧 send/recv 就会踩到 ✓）。
-    if (!c) { rc = FFRDP_CONN_INVALID; goto out; }
+    if (!c) { ffrdp->stat_ref_noconn++; rc = FFRDP_CONN_INVALID; goto out; }   // ①-24（只读 ✓）
     // ⚠️ 锁外那次判空**不够** ✗：上面到这里的几行之间没拿锁 ✓，协议线程可能正好在收 FIN /
     //    keepalive 判死时把这条连接收掉（表槽清空 + free ✓）⇒ 这里再读就是 NULL ✓。
     //    真机上这就是空指针解引用 ⇒ SIGSEGV（对端主动关连接后，应用照旧 send/recv 就会踩到 ✓）。
-    if (!c) { rc = FFRDP_CONN_INVALID; goto out; }
+    if (!c) { ffrdp->stat_ref_noconn++; rc = FFRDP_CONN_INVALID; goto out; }   // ①-24（只读 ✓）
     // ⚠️ 锁外那次判空**不够** ✗：上面到这里的几行之间没拿锁 ✓，协议线程可能正好在收 FIN /
     //    keepalive 判死时把这条连接收掉（表槽清空 + free ✓）⇒ 这里再读就是 NULL ✓。
     //    真机上这就是空指针解引用 ⇒ SIGSEGV（对端主动关连接后，应用照旧 send/recv 就会踩到 ✓）。
-    if (!c) { rc = FFRDP_CONN_INVALID; goto out; }
+    if (!c) { ffrdp->stat_ref_noconn++; rc = FFRDP_CONN_INVALID; goto out; }   // ①-24（只读 ✓）
     // 受理判据与旧版逐字相同：帧数上限（在途 + 这一条要占的帧）算在这里，不在出队时算。区别只在
     // "这个在途帧数从哪来"：协议跑在工作线程里，应用不再读协议自己的 wait_snd，而读它发布的镜像
     // （pub_wait_snd，每个回调结束时刷新）—— 值与时序都和旧版一致，但不再越过线程边界。
     // 三条拒绝路径都跳到同一个出口：计数与解锁只有一处，rc 已经预置成 -1。对端还没连上也在这里
     // 被拒绝（与以前一样）。
-    if (ffrdp->closing) { rc = FFRDP_CLOSED; goto out; }                                  // 正在关：当作已断
-    if (ffrdp->is_server && (c->flags & FLAG_CONNECTED) == 0) { rc = FFRDP_CLOSED; goto out; } // 对端还没连上
+    if (ffrdp->closing) { c->counter_ref_closing++; rc = FFRDP_CLOSED; goto out; }    // 正在关：当作已断（①-24 ✓）
+    if (ffrdp->is_server && (c->flags & FLAG_CONNECTED) == 0) { c->counter_ref_notconn++; rc = FFRDP_CLOSED; goto out; } // 对端还没连上（①-24 ✓）
     if (ffrdp->hs_enable) {
-        if (c->hs_state == HS_FAILED) { rc = FFRDP_CLOSED; goto out; }                     // 握手超时 ⇒ 当成已断
-        if (!ffrdp->is_server && c->hs_state != HS_UP) { rc = FFRDP_EAGAIN; goto out; }     // 还在握手 ⇒ 先别发
+        if (c->hs_state == HS_FAILED) { c->counter_ref_hsfail++; rc = FFRDP_CLOSED; goto out; }   // 握手超时 ⇒ 当成已断（①-24 ✓）
+        if (!ffrdp->is_server && c->hs_state != HS_UP) { c->counter_ref_hsdown++; rc = FFRDP_EAGAIN; goto out; } // 还在握手 ⇒ 先别发（①-24 ✓）
     }
     // 帧数上限只在这里判一次：用的是协议发布的镜像 pub_wait_snd（"已成帧、未确认"的帧数），它不含还
     // 排在下面这个队列里、尚未成帧的消息 —— 所以这是个近似判据，队列本身的容量（FFRDP_APP_TX_SIZE）
@@ -2511,6 +2522,8 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
            c->rtt_min, dump_u32(c->rtts, b2, (int)sizeof(b2)), c->rttd);
     // elapsed 是"自 init 起"（tick_ffrdp_init ✓）；括号里那个是"自上次清零"（clearhistory=1 时才会推进 ✓）。
     // 旧标签写成 dump interval ✗ —— test.c 传的是 clearhistory=0 ⇒ 两个块里它都一样大，更容易误读 ✓。
+    printf("send refused before lookup: no-arg/bad-arg %u, bad-handle-or-table %u (①-24; per-connection ones are below)\n",
+           ffrdp->stat_ref_noarg, ffrdp->stat_ref_noconn);
     printf("elapsed             : %d s (since init) / %d s (since last clear)\n", ((int32_t)get_timestamp32_ms() - (int32_t)ffrdp->tick_ffrdp_init) / 1000, secs);
     printf("recv_size           : %d\n"  , c->recv_size           );
     printf("flags               : %x\n"  , c->flags               );
@@ -2545,8 +2558,9 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("peer wnd raw/clamped: %u, %u\n", c->peer_wnd_raw, c->swnd);
     printf("send starved/blocked: swnd0 %u frames, cap-block %u ticks\n", c->counter_swnd0, c->counter_capblock);
     // §26.30 ①-①：被**哪一道闸门**拒（配 counter_send_failed 看总数 ✓；total = wnd + bytes + big + 其它 ✓）
-    printf("send refused by gate : frame-count %u, queue-bytes %u, too-big %u (see counter_send_failed for the total)\n",
-           c->counter_refuse_wnd, c->counter_refuse_bytes, c->counter_refuse_big);
+    printf("send refused by gate : frame-count %u, queue-bytes %u, too-big %u | conn-state: closing %u, not-connected %u, hs-failed %u, hs-down %u (see counter_send_failed for the total)\n",
+           c->counter_refuse_wnd, c->counter_refuse_bytes, c->counter_refuse_big,
+           c->counter_ref_closing, c->counter_ref_notconn, c->counter_ref_hsfail, c->counter_ref_hsdown);
     // §26.30 ①-②：等信用的延迟（episode = 从"没信用"到"真的首发一帧"✓）
     printf("credit wait per frame: %u episodes, %u ms total, %u ms max\n",
            c->counter_swnd_wait_ep, c->counter_swnd_wait_ms, c->counter_swnd_wait_max);
