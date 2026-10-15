@@ -87,6 +87,11 @@
 static uint32_t g_inflight_max = FFRDP_INFLIGHT_MAX;
 static uint32_t g_max_cwnd     = FFRDP_MAX_CWND_SIZE;
 static uint32_t g_waitsnd      = FFRDP_MAX_WAITSND;
+// ①-28 B：伪超时（`CEVENT_ACK_TIMEOUT_MISSED` —— 等的时候 ack 到过 ✓，是估计器没看见 ✓）
+// **不再减半**。为什么：①-27 实测零丢包的 lo 上 **100% 的超时都是这一类** ✓（no-ack-arrived 0 /
+// acks-arrived-but-missed 1350 ✓），而每来一个就把 cwnd 减半 ⇒ 窗口被钉在地板 ⇒ 吞吐塌 ✓。
+// 默认 0 = 保持原行为（与快速重传同一档：乘性减半 ✓）⇒ 零行为变化 ✓。
+static int      g_pseudo_nocut = 0;
 static int      g_knobs_read   = 0;
 static void ffrdp_read_knobs(void)
 {
@@ -96,6 +101,7 @@ static void ffrdp_read_knobs(void)
     if ((e = getenv("FFRDP_INFLIGHT")) && *e) { unsigned v = (unsigned)atoi(e); if (v >= 1 && v <= 4096) g_inflight_max = v; }
     if ((e = getenv("FFRDP_MAXCWND" )) && *e) { unsigned v = (unsigned)atoi(e); if (v >= 1 && v <= 4096) g_max_cwnd     = v; }
     if ((e = getenv("FFRDP_WAITSND"  )) && *e) { unsigned v = (unsigned)atoi(e); if (v >= 1 && v <= 8192) g_waitsnd      = v; }
+    if ((e = getenv("FFRDP_PSEUDO_NOCUT")) && *e) g_pseudo_nocut = atoi(e) ? 1 : 0;   // ①-28 B
 }
 
 #define FFRDP_INFLIGHT_MIN   4
@@ -370,6 +376,13 @@ typedef struct {
     uint32_t counter_ls0, counter_ls1, counter_ls2, counter_ls3, counter_ls5;  // 这一圈发出几帧
     uint32_t counter_sp_list, counter_sp_cwnd, counter_sp_cap, counter_sp_swnd0, counter_sp_other;  // 发送循环停在哪一条
     uint32_t counter_ll0, counter_ll2, counter_ll8, counter_llM;      // 圈末在途表长（0 / 1-2 / 3-8 / >=9 ✓）
+    // 2026-10-15（①-28 A）：超时帧**距 ack 的 una 多远** ✓ + 在不在 ack 的 24 位位图里 ✓。
+    // 为什么缺这个数：零丢包的 lo 上 100% 的超时是伪超时 ✓，但"为什么 ack 没覆盖它"没有数 ✗ ——
+    // ack 报的是 una + 24 位位图（`ffrdp_apply_acks` 里 `for (i=23; ...)` ✓）⇒ 若窗口一大、帧跑到
+    // una 之外 24 格，**位图就盖不住它** ✗，只能等 una 追上来 ✓。纯计数 ✓。
+    uint32_t counter_to_d0_7, counter_to_d8_15, counter_to_d16_23, counter_to_d24_63, counter_to_dM;
+    uint32_t counter_to_dmax;
+    uint32_t counter_pseudo_nocut;   // ①-28 B："本来要减半、但被关掉了"的伪超时次数 ✓
     // 2026-10-15（§26.30 步骤1-①）：应用侧被**哪一道**闸门拒掉 ✓。为什么缺这个数：只看
     // counter_send_failed 只能知道"被拒了"✗，分不出是帧数闸（FFRDP_MAX_WAITSND ✓）还是字节闸
     // （FFRDP_APP_TX_SIZE ✓）—— 而 §26.30 的第 1 步要判的正是"这两个常量是不是成了瓶颈"✓。
@@ -1330,6 +1343,7 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 enum { CEVENT_ACK_OK, CEVENT_ACK_TIMEOUT, CEVENT_ACK_TIMEOUT_MISSED, CEVENT_FAST_RESEND, CEVENT_SEND_FAILED };
 static void ffrdp_congestion_control(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int event)
 {
+    ffrdp_read_knobs();   // ①-28：幂等，一次之后就是常数 ✓
     switch (event) {
     case CEVENT_ACK_OK:
         if (c->cwnd < c->ssthresh) c->cwnd *= 2;
@@ -1351,6 +1365,10 @@ static void ffrdp_congestion_control(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int even
         break;
     case CEVENT_ACK_TIMEOUT_MISSED:
         // 伪超时：等待期间 ack 到过（只是没覆盖这一帧）⇒ **链路没丢，是估计器没看见** ⇒ 降半就够 ✓
+        if (g_pseudo_nocut) {   // ①-28 B：默认关 ✓；开了就**不动窗口**（证据只留给 rtt_tail/rto ✓）
+            c->counter_pseudo_nocut++;
+            break;
+        }
         // 2026-10-15 真机：快 AP 上 cwnd 被打回 1 时发送速率掉到约"1 帧/RTT"、吞吐掉到 1.58~3.09 MB/s ✗，
         // 而 timeout diag 显示绝大多数超时属于这一类（acks-arrived-but-missed 139~167 ✓）。
         // fall through —— 与快速重传同一档：乘性降半，不做慢启动重启 ✓
@@ -1966,6 +1984,15 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                 // stale: we were told, but had not removed it -> the retransmit is pure waste.
                 if (seq_distance(GET_FRAME_SEQ(p), (uint32_t)c->ack_una) < 0) c->counter_rto_stale++;
                 else c->counter_rto_behind++;
+                {   // ①-28 A（只读 ✓）：这一帧距 una 多远（= ack 的 24 位位图能不能盖到它 ✓）
+                    int32_t d2 = seq_distance(GET_FRAME_SEQ(p), (uint32_t)c->ack_una);
+                    if      (d2 <= 7)  c->counter_to_d0_7++;
+                    else if (d2 <= 15) c->counter_to_d8_15++;
+                    else if (d2 <= 23) c->counter_to_d16_23++;
+                    else if (d2 <= 63) c->counter_to_d24_63++;
+                    else               c->counter_to_dM++;
+                    if (d2 > (int32_t)c->counter_to_dmax) c->counter_to_dmax = (uint32_t)d2;
+                }
                 if (c->rto == FFRDP_MAX_RTO) {
                     p->tick_send = get_timestamp32_ms();
                     p->flags    &=~FLAG_TIMEOUT_RESEND;
@@ -2789,6 +2816,10 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
            c->counter_fire_ackonly, c->counter_fire_tick);
     printf("timer due given     : zero %u, <=now %u, now+1..4 %u, >now+4 %u (the '<=now' one asks to go now)\n",
            c->counter_fire_d0, c->counter_fire_dnow, c->counter_fire_dnear, c->counter_fire_dfar);
+    printf("timeout dist ①-28A  : <=7 %u, 8-15 %u, 16-23 %u, 24-63 %u, >=64 %u, max %u (distance from ack una; the ack bitmap covers 24)\n",
+           c->counter_to_d0_7, c->counter_to_d8_15, c->counter_to_d16_23, c->counter_to_d24_63, c->counter_to_dM, c->counter_to_dmax);
+    printf("pseudo-nocut ①-28B  : %s (env FFRDP_PSEUDO_NOCUT=0|1), times it would have halved: %u\n",
+           g_pseudo_nocut ? "ON (pseudo-timeouts do not halve cwnd)" : "off (pseudo-timeouts halve, as before)", c->counter_pseudo_nocut);
     printf("gate knobs ①-27     : inflight %u, max_cwnd %u, waitsnd %u (env FFRDP_INFLIGHT/MAXCWND/WAITSND; source defaults 64/128/256)\n",
            g_inflight_max, g_max_cwnd, g_waitsnd);
     printf("ack mode            : %s (env FFRDP_ACK_COALESCE=%d; 0 = per-frame on receive, 1 = one per lap)\n",
