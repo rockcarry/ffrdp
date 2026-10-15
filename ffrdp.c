@@ -92,6 +92,10 @@ static uint32_t g_waitsnd      = FFRDP_MAX_WAITSND;
 // acks-arrived-but-missed 1350 ✓），而每来一个就把 cwnd 减半 ⇒ 窗口被钉在地板 ⇒ 吞吐塌 ✓。
 // 默认 0 = 保持原行为（与快速重传同一档：乘性减半 ✓）⇒ 零行为变化 ✓。
 static int      g_pseudo_nocut = 0;
+// ①-29：`ffrdp_apply_acks` 里"洞等够久"那条分支，**同一帧只许减半一次** ✓（默认关 = 原行为 ✓）。
+// 为什么：那条分支在**每次 ack** 都会重新走一遍发送表 ✓，而 CC 调用没有"已经减过"的守卫 ✗ ⇒
+// 同一个帧每当 hole_wait 到点就被再判一次 ✓ —— 这正是 `cwnd-back` 远多于三类触发事件的原因 ✓。
+static int      g_hole_cut_once = 0;
 static int      g_knobs_read   = 0;
 static void ffrdp_read_knobs(void)
 {
@@ -102,6 +106,7 @@ static void ffrdp_read_knobs(void)
     if ((e = getenv("FFRDP_MAXCWND" )) && *e) { unsigned v = (unsigned)atoi(e); if (v >= 1 && v <= 4096) g_max_cwnd     = v; }
     if ((e = getenv("FFRDP_WAITSND"  )) && *e) { unsigned v = (unsigned)atoi(e); if (v >= 1 && v <= 8192) g_waitsnd      = v; }
     if ((e = getenv("FFRDP_PSEUDO_NOCUT")) && *e) g_pseudo_nocut = atoi(e) ? 1 : 0;   // ①-28 B
+    if ((e = getenv("FFRDP_HOLE_CUT_ONCE")) && *e) g_hole_cut_once = atoi(e) ? 1 : 0; // ①-29
 }
 
 #define FFRDP_INFLIGHT_MIN   4
@@ -225,6 +230,8 @@ typedef struct tagFFRDP_FRAME_NODE {
     uint32_t tick_timeout; // frame ack timeout tick
     uint32_t ticket;       // 首发时的 counter_ack_recv 快照：超时时用来分辨"等待期间 ack 到没到"。
                            // 不是临时调试：它是 timeout diag 与 rtt_tail 采样条件的依据，保留。
+    // 2026-10-15（①-29）：这一帧把 cwnd 判减半了几次 ✓（`frame_node_new` 用 calloc ⇒ 天然从 0 起 ✓）
+    uint8_t cc_cuts;
 } FFRDP_FRAME_NODE;
 
 // ── 标志位 ───────────────────────────────────────────────────────────────
@@ -383,6 +390,14 @@ typedef struct {
     uint32_t counter_to_d0_7, counter_to_d8_15, counter_to_d16_23, counter_to_d24_63, counter_to_dM;
     uint32_t counter_to_dmax;
     uint32_t counter_pseudo_nocut;   // ①-28 B："本来要减半、但被关掉了"的伪超时次数 ✓
+    // 2026-10-15（①-29）：减半**按调用点**分账 ✓ + 同一帧被减了几次 ✓。为什么缺这个数：`cwnd-back`
+    // 远多于三类触发事件（a_def 898 vs 68 ✓）⇒ 猜是"同一帧反复减半" ✗ ⇒ 必须让每个调用点自己报数 ✓。
+    uint32_t counter_cc_hole;     // 洞等够久分支
+    uint32_t counter_cc_hole_cut; // 其中**真的**调了 CC 的那几次（开了守卫后应远小于上一项 ✓）
+    uint32_t counter_cc_rto;      // 真 RTO
+    uint32_t counter_cc_pseudo;   // 伪超时这一档
+    uint32_t counter_cut_multi;   // 同一帧第 2 次及以后被减半的次数 ✓
+    uint32_t counter_cut_max;     // 单帧最多被减半几次 ✓
     // 2026-10-15（§26.30 步骤1-①）：应用侧被**哪一道**闸门拒掉 ✓。为什么缺这个数：只看
     // counter_send_failed 只能知道"被拒了"✗，分不出是帧数闸（FFRDP_MAX_WAITSND ✓）还是字节闸
     // （FFRDP_APP_TX_SIZE ✓）—— 而 §26.30 的第 1 步要判的正是"这两个常量是不是成了瓶颈"✓。
@@ -1639,8 +1654,15 @@ static void ffrdp_apply_acks(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_RX_BATCH *
                 // overtaken on the way, so wait; where the retransmits are really repairing something,
                 // hole_wait is zero and this reacts exactly as before.
                 if ((int32_t)get_timestamp32_ms() - (int32_t)p->tick_send >= (int32_t)c->hole_wait) {
-                    ffrdp_congestion_control(ffrdp, c, CEVENT_FAST_RESEND);
-                    p->flags |= FLAG_FAST_RESEND;
+                    c->counter_cc_hole++;                                   // ①-29（只读 ✓）
+                    // ⚠️ 这一分支在**每次 ack** 都会重走发送表 ✗ ⇒ 原来同一帧会被反复判减半 ✓；
+                    //    开了守卫（默认关 ✓）就只认第一次（那一帧的 FLAG_FAST_RESEND 由重传路径清 ✓）。
+                    if (!g_hole_cut_once || !(p->flags & FLAG_FAST_RESEND)) {
+                        ffrdp_congestion_control(ffrdp, c, CEVENT_FAST_RESEND);
+                        p->flags |= FLAG_FAST_RESEND;
+                        c->counter_cc_hole_cut++;                           // ①-29（只读 ✓）
+                        if (p->cc_cuts++) { c->counter_cut_multi++; if (p->cc_cuts > c->counter_cut_max) c->counter_cut_max = p->cc_cuts; }
+                    }
                 }
             }
             p = p->next;
@@ -1975,6 +1997,7 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             {
                 int rto_real = !(p->flags & FLAG_FAST_RESEND);
                 int pseudo   = rto_real && (p->ticket != c->counter_ack_recv);
+                if (pseudo) c->counter_cc_pseudo++; else c->counter_cc_rto++;   // ①-29（只读 ✓）
                 ffrdp_congestion_control(ffrdp, c, pseudo ? CEVENT_ACK_TIMEOUT_MISSED : CEVENT_ACK_TIMEOUT);
             }
             if (ffrdp_send_data_frame(ffrdp, c, p) != 0) break;
@@ -2818,6 +2841,9 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
            c->counter_fire_d0, c->counter_fire_dnow, c->counter_fire_dnear, c->counter_fire_dfar);
     printf("timeout dist ①-28A  : <=7 %u, 8-15 %u, 16-23 %u, 24-63 %u, >=64 %u, max %u (distance from ack una; the ack bitmap covers 24)\n",
            c->counter_to_d0_7, c->counter_to_d8_15, c->counter_to_d16_23, c->counter_to_d24_63, c->counter_to_dM, c->counter_to_dmax);
+    printf("cc sites ①-29       : hole-wait %u (cut %u), rto %u, pseudo %u | same frame cut >=2: %u, max %u | hole-cut-once %s\n",
+           c->counter_cc_hole, c->counter_cc_hole_cut, c->counter_cc_rto, c->counter_cc_pseudo,
+           c->counter_cut_multi, c->counter_cut_max, g_hole_cut_once ? "ON" : "off");
     printf("pseudo-nocut ①-28B  : %s (env FFRDP_PSEUDO_NOCUT=0|1), times it would have halved: %u\n",
            g_pseudo_nocut ? "ON (pseudo-timeouts do not halve cwnd)" : "off (pseudo-timeouts halve, as before)", c->counter_pseudo_nocut);
     printf("gate knobs ①-27     : inflight %u, max_cwnd %u, waitsnd %u (env FFRDP_INFLIGHT/MAXCWND/WAITSND; source defaults 64/128/256)\n",
