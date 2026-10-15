@@ -369,6 +369,16 @@ done:
     } else if (v.recv_msgs) {
         printf("[%s] verify: OK -- received %u messages, seq contiguous and crc all correct\n", peer->name, v.recv_msgs);
     }
+    // 2026-10-15（§26.36 ①-16）：**退出时**也打一次全表 ✓。为什么缺：原来的 dump 由"收到数据"触发
+    //（每 10s ✓），而对端走了以后就没有任何数据了 ✗ ⇒ 收尾那一段（客户端先退、服务端多活 ⇒ 实测
+    // 回环 8s 里低层转了 129 万圈 ✗、真机 server 的 fire 是 timer 的 10 倍 ✗）在**协议侧账上根本
+    // 不存在** ✗ —— 这就是"账被输出时点挡住"的第三次 ✓（§26.26 两次 ✓）。纯输出侧 ✓，放在 verify
+    // 之后、close 之前 ⇒ 走 close 的场景也拿得到 ✓。
+    if (ffrdp) {
+        printf("[%s] --- exit dump (protocol counters; includes the teardown tail) ---\n", peer->name);
+        fflush(stdout);
+        pthread_mutex_lock(&g_mutex); ffrdp_dump(ffrdp, -1, 0); pthread_mutex_unlock(&g_mutex);
+    }
     if (g_do_close && ffrdp) {
         // 主动关闭（验四次挥手）：ffrdp_close ⇒ 我方发 FIN ⇒ 对端回 FIN ⇒ 双方各自 DISCONN ✓。
         // ⚠️ 只有走握手的连接才有 FIN ✓（hs:0 下没有 FIN ⇒ 只做本地拆除 ✓，见 ffrdp.h ✓）。
@@ -479,7 +489,15 @@ static void* peer_thread(void *param)
     }
 
     for (i = 0; i < nlink; i++) pthread_join(links[i], NULL);
-    if (ffrdp) ffrdp_exit(ffrdp);      // 只有"上下文还开着"的那条路才需要退 ✓
+    if (ffrdp) {
+        // 2026-10-15（§26.36 ①-16b）：上下文拆掉**前一刻**再打一次 ✓。为什么还要这一次：link_loop 一旦
+        // 退（对端静默 ⇒ lost ✓，实测 18s ✓）就再也没有 dump 触发了 ✗，而低层在那之后还在转
+        //（实测这一段 5 s 里 120 万圈 ✗）⇒ 账必须打到这里才闭合 ✓（第三次"账被输出时点挡住"✓）。
+        printf("[%s] --- final dump (right before ffrdp_exit) ---\n", peer->name);
+        fflush(stdout);
+        pthread_mutex_lock(&g_mutex); ffrdp_dump(ffrdp, -1, 0); pthread_mutex_unlock(&g_mutex);
+        ffrdp_exit(ffrdp);             // 只有"上下文还开着"的那条路才需要退 ✓
+    }
     return NULL;
 }
 
