@@ -4,6 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 #include "ffrdp.h"
 #include "utils.h"
 
@@ -35,7 +36,23 @@ static int  send_speed           = 0;   // 本进程的发送限速，单位 KB/
 static int  g_idle_sec           = 0;   // FFRDP_IDLE>0：**不发应用数据**，专门验 keepalive 不误杀 ✓
 static int  g_do_close           = 0;   // FFRDP_CLOSE=1：退出前用 ffrdp_close() 主动关（验四次挥手）✓
 static int  g_use_hs             = 1;   // 本侧是否走握手（FFRDP_HS=0 ⇒ 老路径 ⇒ 服务端句柄就是 0 ✓）
+// 2026-10-15（①-22）：应用侧**突发**（只在环境变量 TEST_APP_BURST>0 时打开 ✓）。为什么会缺这个数：
+// v2 的应用循环是"造一条 + 发一条 + 阻塞进带超时的 ffrdp_recv"✗（那个 recv 是**应用侧唯一的等待点** ✓），
+// 而 v1 的应用循环**从不阻塞**（send/recv 无超时 + 每轮 ffrdp_update）✓ ⇒ 三路对照里 v1.1 每圈搬
+// ≈65 KB、v2 只有 ≈8.2 KB ✗，分不清是"应用节拍"还是"协议容量"✗。这个开关就是把前者拆出来 ✓。
+// 默认 0 ⇒ 一个字节的行为都不动 ✓（下面那段整段不执行 ✓）。
+static int  g_app_burst          = 0;
 static pthread_mutex_t g_mutex;
+
+// 2026-10-15（①-23）：应用侧的 **µs** 时钟。为什么缺这个数：test.c 只有 ms 口径 ✗，而应用循环
+// 的节奏点（那次带 TEST_RECV_WAIT_MS 超时的 ffrdp_recv ✓）就在 µs 量级 ⇒ 用 ms 只能看到"每轮 0ms"✗。
+// 只读 ✓：不改变任何行为 ✓。
+static uint32_t app_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull);
+}
 
 // 一个"对等端"的运行参数。两侧跑的是同一个循环，差别只在下面这几项。
 typedef struct {
@@ -242,6 +259,11 @@ static int link_loop(struct link_arg *a)
     uint32_t tick_dump, tick_recv = 0, tick_speed, tokens, rnd = 0x12345678u, seq = 1;
     uint32_t tick_msg_first = 0, msg_retries = 0;   // 只读（§26.30 ①-①）：这一条消息的首次尝试时刻 / 被拒次数 ✓
     int      ret, connected = 0, stream_len = 0, msg_len = 0, max_payload, hb = 0, lost = 0;
+    // ①-23：应用循环的账（只读 ✓）。为什么会缺这个数：应用是"造一条 + 发一条 + 带超时的 recv"✗，
+    // 而 dump 里全是协议侧的低层/协议圈 ✗ ⇒ "谁在等"在**应用这一格**上是空的 ✗（§26.42 只量到
+    // "应用与 v1.1 差 9 倍圈率"，指不出等在哪一步 ✓）。
+    uint32_t loop_iters = 0, t_loop0 = 0, t_loop1 = 0, t_w;
+    uint32_t rd_n = 0, rd_us = 0, re_n = 0, re_us = 0, rf_n = 0, rf_us = 0;
     TEST_VERIFY v;
 
     memset(&v, 0, sizeof(v));
@@ -259,6 +281,9 @@ static int link_loop(struct link_arg *a)
     tokens     = quota;   // 一开跑就有一个周期的额度，否则头 1 秒发不出去、平均速率会偏低
     while (!g_exit) {
         // 发送限速（令牌桶）：每 TEST_SPEED_INTERVAL_MS 把令牌补满一个周期的额度，
+        loop_iters++;                       // ①-23（只读 ✓）
+        if (t_loop0 == 0) t_loop0 = app_us();
+        t_loop1 = app_us();
         // 桶的上限就是这一个周期的量（不跨周期累积 ⇒ 不会攒出突发）。
         if (quota) {
             if ((int32_t)get_timestamp32_ms() - (int32_t)tick_speed >= TEST_SPEED_INTERVAL_MS) {
@@ -267,6 +292,31 @@ static int link_loop(struct link_arg *a)
             }
         }
 
+        // ①-22：把"应用每周起一次、只塞一条"这个节拍拆开的开关 ✓。放在"造消息"**之前** ✓（原来放在后面 ✗ ⇒ 进循环体时 msg_len 已经 >0 ⇒ 一次都不跑 ✗ —— 实测踩过 ✓）
+        // 且 g_app_burst>1 时进入 ✓ ⇒ 默认整段跳过 ✓。被拒就立刻退出，节拍交回下面那次带超时的 recv ✓。
+        if (!g_idle_sec && g_app_burst > 1) {
+            int k;
+            for (k = 1; k < g_app_burst && !g_exit && msg_len == 0; k++) {
+                int room = 1, maxp = send_max - TEST_MSG_OVERHEAD;
+                if (quota) {
+                    if (tokens <= TEST_MSG_OVERHEAD) room = 0;
+                    else if (tokens - TEST_MSG_OVERHEAD < (uint32_t)maxp) maxp = (int)(tokens - TEST_MSG_OVERHEAD);
+                }
+                if (room) msg_len = msg_build(sendbuf, send_max, seq, maxp, &rnd);
+                if (msg_len <= 0) { msg_len = 0; break; }
+                tick_msg_first = get_timestamp32_ms(); msg_retries = 0;
+                ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
+                if (ret == msg_len) {
+                    v.sent_msgs++; v.sent_bytes += (uint32_t)msg_len;
+                    if (quota) tokens -= (uint32_t)msg_len;
+                    seq++; msg_len = 0;
+                } else if (ret > 0) {          // 不该发生（send 是原子的 ✓）：丢掉这条并留下告警
+                    v.partial_err++; msg_len = 0; break;
+                } else {                       // 被拒 ⇒ 退出突发 ✓（应用不再空转 ✓）
+                    v.send_retries++; msg_retries++; break;
+                }
+            }
+        }
         if (!g_idle_sec && msg_len == 0) {   // 上一条已经发出去了，生成下一条（失败重试时必须原样重发，不能重新生成）
             // FFRDP_IDLE>0 ⇒ 压根不生成 ✓：应用层一个字节都不发，专门看协议自己会不会把连接判死 ✓
             int room = 1;
@@ -307,7 +357,11 @@ static int link_loop(struct link_arg *a)
 
         if (stream_len < TEST_STREAM_MAX) {
             // 应用侧唯一的等待点：一有数据立刻返回，没有数据最多等 TEST_RECV_WAIT_MS。
+            t_w = app_us();                 // ①-23：应用侧唯一的等待点 ✓
             ret = ffrdp_recv(ffrdp, handle, (char*)stream + stream_len, TEST_STREAM_MAX - stream_len, TEST_RECV_WAIT_MS);
+            {   uint32_t d = app_us() - t_w;   // ①-23："等到数据"与"空转到超时"分开记 ✓
+                if (ret > 0) { rd_n++; rd_us += d; } else { re_n++; re_us += d; }
+            }
             if (ret > 0) {
                 stream_len += ret;
                 if (connected == 0) {
@@ -323,7 +377,9 @@ static int link_loop(struct link_arg *a)
                 }
             }
         } else {
+            t_w = app_us();                 // ①-23：流满那条路（注释说"正常情况下到不了"✓，量一下 ✓）
             usleep(10 * 1000);   // 流满了 ⇒ 这一轮没地方收；睡一下别空转（正常情况下到不了这里）
+            rf_n++; rf_us += app_us() - t_w;
         }
         if (stream_len > 0) {   // 每轮都试着解析（不足一条时这个循环体不会进入）
             int used = msg_parse(&v, peer->name, peer->peer, stream, stream_len);
@@ -334,6 +390,7 @@ static int link_loop(struct link_arg *a)
         }
 
         // 这里原来有一句 ffrdp_update()：协议现在由 lowlevel 的工作线程驱动 ✓，应用不需要它了。
+        t_loop1 = app_us();                 // ①-23（含 msg_parse ✓）
         if (g_idle_sec) {
             uint32_t nowi = get_timestamp32_ms();
             if ((int32_t)nowi - (int32_t)tick_dump > 1000) {
@@ -364,6 +421,12 @@ done:
     // §26.30 ①-①：应用侧在队列闸门上的等待（累计值 ✓；配合 ffrdp 那块的 refuse 分档看"谁挡的"✓）
     printf("[%s] app send gate: refused %u times, waited on %u msgs, %u ms total, %u ms max (retry = next loop, ~%dms)\n",
            peer->name, v.send_retries, v.send_wait_msgs, v.send_wait_ms, v.send_wait_max_ms, TEST_RECV_WAIT_MS);
+    if (t_loop0) {   // ①-23：应用循环的账 —— "谁在等"的应用那一格 ✓
+        uint32_t tot = t_loop1 - t_loop0;
+        printf("[%s] app loop ①-23: %u iters over %u ms | recv-with-data %u (%u ms), recv-EMPTY %u (%u ms), stream-full %u (%u ms) | in recv %u%% of the loop, avg %u us/iter\n",
+               peer->name, loop_iters, tot / 1000, rd_n, rd_us / 1000, re_n, re_us / 1000, rf_n, rf_us / 1000,
+               tot ? (unsigned)((uint64_t)(rd_us + re_us + rf_us) * 100 / tot) : 0, loop_iters ? tot / loop_iters : 0);
+    }
     if (v.crc_err || v.len_err || v.partial_err || v.seq_gap) {
         printf("[%s] verify: *** CHECK FAILED ***\n", peer->name);
     } else if (v.recv_msgs) {
@@ -566,6 +629,10 @@ int main(int argc, char *argv[])
             if (sh && *sh) g_use_hs = atoi(sh) ? 1 : 0;   // 与 ffrdp_init 拼串时的判断保持同一口径 ✓
         }
         if (sc && *sc) g_do_close = atoi(sc) ? 1 : 0;
+        {   const char *sb = getenv("TEST_APP_BURST");   // ①-22：应用侧突发上限（0/不设 = 旧行为 ✓）
+            if (sb && *sb) { g_app_burst = atoi(sb); if (g_app_burst < 0) g_app_burst = 0; }
+            if (g_app_burst > 1) printf("app burst           : %d messages per recv tick (diagnostic; default 1 = old behaviour)\n", g_app_burst);
+        }
         if (g_idle_sec > 0) printf("idle mode           : on (no application data; only checks that keepalive does not misfire)\n");
         if (g_do_close)     printf("close on exit       : on (calls ffrdp_close before exit; checks the four-way handshake)\n");
     }
