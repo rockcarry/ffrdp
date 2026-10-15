@@ -1142,7 +1142,7 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     if (ffrdp->lowlevel->send(ffrdp->lowlevel, c->peer_addr, data, alen) != 0) c->counter_send_err++; // send ack frame
 }
 
-enum { CEVENT_ACK_OK, CEVENT_ACK_TIMEOUT, CEVENT_FAST_RESEND, CEVENT_SEND_FAILED };
+enum { CEVENT_ACK_OK, CEVENT_ACK_TIMEOUT, CEVENT_ACK_TIMEOUT_MISSED, CEVENT_FAST_RESEND, CEVENT_SEND_FAILED };
 static void ffrdp_congestion_control(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int event)
 {
     switch (event) {
@@ -1162,6 +1162,11 @@ static void ffrdp_congestion_control(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int even
         c->ssthresh = MAX(c->cwnd / 2, FFRDP_MIN_CWND_SIZE);
         c->cwnd     = FFRDP_MIN_CWND_SIZE;
         break;
+    case CEVENT_ACK_TIMEOUT_MISSED:
+        // 伪超时：等待期间 ack 到过（只是没覆盖这一帧）⇒ **链路没丢，是估计器没看见** ⇒ 降半就够 ✓
+        // 2026-10-15 真机：快 AP 上 cwnd 被打回 1 时发送速率掉到约"1 帧/RTT"、吞吐掉到 1.58~3.09 MB/s ✗，
+        // 而 timeout diag 显示绝大多数超时属于这一类（acks-arrived-but-missed 139~167 ✓）。
+        // fall through —— 与快速重传同一档：乘性降半，不做慢启动重启 ✓
     case CEVENT_FAST_RESEND:
         c->counter_cwnd_back++;
         c->ssthresh = MAX(c->cwnd / 2, FFRDP_MIN_CWND_SIZE);
@@ -1621,7 +1626,14 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                 // 不成立（帧被确认时就从表里移除，"una 越过它"与"它超时"很难同时发生）。采样改到确认
                 // 到达的那一刻，见下面那个"被重传过的帧"的兄弟块。
             }
-            ffrdp_congestion_control(ffrdp, c, CEVENT_ACK_TIMEOUT);
+            // 只对真 RTO 分辨，快速重传保持原样（它不吃这一刀 ✓）。
+            // p->ticket 是首发时 counter_ack_recv 的快照 ⇒ "等待期间 ack 有没有来过" 一句话就够 ✓
+            // （与下面 1619 行那句 timeout diag 计数用的是同一个判断 ✓）。
+            {
+                int rto_real = !(p->flags & FLAG_FAST_RESEND);
+                int pseudo   = rto_real && (p->ticket != c->counter_ack_recv);
+                ffrdp_congestion_control(ffrdp, c, pseudo ? CEVENT_ACK_TIMEOUT_MISSED : CEVENT_ACK_TIMEOUT);
+            }
             if (ffrdp_send_data_frame(ffrdp, c, p) != 0) break;
             if (!(p->flags & FLAG_FAST_RESEND)) {
                 if (p == c->send_list_head) c->counter_rto_head++; else c->counter_rto_chain++;
