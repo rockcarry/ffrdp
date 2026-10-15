@@ -2203,12 +2203,12 @@ static void ffrdp_dump_locked(FFRDPCONTEXT *ffrdp, int conn, int clearhistory)
 static const char* dump_hs_name(int hs)
 {
     switch (hs) {
-    case 0:           return "未握手";   // 0 = 无握手（就是结构体 calloc 清零后的初值 ✓；那个宏已删 ✓）
-    case HS_SYN_SENT: return "SYN 已发";
-    case HS_SYN_RCVD: return "SYN-ACK 已发";
-    case HS_UP:       return "已建立";
-    case HS_FIN_WAIT: return "FIN 已发（等对端）";
-    case HS_FAILED:   return "握手失败";
+    case 0:           return "no handshake";   // 0 = 无握手（就是结构体 calloc 清零后的初值 ✓；那个宏已删 ✓）
+    case HS_SYN_SENT: return "SYN sent";
+    case HS_SYN_RCVD: return "SYN-ACK sent";
+    case HS_UP:       return "established";
+    case HS_FIN_WAIT: return "FIN sent (waiting for peer)";
+    case HS_FAILED:   return "handshake failed";
     default:          return "?";
     }
 }
@@ -2250,7 +2250,7 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     }
 
     printf("\n---- conn %d   %s   %s%s ----\n", handle, addr, dump_hs_name(c->hs_state),
-           (c->flags & FLAG_CONNECTED) ? "（已连接 ✓）" : "");
+           (c->flags & FLAG_CONNECTED) ? " (connected)" : "");
     printf("total_send, total_recv: %.2fMB, %.2fMB\n"    , c->counter_send_bytes / (1024.0 * 1024), c->counter_recv_bytes / (1024.0 * 1024));
     // secs 是距上一次 dump 的秒数：刚起来的第一次 dump 可能不足一秒，别拿 0 当除数。
     printf("averg_send, averg_recv: %.2fKB/s, %.2fKB/s\n", c->counter_send_bytes / (1024.0 * MAX(secs, 1)), c->counter_recv_bytes / (1024.0 * MAX(secs, 1)));
