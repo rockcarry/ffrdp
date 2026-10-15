@@ -100,6 +100,11 @@ static int      g_pseudo_nocut = 0;
 // `cwnd-back` 829→**212** ✓，而同档吞吐 31.6 → **34.8/36.2 MB/s** ✓（两次复测同向 ✓，仍在单跑噪声带边缘 ✓）。
 // 保留 env：`FFRDP_HOLE_CUT_ONCE=0` 可关回原行为（复现对照用 ✓）。
 static int      g_hole_cut_once = 1;
+// ①-35b/c：`ffrdp_send` 每收一条就 `lowlevel->timer(now)` 叫醒工作线程一次 ✗ —— 32 条的突发就是
+// 32 次唤醒（§26.54：v2 ≈120 µs/消息 vs v1.1 ≈66 µs/消息，而 v1.1 的 send 只是 memcpy、零系统调用 ✓）。
+// `FFRDP_SENDWAKE_COALESCE=1`（默认 0 = 原行为 ✓）⇒ **队列由空变非空时才叫醒** ✓：之后工作线程
+// 自己会把队列抽干（`ffrdp_drain_tx` ✓，与 send 同一把锁 ✓ ⇒ 不会漏醒 ✓）并在抽空时把标志清掉 ✓。
+static int      g_sendwake_coalesce = 0;
 static int      g_knobs_read   = 0;
 static void ffrdp_read_knobs(void)
 {
@@ -111,6 +116,7 @@ static void ffrdp_read_knobs(void)
     if ((e = getenv("FFRDP_WAITSND"  )) && *e) { unsigned v = (unsigned)atoi(e); if (v >= 1 && v <= 8192) g_waitsnd      = v; }
     if ((e = getenv("FFRDP_PSEUDO_NOCUT")) && *e) g_pseudo_nocut = atoi(e) ? 1 : 0;   // ①-28 B
     if ((e = getenv("FFRDP_HOLE_CUT_ONCE")) && *e) g_hole_cut_once = atoi(e) ? 1 : 0; // ①-29
+    if ((e = getenv("FFRDP_SENDWAKE_COALESCE")) && *e) g_sendwake_coalesce = atoi(e) ? 1 : 0; // ①-35c
 }
 
 #define FFRDP_INFLIGHT_MIN   4
@@ -394,6 +400,11 @@ typedef struct {
     uint32_t counter_to_d0_7, counter_to_d8_15, counter_to_d16_23, counter_to_d24_63, counter_to_dM;
     uint32_t counter_to_dmax;
     uint32_t counter_pseudo_nocut;   // ①-28 B："本来要减半、但被关掉了"的伪超时次数 ✓
+    // ①-35b：每消息固定开销的账 —— 受理次数 / 真叫醒次数 / 被省掉的叫醒 ✓
+    uint32_t counter_send_calls;
+    uint32_t counter_send_wakes;
+    uint32_t counter_send_wake_skip;
+    uint32_t tx_woken;               // ①-35c："已经叫过、还没被抽干" ✓（由 drain 清零 ✓）
     // 2026-10-15（①-29）：减半**按调用点**分账 ✓ + 同一帧被减了几次 ✓。为什么缺这个数：`cwnd-back`
     // 远多于三类触发事件（a_def 898 vs 68 ✓）⇒ 猜是"同一帧反复减半" ✗ ⇒ 必须让每个调用点自己报数 ✓。
     uint32_t counter_cc_hole;     // 洞等够久分支
@@ -1080,11 +1091,16 @@ int ffrdp_send(void *ctxt, int conn, char *buf, int len, int timeout_ms)
         if (!c) { pthread_mutex_unlock(&ffrdp->lock); return FFRDP_CLOSED; }
     }
 out:
+    c->counter_send_calls++;   // ①-35b（只读 ✓）
     // 计数口径与旧版一致：只要这条消息没被接受就记一次（现在 rc 有 0 / -1 / -2 三种，
     // 旧版只有 -1 ⇒ 条件从 rc < 0 改成 rc <= 0 才能保持 fail 这个数不变 ✓）。
     if (rc <= 0) c->counter_send_failed++;
     // 刚排进去的东西不该等下一个期限：叫醒工作线程立刻跑一轮（这是 timer 的第二种用法）。
-    if (rc > 0 && ffrdp->lowlevel) ffrdp->lowlevel->timer(ffrdp->lowlevel, get_timestamp32_ms());
+    if (rc > 0 && ffrdp->lowlevel) {   // ①-35c：叫醒（可合并 ✓）
+        int wake = 1;
+        if (g_sendwake_coalesce && c->tx_woken) { wake = 0; c->counter_send_wake_skip++; }
+        if (wake) { c->counter_send_wakes++; c->tx_woken = 1; ffrdp->lowlevel->timer(ffrdp->lowlevel, get_timestamp32_ms()); }
+    }
     pthread_mutex_unlock(&ffrdp->lock);
     return rc;
 }
@@ -1426,6 +1442,7 @@ static void ffrdp_conf_hist(FFRDPCONN *c, uint32_t conf)
 // 帧数上限不在这里判：它在 ffrdp_send 的受理判据里判，这里只是把排进来的东西全部成帧（注释修正之二）。
 static void ffrdp_drain_tx(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 {
+    // ①-35c：抽空之后允许下一次 send 再叫醒（与 send 同一把锁 ⇒ 不漏醒 ✓）
     uint32_t cap = (uint32_t)sizeof(c->app_tx_buff);
     // 表里已经排着窗口那么多"已成帧、未确认"的帧时，这一轮不再往下喂：tick 的发送循环只从表头看
     // cwnd 个条目，喂得更长只会让表尾那些帧既发不出去、也等不到超时，wait_snd 于是只涨不落、应用被
@@ -1447,6 +1464,7 @@ static void ffrdp_drain_tx(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         c->app_tx_head = ringbuf_read(c->app_tx_buff, cap, c->app_tx_head, NULL, 4 + len);
         c->app_tx_size -= 4 + len;
     }
+    if (c->app_tx_size == 0) c->tx_woken = 0;   // ①-35c：抽空了 ⇒ 下一次 send 重新叫醒 ✓
 }
 
 // 一批帧里跨帧累积的东西。旧写法在 recvfrom 循环外累积它；现在由调用方持有：
@@ -2845,6 +2863,12 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
            c->counter_fire_d0, c->counter_fire_dnow, c->counter_fire_dnear, c->counter_fire_dfar);
     printf("timeout dist ①-28A  : <=7 %u, 8-15 %u, 16-23 %u, 24-63 %u, >=64 %u, max %u (distance from ack una; the ack bitmap covers 24)\n",
            c->counter_to_d0_7, c->counter_to_d8_15, c->counter_to_d16_23, c->counter_to_d24_63, c->counter_to_dM, c->counter_to_dmax);
+    printf("send wake ①-35      : calls %u, wakes %u, skipped %u (wakes/call %.2f; coalesce %s)\n",
+           c->counter_send_calls, c->counter_send_wakes, c->counter_send_wake_skip,
+           c->counter_send_calls ? (double)c->counter_send_wakes / (double)c->counter_send_calls : 0.0,
+           g_sendwake_coalesce ? "ON" : "off");
+    printf("footprint ①-35      : sizeof(conn) %u, sizeof(context) %u, sizeof(frame node) %u bytes (static part; each in-flight frame costs one node + smss)\n",
+           (unsigned)sizeof(FFRDPCONN), (unsigned)sizeof(FFRDPCONTEXT), (unsigned)sizeof(FFRDP_FRAME_NODE));
     printf("cc sites ①-29       : hole-wait %u (cut %u), rto %u, pseudo %u | same frame cut >=2: %u, max %u | hole-cut-once %s\n",
            c->counter_cc_hole, c->counter_cc_hole_cut, c->counter_cc_rto, c->counter_cc_pseudo,
            c->counter_cut_multi, c->counter_cut_max, g_hole_cut_once ? "ON" : "off");

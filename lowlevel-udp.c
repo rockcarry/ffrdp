@@ -451,6 +451,8 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
            udp->stat_cb_us_sum, udp->stat_cb_us_max);
     printf("udp lowlevel rx batch: %d frames per lap (env FFRDP_RX_BATCH; default = %d)\n",
            udp->rx_batch, FFRDP_LOWLEVEL_RX_BATCH_MAX);
+    printf("footprint ①-35      : sizeof(UDP_LOWLEVEL) %u bytes (plus the two sockets' kernel buffers above)\n",
+           (unsigned)sizeof(UDP_LOWLEVEL));
     printf("udp lowlevel buffers : requested %d B, kernel gave rcv %d B / snd %d B (①-30; env FFRDP_BUFSIZE in KB; rmem_max caps it)\n",
            udp->bufsize, udp->buf_rcv_eff, udp->buf_snd_eff);
     printf("udp lowlevel tx      : sendto %u calls, %u bytes (per frame = calls / frames in the ffrdp block)\n",
