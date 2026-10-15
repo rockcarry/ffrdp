@@ -103,6 +103,12 @@
 // （2026-10-14 慢 AP 日志：probe rtt ref/best = 79/79 ✗ 而实际 227ms↔79ms 在跳）；
 // 但速率守卫（FFRDP_PROBE_RATE_KEEP_PCT ✓）+ 按秒 giveback + 地板 32 三道网把它兜住了 ✓
 // —— 实测没有一次误 keep 造成损失 ✓。判据口径的重审排在后面（把"RTT 降没降"换成"resend_perMB 降没降"）。
+#define FFRDP_PROBE_GIVEBACK_IDLE_S 5 // giveback（把证明过的窗口还回去）要先"连续健康"这么多秒 ✓
+                                      // 为什么：还的速度不能快过证明的速度 ✗ —— 探测每 PROBE_GAP(10s) 才问一次，
+                                      // 而原实现每秒就能还 25% ⇒ 必然振荡。2026-10-15 慢 AP 实测：
+                                      // cap 在 16~64 之间漂、rtts 77~116ms ✗；把 giveback 关掉当对照则稳在
+                                      // 4 帧、rtts 9ms ✓✓（算术也对得上：4 帧⇒9ms、16⇒60、32⇒120 ✓）。
+                                      // 见 notes §26.18。
 #define FFRDP_PROBE_ENABLE        1
                                       // —— 把在途砍半，若 rtts 明显下降且确认速率没掉，就保留更小的上限（同吞吐、低延迟）。
                                       // 真机上它曾走过一次"单向棘轮"✗：参考取紧邻的前一秒，第一刀之后参考自己也掉 ⇒
@@ -373,6 +379,8 @@ typedef struct {
     uint32_t probe_best;          // lowest round trip seen during the probe
     uint32_t probe_del_ref;       // delivered frames at the start of the probe
     uint32_t probe_res_ref;       // 重传总数（rto+fast）在探测开始时的快照：用来量"重传强度变没变" ✓
+    uint32_t giveback_idle;       // 连续健康的秒数（giveback 要先攒够 FFRDP_PROBE_GIVEBACK_IDLE_S ✓）
+    uint32_t last_giveback;       // 上一次 giveback 的时刻：频率不得高于探测周期 ✓
     uint32_t probe_waste_ref;     // 探测前一刻的 probe_waste（每千首发帧的重传数 ✓）：与之相比
     uint32_t probe_rate_ref;      // frames per second the peer confirmed just before the probe
     uint32_t rate_best;           // best confirmed rate ever seen (decays 1/16 per second): the reference a keep must survive
@@ -1691,6 +1699,15 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             uint32_t resend = c->counter_resend_rto + c->counter_resend_fast;
             uint32_t firsts = c->counter_send_1sttime;
             c->rate_now     = c->counter_delivered - c->rate_del_ref;
+            // 每秒结算一次"这一秒健不健康"：waste 与"没有队列"都要满足 ✓
+            // giveback 只认**连续**健康（见 FFRDP_PROBE_GIVEBACK_IDLE_S ✓）—— 单看某一秒会被
+            // "队列刚好排空的那一瞬"骗到 ✗（那正是原实现每秒还 25% 的来源 ✓）。
+            {
+                uint32_t idle_now = (c->rtt_min && c->rtts != (uint32_t)-1 &&
+                                     c->rtts < c->rtt_min + FFRDP_PROBE_RTT_DROP_MS) ? 1u : 0u;
+                if (c->probe_waste < FFRDP_PROBE_HEALTHY_PCT && idle_now) c->giveback_idle++;
+                else                                                      c->giveback_idle = 0;
+            }
             c->rate_tick    = now;
             if (c->rtt_tail) c->rtt_tail -= c->rtt_tail / 16;   // 约 16 秒忘掉旧的尾部
             c->rate_del_ref = c->counter_delivered;
@@ -1773,7 +1790,9 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                     c->probe_waste_ref = c->probe_waste;
                     c->cap           = c->probe_cap;
                     c->counter_probe++;
-                } else if (waste < FFRDP_PROBE_HEALTHY_PCT && c->cap_kept && idle) {
+                } else if (waste < FFRDP_PROBE_HEALTHY_PCT && c->cap_kept && idle &&
+                           c->giveback_idle >= FFRDP_PROBE_GIVEBACK_IDLE_S &&
+                           (int32_t)now - (int32_t)c->last_giveback >= (int32_t)FFRDP_PROBE_GAP_MS) {
                     // nothing is being wasted any more, and the queue is genuinely gone (idle, the absolute
                     // test above -- not the ratio, which sits right at its own threshold on this path): give
                     // a little of the window back, so a path that has become faster is not held down for
@@ -1785,6 +1804,8 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                     c->cap_kept   = MIN(c->cap_kept + MAX(c->cap_kept / 4, 1), (uint32_t)FFRDP_INFLIGHT_MAX);
                     c->cap        = c->cap_kept;
                     c->probe_next = now + FFRDP_PROBE_GAP_MS;
+                    c->last_giveback = now;
+                    c->giveback_idle = 0;      // 还过一次就重新攒 ✓
                     c->counter_giveback++;
                 } else {
                     // nothing to ask about yet: the queue test is not satisfied, so wait a full back off
