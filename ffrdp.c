@@ -341,6 +341,15 @@ typedef struct {
     uint32_t counter_lap_sent1;   // 上一圈发出去 1 帧 ✓
     uint32_t counter_lap_sentN;   // 上一圈发出去 >= 2 帧 ✓
     uint32_t lap_sent_ref;        // 上一圈结束时的(首发+重传)计数快照（0 = 还没结算过 ✓）
+    // 2026-10-15（①-6）：TIMER 分支到底走了哪一支、期限模型给的是哪一档 ✓。为什么缺这个数：
+    // 真机 server fire÷收帧 ≈ 6.6 ✗，而回环只有 1.3 ✓ ⇒ 不是这条路径本身有问题（它是故意的优化 ✓），
+    // 而是真机上有东西在**反复把期限设成"现在"** ✗ ⇒ 只能在这一支里按来源分档量 ✓。纯计数 ✓。
+    uint32_t counter_fire_ackonly; // 只回 ack 那一支（不跑整圈 ⇒ 不进协议圈数 ✓）
+    uint32_t counter_fire_tick;    // 跑整圈那一支 ✓
+    uint32_t counter_fire_d0;      // ffrdp_next_due 给的是 0（眼下没别的事 ✓）
+    uint32_t counter_fire_dnow;    // 给的是 <= now（要求"现在"✗ ⇒ 这一档就是自旋源 ✓）
+    uint32_t counter_fire_dnear;   // 给的是 now+1..4ms
+    uint32_t counter_fire_dfar;    // 给的是 > now+4ms ✓（正常 ✓）
     uint32_t counter_upd_cost_max;// longest time spent inside one lap, in ms
     uint32_t counter_ack_una_dup; // ack frames whose una is the same as the previous one: the peer reports no progress
     uint32_t counter_rto_head ;   // rto retransmits of the send list head, the frame that blocks the stream
@@ -2205,10 +2214,19 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
                 }
             }
             d = ffrdp_next_due(ffrdp, cc);
+            {   // 只读（①-6）：期限模型这一圈给的是哪一档 ✓ —— 放在分支之前 ⇒ cc 一定有效 ✓
+                uint32_t dn = get_timestamp32_ms();
+                if (!d)                          cc->counter_fire_d0++;
+                else if ((int32_t)(d - dn) <= 0) cc->counter_fire_dnow++;
+                else if ((int32_t)(d - dn) <= 4) cc->counter_fire_dnear++;
+                else                             cc->counter_fire_dfar++;
+            }
             if ((cc->flags & FLAG_ACK_DUE) && (!d || (int32_t)(d - get_timestamp32_ms()) > 0)) {
                 cc->flags &= ~FLAG_ACK_DUE;
+                cc->counter_fire_ackonly++;                          // 只读（①-6）
                 ffrdp_recvdata_and_sendack(ffrdp, cc);
             } else {
+                cc->counter_fire_tick++;                             // 只读（①-6）
                 ffrdp_tick_conn(ffrdp, cc);
                 // ⚠️ tick 里可能刚刚把这条连接**判死并收摊**（keepalive 超时 ⇒ 表槽清空 + free ✓）
                 //    ⇒ 这里必须重新查表，绝不能再碰 cc 这个旧指针 ✗
@@ -2483,6 +2501,11 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     // ①-5：每圈产出 —— sent0 就是"期限说现在有活、却一帧没发"的那类圈 ✗
     printf("lap output sent     : 0 frames %u, 1 frame %u, >=2 frames %u (0 means a lap that was asked to go now and put nothing on the wire)\n",
            c->counter_lap_sent0, c->counter_lap_sent1, c->counter_lap_sentN);
+    // ①-6：TIMER 分支哪一支 × 期限模型哪一档 ✓（ack-only 不跑整圈 ⇒ 不进协议圈数 ✓）
+    printf("timer branch        : ack-only %u, full-tick %u (ack-only runs no lap, so fires can far exceed laps)\n",
+           c->counter_fire_ackonly, c->counter_fire_tick);
+    printf("timer due given     : zero %u, <=now %u, now+1..4 %u, >now+4 %u (the '<=now' one asks to go now)\n",
+           c->counter_fire_d0, c->counter_fire_dnow, c->counter_fire_dnear, c->counter_fire_dfar);
     printf("counter_txfull      : %u\n"  , c->counter_txfull      );
     printf("counter_txshort     : %u\n"  , c->counter_txshort     );
     printf("counter_rxfull      : %u\n"  , c->counter_rxfull      );
