@@ -359,6 +359,13 @@ typedef struct {
     uint32_t counter_due_future;     // 正常：期限落在未来 ✓
     // STALE 时是哪个期限源赢的（7 个候选按下面的顺序 ✓）；[0] 未分类 ✓
     uint32_t counter_stale_src[8];
+    // 2026-10-15（①-3：护栏盲点）：上面三档都只看**护栏之后**的 due ✗ ⇒ 被护栏从
+    // "现在"改写成"1ms 后"的那些，全被记成 future ✗ —— 而真机服务端那 8,969 圈/秒正是它们
+    // （lowlevel-udp.c:232-237：一圈活超过 1ms ⇒ now+1 已过期 ⇒ left=0 ⇒ 实睡 0ms ✗）。
+    // 所以护栏那一支要单独记，并记住是哪个源赢的 ✓。纯计数，不改行为 ✗。
+    uint32_t counter_arm_eq_now;     // 护栏把"正好现在"改写成"1ms 后"的次数 ✗
+    uint32_t counter_arm_eq_src[8];  // 上面那次的源（顺序同 counter_stale_src ✓）
+    uint32_t counter_arm_le2ms;      // 记账后期限离现在 <= 2ms 的次数（真·自旋指标 ✓）
     // 2026-10-15（A 案收尾）：把"被重传过的帧**最后**被确认时等了多久"（conf = now - tick_send ✓）
     // 的**原始**分布记下来。为什么缺这个数：rtt_tail 只留了**限速后**的值 ✗、maxwait 只留了
     // "超时瞬间"的年龄 ✗ ⇒ 两者都分不清"ack 真的迟到"与"洞挡在前面、对端没法确认"✓。
@@ -1567,7 +1574,11 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     //    now 的帧，这一圈不会被重传 ✗。若把它当"现在"叫醒，就是在**同一个冻结的 tick 里**空转 ✓
     //    （忠实模型实测：每个这样的步都要撞一次防自旋护栏 ✓）。它只差 1ms，往前挪一下就好 ✓。
     //    注意顺序：必须放在下面"过期 ⇒ 立刻"那句**之前** ✓ —— 真正已过期（< now）的帧 tick 是能干活的 ✓。
-    if (!armed_now && due && (int32_t)(due - now) == 0) due = now + 1;
+    if (!armed_now && due && (int32_t)(due - now) == 0) {
+        c->counter_arm_eq_now++;                                     // 只读（①-3）
+        c->counter_arm_eq_src[tag < 0 || tag > 7 ? 0 : tag]++;       // 只读：是哪个源要求的 ✗
+        due = now + 1;
+    }
     if (due && (int32_t)(due - now) < 0) due = now;       // 已经过期 ⇒ 立刻（这也是"快一点"的做法）
     // 兜底：有未确认的帧、或应用队列非空时最多睡 4ms。上面那条判据修好后它不该再触发；
     // 真机上 lap 最大曾到 59/114/222ms，每漏一次小窗口就少送好几帧，而多醒几次只费一点 CPU。
@@ -1577,6 +1588,7 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         if (armed_now) c->counter_due_now_work++;
         else { c->counter_due_now_stale++; c->counter_stale_src[tag < 0 || tag > 7 ? 0 : tag]++; }
     } else if (due) c->counter_due_future++;
+    if (due && (int32_t)(due - now) <= 2) c->counter_arm_le2ms++;    // 只读（①-3）
     return due;
 }
 
@@ -2311,6 +2323,14 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("stale by source      : frame %u, flush %u, rate %u, hs %u, keepalive %u, query %u, probe %u, other %u\n",
            c->counter_stale_src[1], c->counter_stale_src[2], c->counter_stale_src[3], c->counter_stale_src[4],
            c->counter_stale_src[5], c->counter_stale_src[6], c->counter_stale_src[7], c->counter_stale_src[0]);
+    // ①-3：被护栏改写过的那批（旧分类会把它记进 future ✗）—— 真机服务端自旋的真身 ✓
+    printf("guard-now ask        : %u (asked for \"exactly now\" => rewritten to now+1; each is a 0ms sleep if a lap takes >1ms)\n",
+           c->counter_arm_eq_now);
+    printf("guard-now by source  : frame %u, flush %u, rate %u, hs %u, keepalive %u, query %u, probe %u, other %u\n",
+           c->counter_arm_eq_src[1], c->counter_arm_eq_src[2], c->counter_arm_eq_src[3], c->counter_arm_eq_src[4],
+           c->counter_arm_eq_src[5], c->counter_arm_eq_src[6], c->counter_arm_eq_src[7], c->counter_arm_eq_src[0]);
+    printf("armed <=2ms          : %u (deadline within 2ms of now after accounting; the real spin indicator)\n",
+           c->counter_arm_le2ms);
     printf("drain-block/backdrop: %u ticks (drain held), cwnd back %u (rto/fast) + %u (send fail)\n",
            c->counter_drain_block, c->counter_cwnd_back, c->counter_cwnd_sfail);
     printf("timeout diag        : no-ack-arrived %u, acks-arrived-but-missed %u, max wait %u ms\n",
