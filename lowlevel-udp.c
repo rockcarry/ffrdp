@@ -63,7 +63,7 @@ typedef struct {
     // 分两类：跨线程（应用线程 send 后催一下 ✓）与循环内（协议 tick 返回下一个期限 ✓）。
     uint32_t        stat_arm_now_other;  // 跨线程 arm 成 <= now 的次数
     uint32_t        stat_arm_now_loop;   // 从循环自己线程 arm 成 <= now 的次数
-    int             stat_rx_errno;    // 第一次失败的 errno（0 = 还没失败过 ✓）
+    int             stat_rx_errno;       // 第一次失败的 errno（0 = 还没失败过 ✓）
     // 追加③（①-4）：把"空圈"再往下一层拆 ✓ —— 协议侧四个桶对不上总圈数（真机 2026-10-15：
     // 服务端 laps 695849 vs 桶和 248908 ✗，有 ~45 万圈在协议账上根本不存在 ✗）⇒ 肇事者不在
     // ffrdp_next_due 那一层 ⇒ 只能在这里量：睡下去时期限离现在多远 ✓、tick 进去时是什么情形 ✓。
@@ -248,9 +248,9 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
         if (dl) {
             int32_t left = (int32_t)(dl - get_timestamp32_ms());
             // 只读（①-4）：left<0 就是"实睡 0ms"的那种自旋圈 ✗（select 返回 0 ⇒ 又是一圈）
-            if (left < 0)       udp->stat_left_le0++;
-            else if (left == 0) udp->stat_left_0++;
-            else if (left <= 9) udp->stat_left_1_9++;
+            if (left < 0)       udp->stat_left_le0 ++;
+            else if (left == 0) udp->stat_left_0   ++;
+            else if (left <= 9) udp->stat_left_1_9 ++;
             else                udp->stat_left_ge10++;
             if (left < 0) left = 0;                    // due already: come straight back
             tv.tv_sec  = left / 1000;

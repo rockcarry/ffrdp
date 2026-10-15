@@ -344,12 +344,12 @@ typedef struct {
     // 2026-10-15（①-6）：TIMER 分支到底走了哪一支、期限模型给的是哪一档 ✓。为什么缺这个数：
     // 真机 server fire÷收帧 ≈ 6.6 ✗，而回环只有 1.3 ✓ ⇒ 不是这条路径本身有问题（它是故意的优化 ✓），
     // 而是真机上有东西在**反复把期限设成"现在"** ✗ ⇒ 只能在这一支里按来源分档量 ✓。纯计数 ✓。
-    uint32_t counter_fire_ackonly; // 只回 ack 那一支（不跑整圈 ⇒ 不进协议圈数 ✓）
-    uint32_t counter_fire_tick;    // 跑整圈那一支 ✓
-    uint32_t counter_fire_d0;      // ffrdp_next_due 给的是 0（眼下没别的事 ✓）
-    uint32_t counter_fire_dnow;    // 给的是 <= now（要求"现在"✗ ⇒ 这一档就是自旋源 ✓）
-    uint32_t counter_fire_dnear;   // 给的是 now+1..4ms
-    uint32_t counter_fire_dfar;    // 给的是 > now+4ms ✓（正常 ✓）
+    uint32_t counter_fire_ackonly;// 只回 ack 那一支（不跑整圈 ⇒ 不进协议圈数 ✓）
+    uint32_t counter_fire_tick;   // 跑整圈那一支 ✓
+    uint32_t counter_fire_d0;     // ffrdp_next_due 给的是 0（眼下没别的事 ✓）
+    uint32_t counter_fire_dnow;   // 给的是 <= now（要求"现在"✗ ⇒ 这一档就是自旋源 ✓）
+    uint32_t counter_fire_dnear;  // 给的是 now+1..4ms
+    uint32_t counter_fire_dfar;   // 给的是 > now+4ms ✓（正常 ✓）
     uint32_t counter_upd_cost_max;// longest time spent inside one lap, in ms
     uint32_t counter_ack_una_dup; // ack frames whose una is the same as the previous one: the peer reports no progress
     uint32_t counter_rto_head ;   // rto retransmits of the send list head, the frame that blocks the stream
@@ -470,7 +470,7 @@ typedef struct {
     uint32_t   cb_other_calls;    // 其他类型 ✓
     uint32_t   cb_nconn_zero;     // 入口时 nconn==0 ✗（那一段循环体一次都不跑 ✓）
     uint32_t   cb_nconn_sum;      // 入口时 nconn 之和 ✓（配 timer_calls 看平均几条 ✓）
-    uint32_t   tick_ffrdp_init;  // tick of ffrdp_init, for the elapsed time in the dump
+    uint32_t   tick_ffrdp_init;   // tick of ffrdp_init, for the elapsed time in the dump
     FFRDPCONN  conn;   // P1：内嵌的主连接（第一步的表 0 号就指向它 ⇒ 内存/行为与 P1 一致 ✓）
 
     // ── 连接表（P2 第一步）──────────────────────────────────────────────────
@@ -2376,18 +2376,18 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     // 三个判据一行打完：drain 早退（它随窗口宏缩放，之前没有计数器）、cwnd 被乱序误判打回、
     // 以及被内核丢包/缓冲压力打回。计数是累计的（测试驱动的 dump 传 clearhistory=0），看增量。
     printf("ssthresh floor hits : %u (cwnd already at the floor, still recomputed => +1/ACK from here)\n", c->counter_ssth_floor);
-    printf("due-now sources      : ack %u, work %u, STALE %u (stale = asks for \"now\" with nothing to do); future %u\n",
+    printf("due-now sources     : ack %u, work %u, STALE %u (stale = asks for \"now\" with nothing to do); future %u\n",
            c->counter_due_now_ack, c->counter_due_now_work, c->counter_due_now_stale, c->counter_due_future);
-    printf("stale by source      : frame %u, flush %u, rate %u, hs %u, keepalive %u, query %u, probe %u, other %u\n",
+    printf("stale by source     : frame %u, flush %u, rate %u, hs %u, keepalive %u, query %u, probe %u, other %u\n",
            c->counter_stale_src[1], c->counter_stale_src[2], c->counter_stale_src[3], c->counter_stale_src[4],
            c->counter_stale_src[5], c->counter_stale_src[6], c->counter_stale_src[7], c->counter_stale_src[0]);
     // ①-3：被护栏改写过的那批（旧分类会把它记进 future ✗）—— 真机服务端自旋的真身 ✓
-    printf("guard-now ask        : %u (asked for \"exactly now\" => rewritten to now+1; each is a 0ms sleep if a lap takes >1ms)\n",
+    printf("guard-now ask       : %u (asked for \"exactly now\" => rewritten to now+1; each is a 0ms sleep if a lap takes >1ms)\n",
            c->counter_arm_eq_now);
-    printf("guard-now by source  : frame %u, flush %u, rate %u, hs %u, keepalive %u, query %u, probe %u, other %u\n",
+    printf("guard-now by source : frame %u, flush %u, rate %u, hs %u, keepalive %u, query %u, probe %u, other %u\n",
            c->counter_arm_eq_src[1], c->counter_arm_eq_src[2], c->counter_arm_eq_src[3], c->counter_arm_eq_src[4],
            c->counter_arm_eq_src[5], c->counter_arm_eq_src[6], c->counter_arm_eq_src[7], c->counter_arm_eq_src[0]);
-    printf("armed <=2ms          : %u (deadline within 2ms of now after accounting; the real spin indicator)\n",
+    printf("armed <=2ms         : %u (deadline within 2ms of now after accounting; the real spin indicator)\n",
            c->counter_arm_le2ms);
     printf("drain-block/backdrop: %u ticks (drain held), cwnd back %u (rto/fast) + %u (send fail)\n",
            c->counter_drain_block, c->counter_cwnd_back, c->counter_cwnd_sfail);
@@ -2511,7 +2511,7 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("counter_ack_dup     : %u\n"  , c->counter_ack_dup     );
     // rtt_tail 是这一版"让 RTO 自己够到延迟尾部"的那个学习量（见 FFRDP_MIN_RTO 的注释）；它应当收敛到
     // 这条链路的确认延迟尾部（真机上是 85~92 ms 那一档），并在链路变好后每秒衰减 1/16。
-    printf("confirm-wait hist(ms): <=16 %u, <=32 %u, <=64 %u, <=128 %u, <=256 %u, <=512 %u, <=1024 %u, more %u (max %u)\n",
+    printf("confirm-wait hist ms: <=16 %u, <=32 %u, <=64 %u, <=128 %u, <=256 %u, <=512 %u, <=1024 %u, more %u (max %u)\n",
            c->counter_conf_16, c->counter_conf_32, c->counter_conf_64, c->counter_conf_128,
            c->counter_conf_256, c->counter_conf_512, c->counter_conf_1024, c->counter_conf_more,
            c->counter_conf_max);
