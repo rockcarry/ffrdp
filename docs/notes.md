@@ -3515,3 +3515,44 @@ lowlevel 的 `fire` / 圈·包 都**不能**单独当"空转"判据 ✗。
 **②-2 小修（本条改动）**：`lap output sent` 的哨兵 bug ✓ —— 原来拿 1 当 0 的哨兵 ✗ ⇒ 对"一帧都没发过的
 内嵌槽"无符号下溢 ✗ ⇒ 它那行被打成 `>=2 帧`（真机 r7 实测 ✓）。改成"0 = 还没发过、两侧都非零才算一圈"✓。
 纯只读 ✓。
+### 26.30 【交接】lo 吞吐归因：目标、证据、计划、约定（2026-10-15 夜）✔
+
+**目标**：lo 吞吐 HEAD **16.9 / 17.8 MB/s** → 先做到 **>= 30 MB/s**（v1.1 是 80 MB/s ✓）。
+
+**已测证据**（本机回环，各 15s ✓，同一跑法 ✓，`/tmp/abv1` 里还留着日志 ✓）：
+
+| 二进制 | 客户端发 ✓ | 折算 | CPU（cli/srv ✓）|
+|---|---|---|---|
+| `dist/test_ffrdp_v1.1` | 1201.9 / 1217.6 MB | **80.1 / 81.2 MB/s** | 86% / 87% |
+| `dist/test_ffrdp_v1.2` | 500.4 / 527.0 MB | 33.4 / 35.1 MB/s | 78% / 73% |
+| `dist/test_ffrdp_spin9_after`（HEAD ✓）| 254.0 / 267.7 MB | 16.9 / 17.8 MB/s ✗ | **42% / 42%** ✓ |
+
+⇒ **两条硬结论**：① 差距 4.6 倍、可复现 ✓，且 **v1.2 时代就已退化 2.4 倍** ✗（与 §26.21~§26.29 那几处
+"减空转"无关 ✓）；② **HEAD 不是 CPU 瓶颈**（只用 42% 单核 ✓，v1.1 反而 86% ✗）⇒ 瓶颈是**等待/串行** ✓。
+
+**计划（三步，先量再改 ✓）**
+1. **只读仪表（三个"谁在等"）**：① 应用侧 —— `ffrdp_send` 因队列闸门等待的次数/时长 ✓（配现有
+   `counter_send_failed / txfull / swnd0 / capblock` ✓；看 `APP_TX_SIZE` / `MAX_WAITSND` 是否成了瓶颈 ✓）；
+   ② 信用侧 —— `swnd` 回补到能再发一帧的延迟 ✓；③ 收包侧 —— `FFRDP_LOWLEVEL_RX_BATCH_MAX 2` 与
+   "每包一次回调"的代价 ✓；另加一个 **每帧 `sendto` 次数** ✓（v1.1 很可能一次发多帧 ✓，我们是一帧一次 ✓）。
+2. **回环定位**：基线 = `dist/test_ffrdp_spin9_after` ✓，判据 = 每圈帧数 × 圈频 ✓ + 上面三档谁占主导 ✓。
+3. **一行级改动 → 回环验（>= 30 MB/s ✓）→ `SIM_FAST=1 bash tools/check.sh` 全绿 ✓ → 提交 ✓ →
+   真机 `SESSION=r8/r9` 交替 ✓**（闸门：吞吐不劣化 ✓、client CPU 峰值不升高 ✓、重传不劣化 ✓）。
+
+**约定与坑（照做，能省一整轮 ✓）**
+- 文件是 **CRLF** ✗ ⇒ python 补丁先 `
+ -> 
+` 归一化、写回再转回来 ✓；
+- 引号会被 Windows/WSL 中间层吃掉 ✗ ⇒ **一律先写成脚本文件再跑** ✓；提交信息也走文件
+  （`git commit -F /tmp/xxx.txt` ✓）；
+- 真机每轮 **`SESSION=` 必须不同** ✓、必须**交替** ✓、带 `PINGWATCH=1 CPUWATCH=1` ✓；
+- 看收益只认三样 ✓：**协议圈数**（`lap period avgmax` 第三个数 ✓）、**入口分档**（`timer`/`recv` ✓）、
+  **每圈产出**（`lap output sent` ✓）—— lowlevel 的 `fire` / 圈·包 **不能**单独当判据 ✗；
+- 二进制命名 `dist/test_ffrdp_<tag>` ✓，真机命令 `./test.sh dist/test_ffrdp_<tag> chenk@<AP> "" 120` ✓；
+- 全量判据（build + 仿真 14 项 + ASAN + 两进程四路 + v1 互通 3/3 ✓）**全绿**才算过 ✓，
+  且 `git status --porcelain` 必须为空 ✓；
+- 已知遗留（不影响当前 KPI ✓）：护栏 `now+1` 在一圈 >1ms 时理论退化为 0ms 睡眠 ✗（实测未造成自旋 ✓）；
+  r1 那轮"快链路 client 重传偏高"✗（后续未复现 ✓）。
+
+**入口读数（新上下文开工前先看这两条）**：`git --no-pager log --oneline -3` ✓、
+`grep -a 'lap output sent\|lap period avgmax\|timer branch' logs/spin8_after_server_r7.log | tail -6` ✓。
