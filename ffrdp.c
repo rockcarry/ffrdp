@@ -33,7 +33,19 @@ static uint32_t get_tick_count()
 }
 #endif
 
-#define FFRDP_MAX_MSS       (1500 - 8) // should align to 4 bytes and <= 1500 - 8
+// 收 / 发两个 MSS **必须分开**：线上字节 = 本帧 + UDP 8 + IPv4 20 = 帧 + 28，
+// 只按 1500 建帧 ⇒ 满帧 4+1492 = 1496 加头 = 1524 > 1500（以太网 MTU）⇒ **每个满帧都被 IP 分片** ✗。
+//   · FFRDP_MAX_RX_MSS：**能收多大**，**不能缩** ✗（收包节点按它建，超了是静默截断 ⇒ 老对端的满帧
+//     会被悄悄切掉尾巴）；(1500 - 8) & ~3 = 1492 = 旧值 ⇒ **收侧行为不变** ✓。
+//   · FFRDP_MAX_MSS：**发多大** = 再扣掉网络头，并对齐 4 字节。取 1464 是为了让 FEC 帧
+//     4 + 1464 + 2 + 28 = 1498 也不出 MTU ✓（普通满帧 4 + 1464 + 28 = 1496 ✓）。
+#define FFRDP_NET_HEADER_RESERVE 28    // UDP 8 + IPv4 20
+#define FFRDP_MAX_RX_MSS    ((1500 - 8) & ~3)   // 1492
+#define FFRDP_MAX_MSS       ((FFRDP_MAX_RX_MSS - FFRDP_NET_HEADER_RESERVE) & ~3)   // 1464
+#define FFRDP_ETHERNET_MTU  1500
+#if (FFRDP_MAX_MSS + 4 + 2 + FFRDP_NET_HEADER_RESERVE) > FFRDP_ETHERNET_MTU
+#error "满 FEC 帧 + UDP/IP 头超过以太网 MTU ⇒ 会 IP 分片：该缩 FFRDP_MAX_MSS"
+#endif
 #define FFRDP_MIN_RTO        16
 #define FFRDP_MAX_RTO        2000
 #define FFRDP_MAX_WAITSND    256
@@ -43,9 +55,9 @@ static uint32_t get_tick_count()
 #define FFRDP_MIN_CWND_SIZE  1
 #define FFRDP_DEF_CWND_SIZE  32
 #define FFRDP_MAX_CWND_SIZE  64
-#define FFRDP_RECVBUF_SIZE  (128 * (FFRDP_MAX_MSS + 0))
-#define FFRDP_UDPSBUF_SIZE  (128 * (FFRDP_MAX_MSS + 6))
-#define FFRDP_UDPRBUF_SIZE  (128 * (FFRDP_MAX_MSS + 6))
+#define FFRDP_RECVBUF_SIZE  (128 * (FFRDP_MAX_RX_MSS + 0))   // 收侧容量 ⇒ 按**收** MSS 算（用发 MSS 会缩掉窗口）
+#define FFRDP_UDPSBUF_SIZE  (128 * (FFRDP_MAX_RX_MSS + 6))   // 内核收发缓冲 ⇒ 也按收 MSS（保持原容量）
+#define FFRDP_UDPRBUF_SIZE  (128 * (FFRDP_MAX_RX_MSS + 6))
 #define FFRDP_SELECT_SLEEP   1
 #define FFRDP_SELECT_TIMEOUT 10000
 #define FFRDP_USLEEP_TIMEOUT 1000
@@ -108,7 +120,7 @@ typedef struct {
     uint32_t tick_ffrdp_dump;
 
     uint8_t  fec_txbuf[4 + FFRDP_MAX_MSS + 2];
-    uint8_t  fec_rxbuf[4 + FFRDP_MAX_MSS + 2];
+    uint8_t  fec_rxbuf[4 + FFRDP_MAX_RX_MSS + 2];   // 接收侧：按**收** MSS（对端可以比我们发得大）
     uint8_t  fec_txredundancy, fec_rxredundancy;
     uint16_t fec_txseq;
     uint16_t fec_rxseq;
@@ -339,7 +351,7 @@ void* ffrdp_init(char *ip, int port, char *txkey, char *rxkey, int server, int s
     ffrdp->ssthresh = FFRDP_DEF_CWND_SIZE;
     ffrdp->rtts     = (uint32_t) -1;
     ffrdp->rto      = FFRDP_MIN_RTO;
-    ffrdp->rmss     = FFRDP_MAX_MSS;
+    ffrdp->rmss     = FFRDP_MAX_RX_MSS;   // rmss = "对端能发多大" ⇒ 用收 MSS，不是我们发多大
     ffrdp->smss     = MAX(1, MIN(smss, FFRDP_MAX_MSS));
     ffrdp->fec_txredundancy = MAX(0, MIN(sfec, FFRDP_FRAME_TYPE_FEC32));
     ffrdp->tick_ffrdp_dump  = get_tick_count();
@@ -568,7 +580,7 @@ void ffrdp_update(void *ctxt)
 
     if (ffrdp_sleep(ffrdp, FFRDP_SELECT_SLEEP) != 0) return;
     for (node = NULL;;) { // receive data
-        if (!node && !(node = frame_node_new(FFRDP_FRAME_TYPE_FEC2, FFRDP_MAX_MSS))) break;
+        if (!node && !(node = frame_node_new(FFRDP_FRAME_TYPE_FEC2, FFRDP_MAX_RX_MSS))) break;   // 收包节点按**收** MSS 建
         if ((ret = recvfrom(ffrdp->udp_fd, (void*)node->data, node->size, 0, (struct sockaddr*)&srcaddr, &addrlen)) <= 0) break;
         if ((ffrdp->flags & FLAG_SERVER) && (ffrdp->flags & FLAG_CONNECTED) == 0) {
             if (ffrdp->flags & FLAG_CONNECTED) {
