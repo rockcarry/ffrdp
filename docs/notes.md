@@ -4901,3 +4901,36 @@ dev 构建带 `-DFFRDP_DIAG=1` ✓（已接进 `build.sh` 与 `tools/sim/run.sh`
 
 判据 ✓：`check.sh` **8/8 PASS**（DIAG=1 口径 ✓）；DIAG=0 与 DIAG=1 **都** `-Wall -Werror` 干净 ✓。
 顺带发现一处**预存死代码**：`ffrdp.c` 里有个 `#if 0` 块（留给 T4 处理 ✓）。
+
+### 26.66 代码瘦身 T2a-2（路线 A）：诊断计数器搬进一个 `#if FFRDP_DIAG` 段 ⇒ `sizeof(conn)` −624 B ✓（2026-10-16 晚）✔
+
+承 §26.65：dump 已能整体编译掉，但 **154 个 `counter_*` 里有 17 个是"真状态"** ✓ —— 它们的值直接喂给协议
+逻辑（`counter_delivered`→`rate_now`、`counter_resend_rto/fast`+`counter_send_1sttime`→探测判据、
+`counter_ack_recv`→伪超时票据、`counter_rxfull`→收进帧速、`counter_capblock`→cap 变化检测、
+`counter_swnd0`→饿死检测 ✓ …）。这些必须常驻 ✗。
+
+**做法（路线 A ✓）**：把**其余 133 个纯 dump 计数器**集中搬到 `FFRDPCONN` **末尾一个** `#if FFRDP_DIAG`
+段里（注释跟着各自的字段一起搬 ✓），写点改成 `FFRDP_CNT*` 宏 ✓。⇒ 条件编译从"遍地"变成**三处各自成块**
+（宏 / 结构体 diag 段 / dump ✓）—— 与"合并 `#if`、要可读"的方向一致 ✓。
+
+**KEEP 集是量出来的、不是猜的** ✓：把全部计数器先搬走 → `-DFFRDP_DIAG=0` 编译 → **编译器报 "has no member
+named X" 的地方就是逻辑真读了它** ✓ ⇒ 回填进 KEEP → 重来。两轮即收敛，**17 个** ✓（同上那批 ✓）。
+
+**两个实现细节（都值得记 ✓）**：
+1. `reserved` 是 memset 跨度的**终点哨兵** ✓（`memset(&counter_send_bytes, 0, &reserved - &counter_send_bytes)` ✓）
+   ⇒ 它必须跟计数器一起搬、且放在 diag 段**最后** ✓；`counter_send_bytes` 放**最前** ✓。顺带把那个潜在
+   bug 修掉 ✓：原来的跨度里**夹着真状态**（`hs_state`/`hs_tick`/`dup_seen`/`rtt_min` ✓）⇒ 谁用
+   `clearhistory=1` dump 一次，`hs_state` 会被清零 ✗。（现在跨度 = 整个 diag 段 = 纯计数器 ✓。）
+2. `FFRDP_DIAG=0` 时冒空宏必须**引用它的参数**（`((void)(c), (void)(v))` ✓）：否则"只用它们给计数器做
+   下标的局部变量"（如 `now_src` 的 `tag` ✓）会变成 set-but-not-used ⇒ 被 `-Werror` 挡下 ✗。
+
+**实测**
+
+| 项 | FFRDP_DIAG=0 | FFRDP_DIAG=1 |
+|---|---|---|
+| **`sizeof(FFRDPCONN)`** | **3 456 B** ✓ | 4 080 B（**−624 B/连接 = −15.3%** ✓）|
+| `sizeof(FFRDPCONTEXT)` | 3 864 B | 4 488 B |
+| `ffrdp.o` | **27 840 B** | 48 341 B（**−42%** ✓）|
+
+`maxconn = 16` 时：仅这一项每进程 **−9.7 KB** ✓。KEEP 17 个 ✓、搬走 133 个 ✓。判据 **8/8 PASS** ✓（1016-154156 ✓）；
+`DIAG=0` 与 `DIAG=1` 都 `-Wall -Werror` 干净 ✓。
