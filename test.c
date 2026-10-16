@@ -30,6 +30,15 @@ static char server_bind_ip[32]   = "0.0.0.0";
 static char client_cnnt_ip[32]   = "127.0.0.1";
 static int  server_bind_port     = 8000;
 static int  client_cnnt_port     = 8000;
+// ①-41 实验：send 被拒后**立刻重试**多少次（env TEST_APP_SENDRETRY ✓；0 = 老行为：下一个循环再说）。
+// 为什么要它：老循环是"发一条 → 进 10ms 超时的 ffrdp_recv"✓ ⇒ 一旦 send 被拒 ✗，要睡一整个
+// 10ms 才回来重试 ✗✗。而 v1.1 的应用**从不阻塞** ✓ ⇒ 它可以直接成帧还跑得很快 ✓（§26.42/§26.43）。
+static int  app_sendretry_get(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TEST_APP_SENDRETRY"); v = (e && *e) ? atoi(e) : 0; }
+    return v;
+}
 static int  server_max_send_size = 16 * 1024;
 static int  client_max_send_size = 16 * 1024;
 static int  send_speed           = 0;   // 本进程的发送限速，单位 KB/s（1024 B）；0 = 不限速
@@ -312,6 +321,12 @@ static int link_loop(struct link_arg *a)
                 if (msg_len <= 0) { msg_len = 0; break; }
                 tick_msg_first = get_timestamp32_ms(); msg_retries = 0;
                 ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
+            {   int t = app_sendretry_get();   // ①-41 实验：被拒立刻重试（0 = 关 ✓）
+                while (ret < 0 && t-- > 0) ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
+            }
+                {   int t = app_sendretry_get();   // ①-41 实验：被拒立刻重试（0 = 关 ✓）
+                    while (ret < 0 && t-- > 0) ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
+                }
                 if (ret == msg_len) {
                     v.sent_msgs++; v.sent_bytes += (uint32_t)msg_len;
                     if (quota) tokens -= (uint32_t)msg_len;
@@ -340,6 +355,9 @@ static int link_loop(struct link_arg *a)
             // 传 0（不等待）：这个测试的背压方式就是"队列满就下一轮原样重试这一条"，
             // 重试的节拍由下面那次带超时的 ffrdp_recv 提供 ✓。
             ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
+            {   int t = app_sendretry_get();   // ①-41 实验：被拒立刻重试（0 = 关 ✓）
+                while (ret < 0 && t-- > 0) ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
+            }
             if (ret == msg_len) {                       // 整条被接受
                 // 只读（§26.30 ①-①）：这条被拒过 ⇒ 把"从第一次尝试到被接受"的时长记下来 ✓
                 if (msg_retries) {
