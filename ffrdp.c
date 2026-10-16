@@ -36,220 +36,80 @@
 #define FFRDP_CNT_MAX(c, f, v)   ((void)(c), (void)(v))
 #endif
 
-// 帧的固定开销：4 字节头（类型/长度）+ FEC 帧再加 2 字节 fec seq。见 frame_node_new / frame_payload_size。
+// ── 帧格式 ───────────────────────────────────────────────────────────────
+// 帧头 4 字节（类型/长度）+ FEC 帧的 2 字节 fec seq；MSS 由传输层一帧上限派生，向下对齐 4 字节。
 #define FFRDP_FRAME_HEAD      4
 #define FFRDP_FRAME_FEC_TAIL  2
 #define FFRDP_FRAME_OVERHEAD  (FFRDP_FRAME_HEAD + FFRDP_FRAME_FEC_TAIL)
-// 单帧载荷上限：由传输层的一帧上限派生（**不再写死 1500**）——减掉最大帧开销，再向下对齐到 4 字节。
-// 1500 - 6 = 1494 ⇒ &~3 = 1492，与旧值 (1500 - 8) 相同 ⇒ 这次只是把来源写清、行为不变。
 #define FFRDP_MAX_MSS       ((FFRDP_LOWLEVEL_FRAME_MAX - FFRDP_FRAME_OVERHEAD) & ~3)
-#define FFRDP_MIN_RTO        16   // RTO 硬下限（v1.1.0 原值）。
-                                  // 2026-10-12 真机教训：改成的不是这个常数，而是"让 RTO 自己去够到延迟尾部"。
-                                  // 真机上原有的 33~55 次/秒伪超时（resend_waste 99.7~100%）不是 RTO 太小，
-                                  // 而是**估计器看不见尾部**：RTT 采样把"被重传过的帧"整批排除，而迟到 85~92 ms
-                                  // 的恰恰全是这批 ⇒ 任何 rtts/rttd 公式都学不到它（临时把下限抬到 100 ms 能治好，
-                                  // 已验证，但那是常数、在真丢包链路上要付恢复变慢的代价）。
-                                  // 更好的做法见 rtt_tail：只采"对端其实早就有"的那种超时，把它学进 RTO。
+
+// ── 定时与窗口 ───────────────────────────────────────────────────────────
+#define FFRDP_MIN_RTO        16   // RTO 硬下限（ms）；实际 RTO 由 rtt_tail 学到延迟尾部
 #define FFRDP_MAX_RTO        2000
-// ①-41：在途帧数上限（判在 ffrdp_send 的受理判据里）。它原来还是应用队列容量的乘数 ✓，队列已删 ✓。
-// 必须 >= FFRDP_INFLIGHT_MAX（以及 FFRDP_MAX_CWND_SIZE）：比它小就成了比协议闸门更紧的刹车，在途
-// 永远填不满窗口，高 BDP 链路上会掉速 —— 而回环 RTT 极小，测不出来。默认取值与此二者相等。
-#define FFRDP_MAX_WAITSND    256
+#define FFRDP_MAX_WAITSND    256  // 受理侧的帧数闸；必须 >= 在途上限与 max_cwnd，否则它比协议闸门更紧
 #define FFRDP_QUERY_CYCLE    500
 #define FFRDP_FLUSH_TIMEOUT  500
 #define FFRDP_DEAD_TIMEOUT   5000
 #define FFRDP_MIN_CWND_SIZE  1
 #define FFRDP_DEF_CWND_SIZE  32
 #define FFRDP_MAX_CWND_SIZE  128
-// 连接表容量（v2：maxconn，默认 16 ✓）。句柄 = 下标 ✓、索引永不复用 ✓（见 ffrdp.h 的设计说明）。
-#define FFRDP_MAXCONN        16
+#define FFRDP_MAXCONN        16   // 连接表容量；句柄 = 下标，索引永不复用（见 ffrdp.h）
+
 // ── 握手（v2）────────────────────────────────────────────────────────────
-// 只吃一个帧类型号，子类型放载荷第 1 字节（将来加字段只扩载荷，不再占类型号）。
-// 构造方式照抄 QUERY：小栈缓冲 + lowlevel->send() 直接发 ⇒ 绕开 frame_node 的 FEC 尾巴。
-// 帧类型 35 是安全的：ffrdp_on_frame 只认 ≤34，其余一律静默忽略（v1 收到会直接丢掉 ✓）。
+// 只占一个帧类型号，子类型在载荷第 1 字节（加字段只扩载荷）；帧类型 35 安全：v1 只认 <=34 并静默忽略。
 #define FFRDP_FRAME_TYPE_HANDSHAKE 35
 #define FFRDP_HS_SYN      1
 #define FFRDP_HS_SYN_ACK  2
 #define FFRDP_HS_ACK      3
 #define FFRDP_HS_FIN      4
-#define FFRDP_HS_RETRY_MS 500   // 重传间隔（总时限用配置的 handshake_ms ✓）
-// 握手状态（每条连接）；0 = 无握手（calloc 清零后的初值，不需要单独的常量 ✓）
+#define FFRDP_HS_RETRY_MS 500   // 重传间隔（总时限用配置的 handshake_ms）
+// 握手状态（每条连接）；0 = 无握手
 #define HS_SYN_SENT 1   // 客户端发了 SYN，等 SYN-ACK
 #define HS_SYN_RCVD 2   // 服务端发了 SYN-ACK（半开），等 ACK
 #define HS_UP       3   // 已建立
-#define HS_FIN_WAIT 4   // 我方已发 FIN，等对端的 FIN（v2 主动关 ✓）
-#define HS_FAILED   5   // 握手超时（客户端）：此后 send/recv 一律按"已断"处理
-                                  // 2026-10-12 真机 A/B：这个上限与 FFRDP_INFLIGHT_MAX 一起从 64 抬到
-                                  // 128 后，两侧吞吐同时 ×3（客户端 2.5->7.1 MB/s，服务端 3.8->11.4），
-                                  // 服务端 counter_send_failed 9120->254；再抬到 256 基本不再涨（拐点在
-                                  // 128）。注意它同时是 ffrdp_drain_tx 的早退判据，所以不要只改在途闸门。
+#define HS_FIN_WAIT 4   // 我方已发 FIN，等对端 FIN
+#define HS_FAILED   5   // 握手超时 ⇒ 此后 send/recv 按"已断"处理
 
-// step29: the real brake -- the number of frames allowed on the wire at once. The peer's advertised window
-// cannot serve as one: it is handed out again on every ack, so a limit placed on it never binds (measured:
-// 63 frames in flight while the cap read 22).
-// 2026-10-14 真机扫描（tools/inflight-sweep.sh，同批多档、各 180s、两端同版本 ✓；见 notes §26.15/§26.16）：
-//   快 AP  cap 5 ⇒ 0.87 MB/s / rtts 21ms ｜ cap 64 ⇒ 2.66~3.20 / 6~18ms（×3 ✓）｜ cap128 ⇒ 3.14~3.80 / 24~97ms ✗
-//   慢 AP  cap 5 ⇒ 0.34 / **14ms** / 重传 0.12% ✓ ｜ cap 64 ⇒ 0.32 / **227ms** ✗ / 2.86% ✗
-//   lo     cap 64 比 cap 5 慢 ~1.5 倍 ✗（结构性代价，与闸门取值无关 ✓）
-// ⇒ 同一个常数救不了两条链路 ✗（快 AP 要 64 ✓、慢 AP 要 5 ✓）⇒ 这里取"对谁都无害"的 64 ✓，
-//   自适应交给探测（FFRDP_PROBE_ENABLE ✓）—— 实测"探测开 + 地板 32"：快 AP 4.57~8.0 MB/s ✓（还快过静态 64 ✓）、
-//   慢 AP rtts 104~116ms / 重传 0.29~1.25% ✓，无一处变差 ✓。
-// 三道闸同步核对：MAX_WAITSND 256 ✓ 与 MAX_CWND_SIZE 128 ✓ 本来就 >= 64 ✓（见上面那条坑 ✓）。
-// 别混 ✓：waste% 随窗口涨而重传率 ≤0.25% ⇒ 那是 RTO 尾部那条独立线索（§26.5/§26.12）✓，不是闸门的判据 ✗。
+// ── 在途闸门：真正管住"线上同时有几帧"的量 ───────────────────────────────
+// 对端通告的窗口当不了闸门（每次 ack 都重新发一遍 ⇒ 不约束任何东西）。
+// 同一个常数救不了两条链路（快 AP 要 64、慢 AP 要 5）⇒ 这里取"对谁都无害"的 64，自适应交给探测。
+// ⚠️ 它同时是 ffrdp_drain_tx 的早退判据 ⇒ 改它要连 FFRDP_MAX_CWND_SIZE 一起看。
 #define FFRDP_INFLIGHT_MAX   64
-                                  // It is a source constant, not a build switch: change it here and rebuild.
-// 2026-10-14（第二轮）：地板 32 → **4**。2026-10-15 真机结果 ✓：慢 AP 两侧分别稳在 4 / 8 帧，
-// rtts **12 / 20ms**（原 116 / 224ms ✓）、吞吐 0.32/0.64 与 0.61/0.30 不降反升 ✓、重传 0.46/0.24% ✓。
-// 推导：慢 AP 的延迟就是"在途字节 ÷ 该 AP 速率"✓——
-// 32 帧（41KB）÷ 0.34MB/s = 120ms（实测 116ms ✓）、5 帧（6.4KB）= 19ms（实测 14ms ✓）
-// ⇒ 要拿到 ~15-20ms，就必须允许探测走到 ~4-6 帧 ✓（§26.16 里"32"只是当时判据会抖的权宜 ✓；
-// 现在 keep 有了第二条证据（重传强度 ✓），下探才稳得住 ✓）。
-// 命名原因：闸门 / 探测 / 预期窗口三处曾各写 4 或 8 而漂开 ⇒ 现在共用一个常量 ✓。
-// ══ ①-27（本轮实验 ✓）：三道闸门的**运行时**旋钮（默认全部 = 源码常量 ⇒ 零行为变化 ✓）══════
-// 为什么需要：①-26 查明**默认节拍是 app-limited**（96.6% 的圈因表空而停 ✓）⇒ 那时调闸门是空转 ✗，
-// 之前 `capN` 那批实验（cap 5/8/16/32/64/128 ✓）就是这么得出"加大没用"的 ✗；而让应用能灌（burst ✓）
-// 之后**在途闸门就是工作点**（占用 89.6% ✓、88% 的圈被它停 ✓）⇒ 现在才量得出它值多少 ✓。
-// ⚠️ 三个必须一起动 ✓：`FFRDP_MAX_CWND_SIZE` **同时**是 `ffrdp_drain_tx` 的早退判据（源码注释里
-//    写着"不要只改在途闸门" ✗），而 `FFRDP_MAX_WAITSND` 是应用侧的帧数闸 ✓。
-// 实验做完，选定的值应该写回上面那几个源码常量 ✓（注释里那句 "a source constant, not a build switch" ✓）。
-// ①-39（2026-10-16）：探测器的**内存视角**开关 ✓（env `FFRDP_MEMPROBE=0` 可关 ✓）。
-// 为什么需要第三种触发：原来那两条问的都是"链路在排队吗"（rtts > 3×rtt_min ✓）与
-// "重传强度上来了吗"（waste ≥ 5 pm ✓）—— 这两条在**健康快链路**上永远不成立 ✗
-// （真机实测：50 MB/s 回环、waste 0 pm、rtts/rtt_min = 0/0 ⇒ probes 0 次 ✗，
-// 见 §26.59 那份 dump ✓），可每在途帧 ≈1.3 KB ⇒ 上限 64 帧就是 ~84 KB 的**峰值**内存 ✓。
-// 对内存敏感的场景（嵌入式），"上限远远用不满"本身就是值得下探的理由 ✓。
-// 安全网不变 ✓：keep 只认"确认速率没掉"或"重传强度低 20% 以上"（§26.18 起就不再要求 RTT 下降 ✓），
-// revert 会把这个下探还回去、并把下次间隔翻倍（10s→20s→40s→60s ✓）。
-#define FFRDP_MEMPROBE_ENABLE 1   // ①-39：内存视角的探测触发（0 = 关）
-// 没到这么深的在途就不值得再问（否则会一路问到地板、把来回测量变成抖动 ✓）
-#define FFRDP_MEMPROBE_MIN_OUT 8u
-// ①-41（实验）：**未发出帧数**预算 ✓ —— 应用队列被删掉之后，接管它"突发整形"那一半职责 ✓。
-// 为什么必须是这个量：实测（lo ✓）删掉队列后吞吐 35.6 → 3.3 MB/s ✗、重传 0.16% → 5.55% ✗，
-// 根因是应用按自己的速度直接攒帧 ⇒ 一次可以攒 100+ 帧（≈180 KB ✗）一把灌进内核缓冲 ⇒ 内核丢包
-// ⇒ 拥塞崩溃 ✓。而"未发出"（= 已入发送表但还没上过线）正是能压住的量 ✓；
-// **在途**（已发出、未确认）不受这一条限制 ✓ ⇒ 高 RTT 链路该需要的深度照旧（由 FFRDP_INFLIGHT_MAX 管 ✓）。
-// 0 = 关闭（退化成"只有帧数闸"✓，也就是 lo 上崩掉的那一版 ✓）。env: FFRDP_UNSENT
-#define FFRDP_UNSENT_MAX 24       // ①-41：未发出帧预算（0 = 关）
-// ①-28 B：伪超时（`CEVENT_ACK_TIMEOUT_MISSED` —— 等的时候 ack 到过 ✓，是估计器没看见 ✓）
-// **不再减半**。为什么：①-27 实测零丢包的 lo 上 **100% 的超时都是这一类** ✓（no-ack-arrived 0 /
-// acks-arrived-but-missed 1350 ✓），而每来一个就把 cwnd 减半 ⇒ 窗口被钉在地板 ⇒ 吞吐塌 ✓。
-// 默认 0 = 保持原行为（与快速重传同一档：乘性减半 ✓）⇒ 零行为变化 ✓。
-#define FFRDP_PSEUDO_NOCUT 0      // ①-28B：伪超时是否减半（0 = 减半，原行为）
-// ①-29（**①-30 起转正：默认 ON** ✓）：`ffrdp_apply_acks` 里"洞等够久"那条分支，
-// **同一帧只许减半一次** ✓。为什么：那条分支在**每次 ack** 都会重新走一遍发送表 ✓，而 CC 调用
-// 没有"已经减过"的守卫 ✗ ⇒ 同一个帧每当 hole_wait 到点就被再判一次 ✓。
-// 实测（§26.49 ✓ lo ✓ burst=8）：守卫关 ⇒ 770 次分支里 **729 次是重复减半** ✗、单帧最多 **62** 次 ✗
-// （窗口抬到 256 时 **16 707/17 409** ✗、单帧最多 **238** 次 ✗✗）；开了之后真调 CC 770→**104** ✓、
-// `cwnd-back` 829→**212** ✓，而同档吞吐 31.6 → **34.8/36.2 MB/s** ✓（两次复测同向 ✓，仍在单跑噪声带边缘 ✓）。
-// 保留 env：`FFRDP_HOLE_CUT_ONCE=0` 可关回原行为（复现对照用 ✓）。
-#define FFRDP_HOLE_CUT_ONCE 1     // ①-29：同一帧只许减半一次
-// ①-35b/c：`ffrdp_send` 每收一条就 `lowlevel->timer(now)` 叫醒工作线程一次 ✗ —— 32 条的突发就是
-// 32 次唤醒（§26.54：v2 ≈120 µs/消息 vs v1.1 ≈66 µs/消息，而 v1.1 的 send 只是 memcpy、零系统调用 ✓）。
-// `FFRDP_SENDWAKE_COALESCE=1`（默认 0 = 原行为 ✓）⇒ **队列由空变非空时才叫醒** ✓：之后工作线程
-// 自己会把队列抽干（`ffrdp_drain_tx` ✓，与 send 同一把锁 ✓ ⇒ 不会漏醒 ✓）并在抽空时把标志清掉 ✓。
-#define FFRDP_SENDWAKE_COALESCE 0 // ①-35c：send 唤醒合并（0 = 原行为）
+#define FFRDP_INFLIGHT_MIN   4    // 探测能下探到的地板
 
-#define FFRDP_INFLIGHT_MIN   4
+// ── 编译期实验开关（默认即生产值；改这里重编）─────────────────────────────
+#define FFRDP_MEMPROBE_ENABLE 1   // 探测的"内存视角"触发：上限远高于实际用量也值得下探（0 = 关）
+#define FFRDP_MEMPROBE_MIN_OUT 8u // 在途没到这么深就不问（否则一路问到地板，变成抖动）
+#define FFRDP_UNSENT_MAX 24       // 未发出帧预算（接管原应用队列的突发整形；0 = 关）
+#define FFRDP_PSEUDO_NOCUT 0      // 伪超时是否减半（0 = 与快速重传同档，原行为）
+#define FFRDP_HOLE_CUT_ONCE 1     // "洞等够久"分支：同一帧只许减半一次
+#define FFRDP_SENDWAKE_COALESCE 0 // send 每收一条是否合并唤醒（0 = 每条都叫一次工作线程）
 
-// the delay probe: take half the in-flight away for a moment and watch whether the round trip follows.
-#define FFRDP_PROBE_HOLD_MS       500 // held for 2 round trips plus this much, long enough to drain a queue
-#define FFRDP_PROBE_RTT_DROP_MS   2   // the typical round trip must fall by at least this many ms. Absolute, and
-                                      // that is the whole point of the change: the rule used to be relative --
-                                      // below 85% of the value in front of it -- and the value in front of it
-                                      // was c->rttm, the LATEST sample rather than the typical one, so the
-                                      // same experiment passed or failed depending on which single sample
-                                      // happened to precede it. On the measured path the winning step is rtts
-                                      // 18 -> 14ms, i.e. 4ms: 85% of 18 asks for 2.7ms and got it only when
-                                      // the sample in front was high enough. A relative rule also cannot see
-                                      // a queue that refuses to drain: 15% of a 5ms floor is far under the
-                                      // jitter. What the experiment can actually answer is "did taking half
-                                      // the frames away visibly lower the latency", which is a difference in
-                                      // milliseconds -- so it is compared as one. The rate guard below is what
-                                      // keeps an over-eager keep harmless, and the giveback undoes a stale one.
-#define FFRDP_PROBE_RATE_KEEP_PCT 85  // ... while the rate the peer confirms stays above this percentage
-// 2026-10-14 重开 ✓。当年关它的理由（"判据与地板是在**唤醒坏掉**的时期调出来的"）已经不存在：
-// 唤醒那两条 bug 已修（send/recv 句柄竞态、cond 醒后重查），而今天的真机数据正好证明**探测的前提成立** ✓
-// —— 不同链路的拐点天差地别（慢 AP 3~6 帧、快 AP 64 ✓），一个"自己走下来找拐点"的机制就是答案 ✓
-// （三张网实测：probe32 无一处变差、两处明显变好 ✓，见 §26.16）。
-// 已知不足，留着但它有安全网 ✓：keep 判据用的是 rtts 滑窗，在**突发型**链路上会踩空 ✗
-// （2026-10-14 慢 AP 日志：probe rtt ref/best = 79/79 ✗ 而实际 227ms↔79ms 在跳）；
-// 但速率守卫（FFRDP_PROBE_RATE_KEEP_PCT ✓）+ 按秒 giveback + 地板 32 三道网把它兜住了 ✓
-// —— 实测没有一次误 keep 造成损失 ✓。判据口径的重审排在后面（把"RTT 降没降"换成"resend_perMB 降没降"）。
-#define FFRDP_PROBE_GIVEBACK_IDLE_S 5 // giveback（把证明过的窗口还回去）要先"连续健康"这么多秒 ✓
-                                      // 为什么：还的速度不能快过证明的速度 ✗ —— 探测每 PROBE_GAP(10s) 才问一次，
-                                      // 而原实现每秒就能还 25% ⇒ 必然振荡。2026-10-15 慢 AP 实测：
-                                      // cap 在 16~64 之间漂、rtts 77~116ms ✗；把 giveback 关掉当对照则稳在
-                                      // 4 帧、rtts 9ms ✓✓（算术也对得上：4 帧⇒9ms、16⇒60、32⇒120 ✓）。
-                                      // 见 notes §26.18。
+// ── 延迟探测：把在途砍半，看 RTT 跟不跟着降；确认速率没掉就保留更小的上限 ──
 #define FFRDP_PROBE_ENABLE          1
-                                      // —— 把在途砍半，若 rtts 明显下降且确认速率没掉，就保留更小的上限（同吞吐、低延迟）。
-                                      // 真机上它曾走过一次"单向棘轮"✗：参考取紧邻的前一秒，第一刀之后参考自己也掉 ⇒
-                                      // 每一刀都通过 ⇒ 上限被一路 keep 到地板。现在三处安全网就位：
-                                      //   1) 参考改成"探测前一秒"与"见过的最好一秒"里的较大者（rate_best，每秒衰减 1/16）
-                                      //      ⇒ 一个 keep 必须让速率不低于历史最好值的 85%，砍过头会被拒；
-                                      //   2) 按秒 giveback：被 keep 的上限把速率拖到最好值的 85% 以下 ⇒ 每秒翻倍还回去；
-                                      //   3) 地板 INFLIGHT_MIN = 32（= INFLIGHT_MAX 的一半）⇒ 一次误 keep 也压不死管子。
-                                      // 注意它是"延迟 ↔ 吞吐"的取向选择：2026-10-12 坏 AP 那次（RTT 0.3~2 s）它把上限
-                                      // keep 到 32~64，吞吐因此更低，但 RTT 确实掉回 109ms —— 那是设计行为（§1.1 优先级②），
-                                      // 不是故障。要"吞吐优先"就把这一行改成 0 重编（dist 里有 test_ffrdp_noprobe）。
-                                      // lo 上它不触发（rtts ≈ rtt_min）⇒ 只有真机或 tools/sim 能验它；见 notes 26.9/26.14/26.15。
-                                      // on by default: it is a net win wherever a queue is being held, and
-                                      // where there is none the rate guard reverts it and nothing is lost.
-                                      // it is also how a new path gets asked "is the delay ours?", so it is
-                                      // left on rather than built specially for the question.
-// the queue test: how far the typical round trip sits above the path's own floor is what decides whether an
-// experiment is worth running. at 4x the probe stops asking while the excess is merely smaller, not gone:
-// on the target path it converged to rtts 12~19ms over a 4ms floor, i.e. 3~4.75x, and the 4x gate then left
-// it idle although a queue it could still have halved was there. 3x asks the question one step closer to
-// the floor. being curious here stays safe because the answer must still pass the same two guards (the round
-// trip must fall, the confirmed rate must hold) and a failed question doubles the gap -- so the cost is
-// bounded by one half window per back off, never by a permanently smaller pipe.
-#define FFRDP_PROBE_QUEUE_RATIO   3
-#define FFRDP_PROBE_WASTE_PM      5   // retransmits per thousand first transmissions, over the last second
-                                      // (the gate that used to sit here, "at least 8 frames on the wire", is gone:
-                                      //  what earns an experiment is not a big pipe but a ceiling that can still
-                                      //  be lowered, so the test is now "the halved ceiling is strictly under the
-                                      //  one in force" against FFRDP_INFLIGHT_MIN's floor -- see below.)
-                                      // two older gates -- "rttm >= 50ms" and "enough retransmits in the window" --
-                                      // were replaced by the queue test and are gone.
+#define FFRDP_PROBE_HOLD_MS       500 // 保持时长（= 两个 RTT + 这些）
+#define FFRDP_PROBE_RTT_DROP_MS   2   // rtts 至少要降这么多 ms 才算赢（绝对值；相对值会被单次采样带偏）
+#define FFRDP_PROBE_RATE_KEEP_PCT 85  // ... 同时确认速率不低于历史最好值的这个百分比
+#define FFRDP_PROBE_GIVEBACK_IDLE_S 5 // giveback 要先"连续健康"这么多秒（还的速度不快过证明的速度）
+#define FFRDP_PROBE_QUEUE_RATIO   3   // 排队判据：rtts/rtt_min 超过这个倍数才值得问
+#define FFRDP_PROBE_WASTE_PM      5   // ... 或重传强度（每千次首发）到这个数
 #define FFRDP_PROBE_GAP_MS        10000
 #define FFRDP_PROBE_GAP_MAX_MS    60000
-#define FFRDP_PROBE_HEALTHY_PCT   1   // below this much waste the kept window is given back a little
+#define FFRDP_PROBE_HEALTHY_PCT   1   // 浪费低于这个百分比就把窗口还一点
 
-#define FFRDP_RTO_FLOOR_MAX  1000 // ms: a longer repair delay than this is never worth paying
-#define FFRDP_RTO_WIN        128  // retransmits per evidence window, so the loop reacts in about a second
-#define FFRDP_WASTE_MIN      16   // retransmits a window must contain before it is allowed to decide anything
-#define FFRDP_WASTE_HI       80   // % of our retransmits the peer already had => the rto is sitting too short
-#define FFRDP_WASTE_LO       40   // % below which the repairs are real and the floor is given back
+// ── RTO 地板的学习（把"对端其实早就有"的超时学进 RTO；见 rtt_tail）──────────
+#define FFRDP_RTO_FLOOR_MAX  1000 // ms：比这更长的修复延迟不值得付
+#define FFRDP_RTO_WIN        128  // 证据窗里的重传数（约 1 秒一轮）
+#define FFRDP_WASTE_MIN      16   // 窗口里至少这么多重传才有资格下结论
+#define FFRDP_WASTE_HI       80   // 对端早就有我们的重传超过这个百分比 ⇒ RTO 太短
+#define FFRDP_WASTE_LO       40   // 低于这个百分比 ⇒ 修复是真的，可以还一点地板
 
-// ①-36（2026-10-15）：**128 → 96 帧**（186 KB → 140 KB）。它是**接收窗口的缓冲**
-// （recv_wnd = (sizeof(recv_buff) - recv_size) / rmss ⇒ 就是我们在 ack 里通告给对端的窗口）。
-// 判据：它必须**大于我方在途上限**（FFRDP_INFLIGHT_MAX = 64）并留余量，否则窗口反成瓶颈。
-// 实测（lo，各两轮，应用队列 32 KB）：sizeof(conn) 260576 → **180064 B（-31%）**，
-// 吞吐 40.9/37.9 → **38.2/39.0 MB/s**（同带），通告窗口 101~110 帧。
-// 再往下的 80 帧（156 KB）吞吐也同带，但实测有一轮窗口掉到 66 帧（贴住 64）⇒ 不取。
+// ── 缓冲 ─────────────────────────────────────────────────────────────────
+// 接收窗口（= 我们在 ack 里通告给对端的帧数）；必须大于在途上限并留余量，否则窗口反成瓶颈。
 #define FFRDP_RECVBUF_SIZE  (96 * (FFRDP_MAX_MSS + 0))
-// 应用发送队列容量：编译期常量、内联在结构体里 ⇒ 没有 calloc，也没有"分配失败"这条路 ✓。
-// 它只决定两件事：① 能发的**单条消息**上限 = 这个数 − 4（4 字节长度前缀，超过就返回 -1，不空等 ✓）；
-// ② 背压何时出现（配小 ⇒ 更早出现，调用方按契约重试 ✓）。
-// ①-41（2026-10-16，实验）：**应用队列（FFRDP_APP_TX_SIZE / app_tx_buff）已删除** ✓ ——
-//   回到 v1.0/v1.1 的形状：应用线程在 ffrdp_send 里**直接成帧** ✓。省 32 KB/**连接** ✓。
-//   它的"整形"职责由 `FFRDP_UNSENT_MAX`（未发出帧数预算 ✓）接管 ⇒ 见那里的注释 ✓。
-                                  // （v1.1.0 里是 WAITSND×(MSS+4) = 374 KiB ✓）。WAITSND 现在只是"在途/受理"的帧数闸门，
-                                  // 与这块纯应用侧缓冲无关；旧的乘法把两者捆在一起 ⇒ "省内存"必然"掉吞吐"，是个假取舍 ✗
-                                  // （真机实测：WAITSND 64→256 ⇒ 两侧吞吐 ×3，而队列容量本可以不动 ✓）。对吞吐中性 ✓。
-// how far ahead of the hole a received frame may sit before it is dropped instead of stored. The window
-// we advertise travels in a one byte field of the ack, so it is never more than 255 frames, and a peer
-// that respects its credit cannot be further ahead than that. Anything beyond it is a lie or a
-// duplicate, and storing it is how one stranger - with no session, no handshake and one datagram per
-// frame - grows this process's memory without limit (measured before this bound existed: 4000
-// datagrams, 4000 frames kept).
+// 乱序帧最多能越过洞多远（再远就丢 —— 否则陌生人能用无会话的数据报无限占我们内存）。
 #define FFRDP_RECV_QUEUE_MAX 256
-// socket 的缓冲区大小、等待方式（select/usleep）都随 socket 一起搬进了 lowlevel：协议这一层不再有
-// "等多久"这个东西，它只声明"我下次要在什么时刻被叫"（lowlevel.h 的 timer）。
-
-// 应用侧等待时，即使调用方没给期限也要周期性醒来一次：这样 close 之类的状态变化不会被漏掉，也让
-// 调用方看到一个"还在等"的循环，而不是一次永久睡眠。
+// 应用侧等待时即使调用方没给期限也周期醒来：不漏掉状态变化，也不让调用方永久睡眠。
 #define FFRDP_COND_WAIT_MS   200
 
 #define GET_FRAME_SEQ(f)        (*(uint32_t*)(f)->data >> 8)
