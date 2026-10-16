@@ -26,11 +26,15 @@ int main(void)
 {
     const size_t conn = sizeof(FFRDPCONN), ctx = sizeof(FFRDPCONTEXT);
     const size_t low  = sizeof(UDP_LOWLEVEL), node = sizeof(FFRDP_FRAME_NODE);
+#if FFRDP_FEC_ENABLE
     const size_t fec  = sizeof(((FFRDPCONN *)0)->fec_txbuf) + sizeof(((FFRDPCONN *)0)->fec_rxbuf);
-    printf("DIAG=%d\n", FFRDP_DIAG);
+#else
+    const size_t fec  = 0;
+#endif
+    printf("DIAG=%d FEC=%d\n", FFRDP_DIAG, FFRDP_FEC_ENABLE);
     printf("  sizeof(FFRDPCONN)            %6zu B   （每连接结构体；MAXCONN=%d ⇒%8zu B）\n",
            conn, FFRDP_MAXCONN, conn * FFRDP_MAXCONN);
-    printf("    └ 其中 FEC 收发缓冲         %6zu B   （fec:0 时不用 ✗）\n", fec);
+    printf("    └ 其中 FEC 收发缓冲         %6zu B   （FFRDP_FEC_ENABLE=0 时不存在 ✓；=1 而 fec:0 时白占 ✗）\n", fec);
     printf("  sizeof(FFRDPCONTEXT)         %6zu B   （每端点一份）\n", ctx);
     printf("  sizeof(UDP_LOWLEVEL)         %6zu B   （每端点一份）\n", low);
     printf("  sizeof(FFRDP_FRAME_NODE)     %6zu B   （动态分配：按在途帧数 ✓）\n", node);
@@ -43,15 +47,19 @@ int main(void)
 }
 EOF
 
-echo "── 编译期内存账（见 §26.82 ✓）───────────────────────────────────────────"
-for d in 0 1; do
-    if [ "$d" = 0 ]; then LBL="出货口径（DIAG=0 ✓ 诊断整块不存在）"; else LBL="dev 口径（DIAG=1 ✓ 判据那套）"; fi
+echo "── 编译期内存账（见 §26.82 / §26.83 ✓）─────────────────────────────────"
+# 三个口径：出货（诊断 + FEC 都编译掉 ✓ = 最小内存 ✓）、出货+FEC、dev（判据那套 ✓）
+for cfg in "0 0 出货口径（DIAG=0 + FEC=0 ✓ 两样都编译掉 = 最小内存 ✓）" \
+           "0 1 出货 + FEC（DIAG=0 + FEC=1 ✓ 只有 FEC 的 3 KB ✓）" \
+           "1 1 dev 口径（DIAG=1 + FEC=1 ✓ 判据/dev 那套 ✓）"; do
+    set -- $cfg; d=$1; f=$2; shift 2; LBL="$*"
     echo
     echo "=== $LBL ==="
-    if gcc -w -DLINUX -DFFRDP_DIAG=$d -I. "$TMP/probe.c" utils.c socket.c -lpthread -o "$TMP/p$d" 2>"$TMP/e$d"; then
-        "$TMP/p$d" | tail -n +2 | sed 's/^/  /'
+    if gcc -w -DLINUX -DFFRDP_DIAG=$d -DFFRDP_FEC_ENABLE=$f -I. "$TMP/probe.c" utils.c socket.c \
+            -lpthread -o "$TMP/p_${d}${f}" 2>"$TMP/e_${d}${f}"; then
+        "$TMP/p_${d}${f}" | tail -n +2 | sed 's/^/  /'
     else
-        echo "  ✗ 探针编译失败："; head -5 "$TMP/e$d" | sed 's/^/    /'
+        echo "  ✗ 探针编译失败："; head -5 "$TMP/e_${d}${f}" | sed 's/^/    /'
     fi
 done
 

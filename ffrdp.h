@@ -85,6 +85,8 @@ typedef long (*FFRDP_CALLBACK)(void *cbctx, const FFRDP_EVENT *ev);
 //           不留"配置是秒、内部是毫秒"的换算点 ✗。
 //   ",mss:1280,fec:0"                             本端 MSS 与 FEC 冗余（v1 的 smss / sfec 两个参数；
 //                                                 v2 的 init 没有位置参数，所以进了配置串）
+//        ⚠️ `fec:N`（N>0）需要**编译期** FFRDP_FEC_ENABLE=1（ffrdp.c ✓）：关掉时它被忽略并提示一次 ✓；
+//           关掉是默认 —— 那时收发两个 1.5 KB 的 FEC 缓冲不存在 ⇒ 连接结构体 3400 → 404 B ✓。
 // 解析失败 ⇒ 返回 NULL，原因打印出来（用户从输出判断）。
 void* ffrdp_init (void *params, FFRDP_CALLBACK callback, void *cbctx);
 void  ffrdp_exit (void *ctxt);              // 关掉全部连接并释放（内部会 join 传输层线程）

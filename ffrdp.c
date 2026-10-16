@@ -75,6 +75,15 @@
 #define FFRDP_HOLE_CUT_ONCE     1  // "洞等够久"分支：同一帧只许减半一次
 #define FFRDP_SENDWAKE_COALESCE 0  // send 每收一条是否合并唤醒（0 = 每条都叫一次工作线程）
 
+// ── FEC（前向纠错）：编译期特性 ─────────────────────────────────────────────
+// 0 = **编译掉**（默认 ✓）：收发的两个 1498 B 缓冲一起消失 ⇒ 连接结构体 3400 → 404 B ✓
+//     （16 条连接省 48 KB ✓）。⚠️ 代价说清：对端若开了 FEC，它的冗余帧我们**不修** ✓
+//     （数据帧照常收 ✓）；配置串里的 fec:N>0 会被忽略并提示一次 ✓（帧型按无冗余走 = 现状 ✓）。
+// 1 = 全功能：fec:N 生效 ✓（判据 / dev 构建用它 ✓，见 build.sh）。
+#ifndef FFRDP_FEC_ENABLE
+#define FFRDP_FEC_ENABLE 0
+#endif
+
 // ── 延迟探测：把在途砍半，看 RTT 跟不跟着降；确认速率没掉就保留更小的上限 ──
 #define FFRDP_PROBE_ENABLE          1
 #define FFRDP_PROBE_HOLD_MS         500 // 保持时长（= 两个 RTT + 这些）
@@ -171,8 +180,10 @@ typedef struct {
     uint32_t tick_send_query;
     uint32_t tick_rto_backoff; // tick of last rto backoff, rto backs off once per round
 
-    uint8_t  fec_txbuf[4 + FFRDP_MAX_MSS + 2];
-    uint8_t  fec_rxbuf[4 + FFRDP_MAX_MSS + 2];
+#if FFRDP_FEC_ENABLE
+    uint8_t  fec_txbuf[4 + FFRDP_MAX_MSS + 2];   // 发送侧 XOR 累加器（每个 1498 B ✗ 占比 88%）
+    uint8_t  fec_rxbuf[4 + FFRDP_MAX_MSS + 2];   // 接收侧 XOR 累加器 / 组内首个 FEC 帧
+#endif
     uint8_t  fec_txredundancy, fec_rxredundancy;
     uint16_t fec_txseq;
     uint16_t fec_rxseq;
@@ -439,41 +450,52 @@ static void list_free(FFRDP_FRAME_NODE **head, FFRDP_FRAME_NODE **tail)
 static int ffrdp_send_data_frame(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_FRAME_NODE *frame)
 {
     switch (frame->size - c->smss) {
+#if FFRDP_FEC_ENABLE
     case 6 : FFRDP_CNT(c, counter_fec_tx); *(uint16_t*)(frame->data + 4 + c->smss) = c->fec_txseq++; break; // tx fec frame
+#endif
     case 4 : c->counter_txfull ++; break; // tx full frame
     default: FFRDP_CNT(c, counter_txshort); break; // tx short frame
     }
     // 0 = 传输层收下了这一帧；-1 = 它没收（非阻塞发送缓冲满、或链路报错）。协议不区分这两者：帧已经
     // 不在它手里了，丢没丢由上面的重传负责 —— 与旧版 sendto 失败的语义一致。
     if (ffrdp->lowlevel->send(ffrdp->lowlevel, c->peer_addr, (uint8_t*)frame->data, (int)frame->size) != 0) { FFRDP_CNT(c, counter_send_err); return -1; }
+#if FFRDP_FEC_ENABLE
     if (frame->size == 4 + c->smss + 2) { // fec frame
         uint32_t *psrc = (uint32_t*)frame->data, *pdst = (uint32_t*)c->fec_txbuf, i;
         for (i = 0; i < (4 + c->smss) / sizeof(uint32_t); i++) *pdst++ ^= *psrc++; // make xor fec frame
         if (c->fec_txseq % c->fec_txredundancy == c->fec_txredundancy - 1) {
             *(uint16_t*)(c->fec_txbuf + 4 + c->smss) = c->fec_txseq++; c->fec_txbuf[0] = c->fec_txredundancy;
-            // count it like any other send: a redundancy frame the socket refused is a repair that will
-            // not happen, and it used to leave no trace anywhere.
+            // 一次"某某被 socket 拒了"的记账：冗余帧没发出去 = 这次修复不会发生 ✓（原来不留任何痕迹 ✗）。
             if (ffrdp->lowlevel->send(ffrdp->lowlevel, c->peer_addr, (uint8_t*)c->fec_txbuf, (int)frame->size) != 0) FFRDP_CNT(c, counter_send_err); // send fec frame
             memset(c->fec_txbuf, 0, sizeof(c->fec_txbuf)); // clear tx_fecbuf
             FFRDP_CNT(c, counter_fec_tx);
         }
     }
+#endif
     return 0;
 }
 
 static int ffrdp_recv_data_frame(FFRDPCONN *c, FFRDP_FRAME_NODE *frame)
 {
+#if FFRDP_FEC_ENABLE
     uint32_t fecseq, fecrdc, *psrc, *pdst, type, i;
+#endif
     // rmss 是学来的，且被当除数与拷贝长度用 ⇒ 比自身开销还短的碎片会让它变 0 或下溢（SIGFPE / SIGSEGV）；t_fuzz 守着这条。
     switch (frame->data[0]) {
     case FFRDP_FRAME_TYPE_SHORT: FFRDP_CNT(c, counter_rxshort); return 0; // short frame
     case FFRDP_FRAME_TYPE_FULL :
         if (frame->size <= 4) { FFRDP_CNT(c, counter_rx_bad); return -1; }  // header only: no payload at all
         c->counter_rxfull ++; c->rmss = frame->size - 4; return 0; // full frame
+#if FFRDP_FEC_ENABLE
     default:
         if (frame->size <= 6) { FFRDP_CNT(c, counter_rx_bad); return -1; }  // header + fec seq, no payload
         FFRDP_CNT(c, counter_fec_rx); c->rmss = frame->size - 6; break;// fec  frame
+#else
+    // 本构建没有 FEC ⇒ 对端发来的冗余帧直接丢 ✓（**数据帧照常收** ✓；它本来也只是"能修一帧"的机会）。
+    default: return -1;
+#endif
     }
+#if FFRDP_FEC_ENABLE
     fecseq = *(uint16_t*)(frame->data + frame->size - 2);
     fecrdc = frame->data[0];
     if (fecseq / fecrdc != c->fec_rxseq / fecrdc || c->fec_rxredundancy != fecrdc) { // group changed or fec_rxredundancy changed
@@ -506,6 +528,7 @@ static int ffrdp_recv_data_frame(FFRDPCONN *c, FFRDP_FRAME_NODE *frame)
         for (i = 0; i < (frame->size - 2) / sizeof(uint32_t); i++) *pdst++ ^= *psrc++;
         c->fec_rxmask |= 1 << (fecseq % fecrdc); c->fec_rxcnt++;
     }
+#endif
     return 0;
 }
 
@@ -540,7 +563,7 @@ static void ffrdp_conn_init(FFRDPCONN *c, int smss, int sfec)
     c->rto      = FFRDP_MIN_RTO;
     c->rmss     = FFRDP_MAX_MSS;
     c->smss     = MAX(1, MIN(smss, FFRDP_MAX_MSS));
-    c->fec_txredundancy = MAX(0, MIN(sfec, FFRDP_FRAME_TYPE_FEC32));
+    c->fec_txredundancy = FFRDP_FEC_ENABLE ? MAX(0, MIN(sfec, FFRDP_FRAME_TYPE_FEC32)) : 0;  // 关掉 ⇒ 帧不加冗余尾 ✓
     // ①-38：**这里不分配大缓冲** ✗ —— 分配交给真正的使用方（下面的 ffrdp_conn_bufs ✓）。
 }
 
@@ -613,6 +636,10 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
         else { printf("ffrdp_init: unknown option \"%s\"\n", key); return NULL; }
         key = next;
     }
+#if !FFRDP_FEC_ENABLE
+    // FEC 编译掉了 ⇒ 配了也没用：明确说一句、并钉回 0 ✓（否则帧会带着冗余尾发出去、却没人能修 ✗）。
+    if (sfec > 0) { printf("<3> ffrdp_init: FEC 已编译掉（FFRDP_FEC_ENABLE=0）⇒ fec:%d 被忽略 ✓\n", sfec); sfec = 0; }
+#endif
     if (maxconn < 1 || maxconn > FFRDP_MAXCONN) { printf("ffrdp_init: maxconn %d out of range (1..%d)\n", maxconn, FFRDP_MAXCONN); return NULL; }
 
     // 平台相关的初始化（Windows 的 WSAStartup / 定时器精度）不在这里：协议层不碰 socket，socket

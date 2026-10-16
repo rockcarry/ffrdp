@@ -77,7 +77,7 @@ if [ -n "$ASAN" ]; then
     fi
 fi
 
-CFLAGS="-O1 -w -I../.. -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DFFRDP_DIAG=1 -include simdefs.h \
+CFLAGS="-O1 -w -I../.. -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DFFRDP_DIAG=1 -DFFRDP_FEC_ENABLE=1 -include simdefs.h \
  -D'calloc(n,s)=sim_calloc(n,s)' -D'free(p)=sim_free(p)' \
  -D'sendto(s,b,l,f,d,a)=sim_send(b,l)' -D'recvfrom(s,b,l,f,d,a)=sim_recv(b,l)' -D'select(n,r,w,e,t)=sim_select()' \
  -D'ffrdp_udp_lowlevel_init(p,cb,ctx)=sim_ll_init(p,cb,ctx)'"
