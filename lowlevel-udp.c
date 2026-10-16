@@ -155,6 +155,14 @@ static int ffrdp_udp_wakeup_create(UDP_LOWLEVEL *udp)
     int                fd  = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (fd < 0) return -1;
     socket_setopt(fd, "nonblock_io", 1);   // a caller must never block on a full queue
+    // ①-40（2026-10-16 内存盘点）：这个 socket **一辈子只传唤醒字节** ✓，可它原来从没设过大小
+    // ⇒ 拿内核默认值（本机实测 rcv/snd 各 **212,992 B** ✗，因为 rmem_default == rmem_max ✓）
+    // ⇒ 一个唤醒 socket 白占 **416 KB** ✗，比一条连接的协议缓冲（176 KB）还贵 ✗✗。
+    // 请求 4 KB（内核翻倍 ⇒ 8 KB ✓）。安全性：它是非阻塞的 ✓，事件循环每次醒来都把它读空 ✓；
+    // 就算真被填满（那意味着已经积了成千上万个没人处理的唤醒 ⇒ 循环本来就醒着 ✓），
+    // 丢一个唤醒字节也无害 ✓。
+    socket_setopt(fd, "send_buffer", 4096);
+    socket_setopt(fd, "recv_buffer", 4096);
     lo.sin_family      = AF_INET;
     lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     lo.sin_port        = 0;                // the kernel picks; nobody else ever needs to know it
@@ -455,6 +463,16 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
            (unsigned)sizeof(UDP_LOWLEVEL));
     printf("udp lowlevel buffers : requested %d B, kernel gave rcv %d B / snd %d B (①-30; env FFRDP_BUFSIZE in KB; rmem_max caps it)\n",
            udp->bufsize, udp->buf_rcv_eff, udp->buf_snd_eff);
+    {   // 内存盘点（只读 ✓）：**唤醒 socket** 的内核缓冲 —— 它上面从来没设过大小，
+        // 拿的是内核默认值（Linux 常见 rmem_default/wmem_default ≈ 212 KB ✗），
+        // 而它一辈子只传几个唤醒字节 ⇒ 若默认值很大，那是纯白占 ✓。
+        int r = 0, w = 0; socklen_t sl = sizeof(int);
+        if (udp->notify >= 0) {
+            getsockopt(udp->notify, SOL_SOCKET, SO_RCVBUF, (void*)&r, &sl); sl = sizeof(int);
+            getsockopt(udp->notify, SOL_SOCKET, SO_SNDBUF, (void*)&w, &sl);
+        }
+        printf("wakeup socket bufs    : rcv %d B / snd %d B (kernel default; it only ever carries wakeup bytes)\n", r, w);
+    }
     printf("udp lowlevel tx      : sendto %u calls, %u bytes (per frame = calls / frames in the ffrdp block)\n",
            udp->stat_tx_calls, udp->stat_tx_bytes);
     // ④-13（§26.30 第 2 步）：一圈的时间去向（采样 1/64 ✓；三段互斥、和 = 整圈 ✓）—— 除以采样圈数就是每圈 ✓
