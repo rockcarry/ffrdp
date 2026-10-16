@@ -310,6 +310,7 @@ typedef struct {
     uint32_t recv_seq; // send seq
     uint32_t wait_snd; // data frame number wait to send
     uint32_t tx_unsent; // ①-41：已成帧、但还没上过线（FLAG_FIRST_SEND 未置）的帧数 ✓
+    uint32_t tx_stalled; // ①-41e：上一圈"有活却被闸门挡住、一帧没发" ⇒ next_due 别急着要"现在" ✓
     uint32_t rttm, rtts, rttd, rto;
     uint32_t rmss, smss, swnd, cwnd, ssthresh;
     uint32_t peer_wnd_raw;        // 对端最近一次广告的窗口（夹之前的原值）：用来区分"我们夹的"与"对端给的"
@@ -1656,6 +1657,7 @@ static void ffrdp_apply_acks(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_RX_BATCH *
             if (dist > 24 || !(p->flags & FLAG_FIRST_SEND)) break;
             else if (dist < 0 || (dist > 0 && (b->send_mack & (1 << (dist-1))))) { // this frame got ack
                 c->counter_send_bytes += frame_payload_size(p); c->wait_snd--;
+                c->tx_stalled = 0;   // ①-41e：ack 来了 ⇒ 槽位/信用可能腾出来了 ⇒ 值得一试 ✓
                 ffrdp_congestion_control(ffrdp, c, CEVENT_ACK_OK);
                 if (!(p->flags & FLAG_TIMEOUT_RESEND)) {
                     c->rttm = (int32_t)get_timestamp32_ms() - (int32_t)p->tick_send;
@@ -1882,7 +1884,9 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         {   uint32_t now_a = get_timestamp32_ms();
             int quiet = (c->tick_recv_ack != 0) && (ffrdp->idle_ms > 0) &&
                         ((int32_t)(now_a - c->tick_recv_ack) > (int32_t)(ffrdp->idle_ms / 2));
-            if (!quiet && c->swnd > 0 && (uint32_t)n_sent < limit) { due = now; armed_now = 1; tag = 0; }
+            // ①-41e：上一圈被闸门挡住了（tx_stalled ✓）⇒ 这次别再急着要"现在" ✗ —— 那叫一次也
+            // 只是空转 ✗。让它睡到 ack 来敲门（ack 会清掉 tx_stalled ✓，见 ffrdp_apply_acks）✓。
+            if (!c->tx_stalled && !quiet && c->swnd > 0 && (uint32_t)n_sent < limit) { due = now; armed_now = 1; tag = 0; }
         }
     }
     // ⚠️ tick 判"到期要重传"用的是 `now - tick_timeout > 0`（**严格**大于 ✓）⇒ tick_timeout 恰好等于
@@ -2161,6 +2165,11 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         else if (c->inflight_used <= 2)       c->counter_ll2++;
         else if (c->inflight_used <= 8)       c->counter_ll8++;
         else                                  c->counter_llM++;
+        // ①-41e（无队列版的空转修复 ✓）：这一圈"有活却被闸门挡住、一帧没发" ⇒ tx_stalled=1 ⇒
+        // next_due 别再急着要"现在" ✓。判据：d==0（没发 ✓）且 p 非空（循环被闸门**打断**，
+        // 不是表走完了 ✓ —— 表走完是没活，那不叫被挡 ✓）。有进展（d>0）⇒ 解除 ✓。
+        if (d == 0 && p) c->tx_stalled = 1;
+        else if (d > 0)  c->tx_stalled = 0;
     }
     if (got_timeout) c->counter_timeout_evt++;
 
