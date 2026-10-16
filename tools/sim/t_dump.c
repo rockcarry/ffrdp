@@ -114,7 +114,9 @@ int main(void)
     ffrdp_dump(NULL, -1, 0);                     check(1, "dump(NULL, -1) ⇒ 空 ctxt + 总状态 ✓");
 
     printf("── 3 conn 参数要真的选连接（不是『整个表都打一遍』✗）\n");
-    n = count_blocks(p_srv, -1, 0);              check(n == 2, "dump(ctxt, -1) 打出 2 块（0 号内嵌主连接 + accept 那条 ✓）");
+    // ①-38d：服务端那块"没有连接的内嵌 0 号槽"不再整表打出来 ✓ ⇒ 只剩 accept 那条 ✓
+    //（显式点名 conn=0 时照样打得出来 ✓，见下一行 ✓）
+    n = count_blocks(p_srv, -1, 0);              check(n == 1, "dump(ctxt, -1) 打出 1 块（服务端空的内嵌 0 号槽被跳过 ✓ + accept 那条 ✓）");
     n = count_blocks(p_srv, 0, 0);               check(n == 1, "dump(ctxt, 0) 只打 1 块（0 号槽 ✓）");
     n = count_blocks(p_srv, a_srv.conn, 0);      check(n == 1, "dump(ctxt, accept 句柄) 只打 1 块 ✓");
     n = count_blocks(p_srv, 3, 0);               check(n == 0, "dump(ctxt, 空槽) 一块都不打（提前 return ✓）");

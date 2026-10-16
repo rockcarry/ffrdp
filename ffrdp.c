@@ -85,6 +85,17 @@
 //    写着"不要只改在途闸门" ✗），而 `FFRDP_MAX_WAITSND` 是应用侧的帧数闸 ✓。
 // 实验做完，选定的值应该写回上面那几个源码常量 ✓（注释里那句 "a source constant, not a build switch" ✓）。
 static uint32_t g_inflight_max = FFRDP_INFLIGHT_MAX;
+// ①-39（2026-10-16）：探测器的**内存视角**开关 ✓（env `FFRDP_MEMPROBE=0` 可关 ✓）。
+// 为什么需要第三种触发：原来那两条问的都是"链路在排队吗"（rtts > 3×rtt_min ✓）与
+// "重传强度上来了吗"（waste ≥ 5 pm ✓）—— 这两条在**健康快链路**上永远不成立 ✗
+// （真机实测：50 MB/s 回环、waste 0 pm、rtts/rtt_min = 0/0 ⇒ probes 0 次 ✗，
+// 见 §26.59 那份 dump ✓），可每在途帧 ≈1.3 KB ⇒ 上限 64 帧就是 ~84 KB 的**峰值**内存 ✓。
+// 对内存敏感的场景（嵌入式），"上限远远用不满"本身就是值得下探的理由 ✓。
+// 安全网不变 ✓：keep 只认"确认速率没掉"或"重传强度低 20% 以上"（§26.18 起就不再要求 RTT 下降 ✓），
+// revert 会把这个下探还回去、并把下次间隔翻倍（10s→20s→40s→60s ✓）。
+static uint32_t g_probe_mem = 1;
+// 没到这么深的在途就不值得再问（否则会一路问到地板、把来回测量变成抖动 ✓）
+#define FFRDP_MEMPROBE_MIN_OUT 8u
 static uint32_t g_max_cwnd     = FFRDP_MAX_CWND_SIZE;
 static uint32_t g_waitsnd      = FFRDP_MAX_WAITSND;
 // ①-28 B：伪超时（`CEVENT_ACK_TIMEOUT_MISSED` —— 等的时候 ack 到过 ✓，是估计器没看见 ✓）
@@ -112,6 +123,7 @@ static void ffrdp_read_knobs(void)
     if (g_knobs_read) return;
     g_knobs_read = 1;
     if ((e = getenv("FFRDP_INFLIGHT")) && *e) { unsigned v = (unsigned)atoi(e); if (v >= 1 && v <= 4096) g_inflight_max = v; }
+    if ((e = getenv("FFRDP_MEMPROBE")) && *e) g_probe_mem = (uint32_t)atoi(e) ? 1u : 0u;   // ①-39
     if ((e = getenv("FFRDP_MAXCWND" )) && *e) { unsigned v = (unsigned)atoi(e); if (v >= 1 && v <= 4096) g_max_cwnd     = v; }
     if ((e = getenv("FFRDP_WAITSND"  )) && *e) { unsigned v = (unsigned)atoi(e); if (v >= 1 && v <= 8192) g_waitsnd      = v; }
     if ((e = getenv("FFRDP_PSEUDO_NOCUT")) && *e) g_pseudo_nocut = atoi(e) ? 1 : 0;   // ①-28 B
@@ -576,6 +588,7 @@ typedef struct {
     uint32_t probe_resend_seen, probe_first_seen; // ... the raw counts that percentage is taken against
     uint32_t counter_delivered;   // frames the peer has confirmed and we have let go of
     uint32_t counter_probe, counter_probe_keep, counter_probe_revert;
+    uint32_t counter_probe_mem;   // ①-39：其中由"上限定得比实际需要高"触发的次数 ✓
     uint32_t counter_probe_narrow, counter_giveback;
 } FFRDPCONN;
 
@@ -2232,8 +2245,15 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                            c->rtts > FFRDP_PROBE_QUEUE_RATIO * c->rtt_min) ? 1u : 0u;
                 idle    = (c->rtt_min && c->rtts != (uint32_t)-1 &&
                            c->rtts < c->rtt_min + FFRDP_PROBE_RTT_DROP_MS) ? 1u : 0u;
+                // ①-39：**内存视角的触发** ✓ —— 上限比"这一圈真正在线上"高一倍以上就值得试 ✓
+                // （要求已经量到过速率 ⇒ 不在应用爬坡时就把窗口砍掉 ✓）。
+                // 它不需要排队证据 ✗：这里拿"省峰值内存"当收益，代价由 keep/revert 那条现成的
+                // 安全网守着 ✓ —— 真需要大窗口的链路上，下探会让确认速率掉 ⇒ revert ✓ 并把
+                // 下次间隔翻倍 ⇒ 一次失败的下探只值一个探针窗口，摊薄到可忽略 ✓。
+                uint32_t mem_want = (g_probe_mem && c->rate_best > 0 && out >= FFRDP_MEMPROBE_MIN_OUT &&
+                                     cap_want < c->inflight_max) ? 1u : 0u;
                 if (FFRDP_PROBE_ENABLE && out > FFRDP_INFLIGHT_MIN && cap_want < c->inflight_max &&
-                    (holding || waste >= FFRDP_PROBE_WASTE_PM)) {
+                    (holding || waste >= FFRDP_PROBE_WASTE_PM || mem_want)) {
                     uint32_t rtt = (c->rtts == (uint32_t)-1 || c->rtts < FFRDP_MIN_RTO) ? FFRDP_MIN_RTO : c->rtts;
                     c->probe_state   = 1;
                     c->probe_tick    = now;
@@ -2251,6 +2271,7 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                     c->probe_waste_ref = c->probe_waste;
                     c->cap           = c->probe_cap;
                     c->counter_probe++;
+                    if (mem_want && !holding && waste < FFRDP_PROBE_WASTE_PM) c->counter_probe_mem++;
                     // ⚠️ 探测**进行中**时，`probe_next` 必须跟着推到未来 ✗：刷新它的两处都在"探测结束"
                     // （keep → now + probe_hold ✓ / revert → now + probe_gap ✓），而这段时间外层
                     // `if (c->probe_state == 0)` 又把整段跳过 ⇒ 它会一直停在启动那一刻（过去）✗
@@ -2639,6 +2660,12 @@ static void ffrdp_dump_locked(FFRDPCONTEXT *ffrdp, int conn, int clearhistory)
     }
     for (i = 0; i < ffrdp->nconn; i++) {
         FFRDPCONN *c = ffrdp->table[i];
+        // ①-38d（2026-10-16 你的实测意见 ✓）：**服务端那块内嵌 0 号槽**在还没有连接时
+        // 不要整表打出来 ✗。它每圈都被 ffrdp_tick_conn 空跑一遍（每圈的计数都在涨 ✓）⇒ 躲不过
+        // ffrdp_dump_conn 里那道"完全空闲就只打一行"的门 ✗ ⇒ 整表 dump 会多出一大段
+        // "peer not set / 全 0" 的块 ✗，看着就像另一条连接 ✓（就是这次的实测反馈 ✓）。
+        // 判据：服务端 + 它是内嵌主连接 + 从没学到过对端 ✓；**显式点名**（conn >= 0）时不跳 ✓。
+        if (c && ffrdp->is_server && c == &ffrdp->conn && c->peer_addr == 0) continue;
         if (c) ffrdp_dump_conn(ffrdp, c, i, clearhistory);
     }
     // ①-38：只读读数 —— 那两块"按需分配"的大缓冲**实际分配了多少字节** ✓。
@@ -2806,9 +2833,9 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
         // printed here had stopped being a gate when the queue test replaced it). the size gate is "the
         // halved ceiling is still under the one in force and above the floor", so it is read as two numbers:
         // out/2 is what a probe would ask for, and it must land under the limit on the next line.
-        printf("probe trigger       : waste %u pm, rtts/rtt_min %u/%u, out %u (needs %u pm, >%ux, out > %u and out/2 under the limit above)\n",
+        printf("probe trigger       : waste %u pm, rtts/rtt_min %u/%u, out %u (needs %u pm, >%ux, OR ①-39 mem: out >= %u and out/2 under the limit above)\n",
                c->probe_waste, c->rtts, c->rtt_min, out,
-               FFRDP_PROBE_WASTE_PM, FFRDP_PROBE_QUEUE_RATIO, (uint32_t)FFRDP_INFLIGHT_MIN);
+               FFRDP_PROBE_WASTE_PM, FFRDP_PROBE_QUEUE_RATIO, (uint32_t)FFRDP_MEMPROBE_MIN_OUT);
         // 1x is the floor itself, and that is the number to watch fall when the probe wins. rtts is
         // smoothed across intervals while rtt_min is the lowest of this one, so rtts can legitimately read
         // below the floor; printing that as 0x would read like a fault, so anything at or under it shows 1x.
@@ -2930,6 +2957,10 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
            g_sendwake_coalesce ? "ON" : "off");
     printf("footprint ①-35      : sizeof(conn) %u, sizeof(context) %u, sizeof(frame node) %u bytes (static part; each in-flight frame costs one node + smss)\n",
            (unsigned)sizeof(FFRDPCONN), (unsigned)sizeof(FFRDPCONTEXT), (unsigned)sizeof(FFRDP_FRAME_NODE));
+    printf("memprobe ①-39       : %s (env FFRDP_MEMPROBE=0|1), fired %u of %u probes; floor %u frames, kept %u of ceiling %u (peak in-flight ~%u KB)\n",
+           g_probe_mem ? "ON" : "off", c->counter_probe_mem, c->counter_probe,
+           (unsigned)FFRDP_INFLIGHT_MIN, c->inflight_max ? c->inflight_max : g_inflight_max, g_inflight_max,
+           (unsigned)(((c->inflight_max ? c->inflight_max : g_inflight_max) * (sizeof(FFRDP_FRAME_NODE) + 4u + FFRDP_MAX_MSS + 2u)) / 1024));
     printf("cc sites ①-29       : hole-wait %u (cut %u), rto %u, pseudo %u | same frame cut >=2: %u, max %u | hole-cut-once %s\n",
            c->counter_cc_hole, c->counter_cc_hole_cut, c->counter_cc_rto, c->counter_cc_pseudo,
            c->counter_cut_multi, c->counter_cut_max, g_hole_cut_once ? "ON" : "off");
