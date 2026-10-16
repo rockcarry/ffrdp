@@ -70,12 +70,12 @@ typedef struct {
     uint32_t        stat_arm_dfar;       // > now+4
 #endif
     // RX 批上限 = FFRDP_LOWLEVEL_RX_BATCH_MAX（文件头那张实测表选出来的 2 ✓）。
-    int             rx_batch;             // 一圈最多收几帧（= FFRDP_LOWLEVEL_RX_BATCH_MAX ✓）
-    int             bufsize;              // 套接字缓冲请求值（字节 ✓）= FFRDP_LOWLEVEL_BUFSIZE_KB * 1024
+    int             rx_batch;         // 一圈最多收几帧（= FFRDP_LOWLEVEL_RX_BATCH_MAX ✓）
+    int             bufsize;          // 套接字缓冲请求值（字节 ✓）= FFRDP_LOWLEVEL_BUFSIZE_KB * 1024
 #if FFRDP_DIAG
-    int             buf_rcv_eff;          // 内核实际给的（getsockopt ✓，dump 里打 ✓）
+    int             buf_rcv_eff;      // 内核实际给的（getsockopt ✓，dump 里打 ✓）
     int             buf_snd_eff;
-    int             stat_rx_errno;       // 第一次失败的 errno（0 = 还没失败过 ✓）
+    int             stat_rx_errno;    // 第一次失败的 errno（0 = 还没失败过 ✓）
     // 追加③：把空圈再拆一层 —— 睡下时期限离现在多远 ✓、tick 进去时是什么情形 ✓。
     uint32_t        stat_left_le0;    // 睡下时期限已过期（left<0 ⇒ 实睡 0ms ✗ 自旋圈）
     uint32_t        stat_left_0;      // left == 0（0ms，但确实等到点了 ✓）
@@ -122,7 +122,6 @@ static void ffrdp_udp_addr_unpack(uint64_t addr, struct sockaddr_in *sin)
 {
     uint32_t ip;
     uint16_t port;
-
     ffrdp_addr_split(addr, &ip, &port);
     memset(sin, 0, sizeof(*sin));
     sin->sin_family      = AF_INET;
@@ -289,7 +288,7 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
 #if FFRDP_DIAG
         // 一圈三段计时：每 64 圈采一次 ✓（摊薄到全部圈 ≈ 1.5 ns/圈 ⇒ 量不出代价 ✓）
         int      cost  = ((udp->stat_lap & 63) == 0);
-        uint64_t t_c0 = 0, t_c1 = 0, t_c2 = 0, t_c3 = 0;
+        uint64_t  t_c0 = 0, t_c1 = 0, t_c2 = 0, t_c3 = 0;
         if (cost) t_c0 = ffrdp_udp_us();
 #endif
         // 睡到有帧 / 期限到 / 被叫醒 ✓；没有期限就永久睡 ✓（旧的固定 100 ms 既限精度又让空转端点每秒醒十次 ✗）。
@@ -302,27 +301,27 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
             else if (left == 0) LSTAT(udp, stat_left_0);
             else if (left <= 9) LSTAT(udp, stat_left_1_9);
             else                LSTAT(udp, stat_left_ge10);
-            if (left < 0) left = 0;                    // due already: come straight back
+            if (left < 0) left = 0; // due already: come straight back
             tv.tv_sec  = left / 1000;
             tv.tv_usec = (left % 1000) * 1000;
             tvp = &tv;
         } else {
-            LSTAT(udp, stat_sleep_none);               // 没有期限 ⇒ 永久睡 ✓
+            LSTAT(udp, stat_sleep_none); // 没有期限 ⇒ 永久睡 ✓
         }
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(udp->sockfd, &rfds);
         FD_SET(udp->notify, &rfds);
         ret = select(MAX(udp->sockfd, udp->notify) + 1, &rfds, NULL, NULL, tvp);
-        ffrdp_udp_sleep_end(udp);       // awake again, whatever select() answered
+        ffrdp_udp_sleep_end(udp); // awake again, whatever select() answered
 #if FFRDP_DIAG
-        if (cost) t_c1 = ffrdp_udp_us();                                              // pre 段结束 ✓
+        if (cost) t_c1 = ffrdp_udp_us(); // pre 段结束 ✓
 #endif
         if (ret == -1) {
-            if (socket_errno() == EINTR) continue;     // a signal is not an error, and not a reason to sleep
+            if (socket_errno() == EINTR) continue; // a signal is not an error, and not a reason to sleep
             printf("select error !\n"); fflush(stdout); usleep(100 * 1000); continue;
         }
-        LSTAT(udp, stat_lap);                                  // 一圈一笔 ✓
+        LSTAT(udp, stat_lap); // 一圈一笔 ✓
         if (ret == 0) LSTAT(udp, stat_lap_timeout);
         if (ret > 0 && FD_ISSET(udp->notify, &rfds)) LSTAT(udp, stat_lap_notify);
 
@@ -332,13 +331,13 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
         if (ret > 0 && FD_ISSET(udp->sockfd, &rfds)) {
             // 一圈把就绪的包都收下来（有上限 ✓）：上层是"一段一个 ack" ✓ ⇒ 一圈只收一帧就等于一帧一个 ack ✗。
             int frames = 0;
-            while (frames < udp->rx_batch) {                     // ①-25：运行时上限 ✓
+            while (frames < udp->rx_batch) { // ①-25：运行时上限 ✓
                 uint8_t buf[FFRDP_LOWLEVEL_FRAME_MAX];
                 struct  sockaddr_in from;
                 socklen_t fromlen = sizeof(from);
                 // (void *)：Winsock 把 recvfrom 的缓冲声明成 char*、POSIX 是 void* ⇒ 这个转换让两边都 -Wall -Werror 干净 ✓。
                 ret = recvfrom(udp->sockfd, (void*)buf, sizeof(buf), 0, (struct sockaddr*)&from, &fromlen);
-                if (ret <= 0) {        // zero length datagram, an empty socket, or a socket error
+                if (ret <= 0) { // zero length datagram, an empty socket, or a socket error
                     LSTAT(udp, stat_rx_fail);
                     LSTAT_SET(udp, stat_rx_errno, socket_errno());
                     break;
@@ -536,8 +535,8 @@ FFRDP_LOWLEVEL* ffrdp_udp_lowlevel_init(void *params, FFRDP_LOWLEVEL_CB callback
     udp->exit         = ffrdp_udp_lowlevel_exit;
     udp->sockfd       = -1;   // 0 is a valid descriptor, so "no socket yet" cannot be spelled with a zero
     udp->notify       = -1;
-    udp->rx_batch = FFRDP_LOWLEVEL_RX_BATCH_MAX;
-    udp->bufsize = FFRDP_LOWLEVEL_BUFSIZE_KB * 1024;
+    udp->rx_batch     = FFRDP_LOWLEVEL_RX_BATCH_MAX;
+    udp->bufsize      = FFRDP_LOWLEVEL_BUFSIZE_KB * 1024;
     udp->callback     = callback;
     udp->cbctx        = cbctx;
     udp->mthread.proc = ffrdp_udp_lowlevel_proc;

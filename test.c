@@ -17,7 +17,7 @@
 
 // 每条消息（全小端）：[4B len][4B seq][payload][4B crc32]；len 含头尾，crc 覆盖 len+seq+payload。
 // ffrdp_recv 是有序字节流（没有消息边界）⇒ 必须自带定长头；ffrdp_send 是原子的 ⇒ 只有 ret == len 时才 seq+1。
-#define TEST_MSG_OVERHEAD        12
+#define TEST_MSG_OVERHEAD       12
 
 // 退出只有一条路：输入 quit/exit（或 stdin 结束）⇒ 收尾 + verify 汇总 + ffrdp_free；Ctrl+C 直接结束、看不到汇总（接受的代价）。
 static volatile int g_exit = 0;
@@ -25,6 +25,7 @@ static char server_bind_ip[32]   = "0.0.0.0";
 static char client_cnnt_ip[32]   = "127.0.0.1";
 static int  server_bind_port     = 8000;
 static int  client_cnnt_port     = 8000;
+
 // ①-41 的两个应用侧旋钮（env ✓，默认 = 老行为 ✓）：
 //   TEST_APP_SENDRETRY：send 被拒后立刻重试几次（0 = 下一个循环再说，会白等一次 10ms 的 recv ✗）；
 //   TEST_APP_SENDWAIT_MS：送进 ffrdp_send 的等待额 —— 队列删掉之后，反压改由协议在 cond 上做 ✓。
@@ -34,12 +35,14 @@ static int  app_sendwait_get(void)
     if (v < 0) { const char *e = getenv("TEST_APP_SENDWAIT_MS"); v = (e && *e) ? atoi(e) : 0; }
     return v;   // 0 = 老行为（立即被拒）；>0 = 最多等这么久；<0 = 等到能放 ✓
 }
+
 static int  app_sendretry_get(void)
 {
     static int v = -1;
     if (v < 0) { const char *e = getenv("TEST_APP_SENDRETRY"); v = (e && *e) ? atoi(e) : 0; }
     return v;
 }
+
 static int  server_max_send_size = 16 * 1024;
 static int  client_max_send_size = 16 * 1024;
 static int  send_speed           = 0;   // 本进程的发送限速，单位 KB/s（1024 B）；0 = 不限速
