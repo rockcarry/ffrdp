@@ -1994,8 +1994,7 @@ static const char* dump_hs_name(int hs)
     }
 }
 
-// rtts 在"还没采到样"时是 (uint32_t)-1（算法内部就是这么用的 ✓，见 ffrdp_conn_init）：
-// 直接打出来是 4294967295 ✗，这里打 "-" ✓。
+// rtts 没采到样时是 (uint32_t)-1（算法内部就这么用）⇒ 直接打会是 4294967295 ✗，这里打 "-"✓。
 static const char* dump_u32(uint32_t v, char *buf, int buflen)
 {
     if (v == (uint32_t)-1) return "-";
@@ -2013,16 +2012,14 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     secs = ((int32_t)get_timestamp32_ms() - (int32_t)ffrdp->tick_ffrdp_dump) / 1000;
     secs = secs ? secs : 1;
 
-    // 块头：句柄 + 对端地址 + 握手状态 ✓。没有它的话，多连接时谁也看不出哪块是哪条 ✗
-    // —— 服务端那个"从未通信的 0 号内嵌主连接"尤其容易被当成同一台机器的另一个时刻 ✗。
+    // 块头：句柄 + 对端地址 + 握手状态（多连接时没有它分不出哪块是哪条）。
     if (c->peer_addr) {
         ffrdp_addr_split(c->peer_addr, &ip, &port);
         snprintf(addr, sizeof(addr), "peer %u.%u.%u.%u:%u",
                  (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF, (unsigned)port);
     } else snprintf(addr, sizeof(addr), "peer not set (not learned yet)");
 
-    // 从未通信过的槽（服务端表里的内嵌主连接就是典型 ✓）只打一行：它的每一项都是 0 ✓，
-    // 打满一百多行只会把真正在跑的那一条挤得看不见 ✗。
+    // 从未通信过的槽（服务端的 0 号内嵌主连接）只打一行：每项都是 0，打满只会把真在跑的那条挤没。
     if (c->hs_state == 0 && !(c->flags & FLAG_CONNECTED) &&
         c->send_seq == 0 && c->recv_seq == 0 &&
         c->counter_send_bytes == 0 && c->counter_recv_bytes == 0) {
@@ -2036,16 +2033,13 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     // secs 是距上一次 dump 的秒数：刚起来的第一次 dump 可能不足一秒，别拿 0 当除数。
     printf("averg_send, averg_recv: %.2fKB/s, %.2fKB/s\n", c->counter_send_bytes / (1024.0 * MAX(secs, 1)), c->counter_recv_bytes / (1024.0 * MAX(secs, 1)));
     printf("rttm: %u, rtts: %s, rttd: %u, rto: %u\n", c->rttm, dump_u32(c->rtts, b1, (int)sizeof(b1)), c->rttd, c->rto);
-    // which binary is this? the compile stamp makes a stale executable impossible to mistake for a fresh
-    // one: if this time is older than the build you just ran, you are running something else.
+    // 编译时间戳：比它旧的二进制一眼看出不是刚编的（免得把过期可执行文件当成新的）。
     printf("version & build     : %s probe %d, queue ratio %u, inflight default %u, compiled %s %s\n",
            FFRDP_VERSION, FFRDP_PROBE_ENABLE, (uint32_t)FFRDP_PROBE_QUEUE_RATIO, FFRDP_INFLIGHT_MAX, __DATE__, __TIME__);
-    // rttm is the LATEST sample (its name is misleading); rtt_min is the lowest of this interval, rtts the
-    // smoothed typical latency, rttd the jitter. rto is a timer, not a delay: never read it as latency.
+    // rttm = 最新一次采样（名字有误导），rtt_min = 区间最低，rtts = 平滑典型延迟，rttd = 抖动；rto 是定时器不是延迟。
     printf("rtt_min, rtts, rttd : %u, %s, %u (min / typical / jitter, ms)\n",
            c->rtt_min, dump_u32(c->rtts, b2, (int)sizeof(b2)), c->rttd);
-    // elapsed 是"自 init 起"（tick_ffrdp_init ✓）；括号里那个是"自上次清零"（clearhistory=1 时才会推进 ✓）。
-    // 旧标签写成 dump interval ✗ —— test.c 传的是 clearhistory=0 ⇒ 两个块里它都一样大，更容易误读 ✓。
+    // elapsed = 自 init 起；括号里那个是"自上次清零"（clearhistory=1 才推进）⇒ 旧标签 dump interval 会误读。
     printf("send refused before lookup: no-arg/bad-arg %u, bad-handle-or-table %u (①-24; per-connection ones are below)\n",
            ffrdp->stat_ref_noarg, ffrdp->stat_ref_noconn);
     printf("elapsed             : %d s (since init) / %d s (since last clear)\n", ((int32_t)get_timestamp32_ms() - (int32_t)ffrdp->tick_ffrdp_init) / 1000, secs);
@@ -2056,8 +2050,7 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("wait_snd            : %u\n"  , c->wait_snd            );
     printf("rmss, smss          : %u, %u\n"    , c->rmss, c->smss);
     printf("swnd, cwnd, ssthresh: %u, %u, %u\n", c->swnd, c->cwnd, c->ssthresh);
-    // 三个判据一行打完：drain 早退（它随窗口宏缩放，之前没有计数器）、cwnd 被乱序误判打回、
-    // 以及被内核丢包/缓冲压力打回。计数是累计的（测试驱动的 dump 传 clearhistory=0），看增量。
+    // 三个判据一行打完（drain 早退 / cwnd 被乱序误判打回 / 被内核丢包打回）；计数是累计的 ⇒ 看增量。
     printf("ssthresh floor hits : %u (cwnd already at the floor, still recomputed => +1/ACK from here)\n", c->counter_ssth_floor);
                 // ①-3：被护栏改写过的那批（旧分类会把它记进 future ✗）—— 真机服务端自旋的真身 ✓
                 printf("drain-block/backdrop: %u ticks (drain held), cwnd back %u (rto/fast) + %u (send fail)\n",
@@ -2070,22 +2063,16 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("send refused by gate : frame-count %u, queue-bytes %u, too-big %u | conn-state: closing %u, not-connected %u, hs-failed %u, hs-down %u (see counter_send_failed for the total)\n",
            c->counter_refuse_wnd, c->counter_refuse_bytes, c->counter_refuse_big,
            c->counter_ref_closing, c->counter_ref_notconn, c->counter_ref_hsfail, c->counter_ref_hsdown);
-    // §26.30 ①-②：等信用的延迟（episode = 从"没信用"到"真的首发一帧"✓）
-        // §26.30 ④-14：ack 攒了没有 / 谁在回（覆盖数 = 距上一条 ack 之间到达的全帧数 ✓）
-        // §26.30 ④-15：在途闸门"紧不紧" —— 占用率（均值对均值 ✓）、挡住的圈里有没有一帧没发的 ✓
                 printf("ack latency         : %u us avg, %u us max (%u acks)\n",
            c->ack_lat_n ? (uint32_t)(c->ack_lat_sum_us / c->ack_lat_n) : 0,
            c->ack_lat_max_us, c->ack_lat_n);
-    {   // the delay probe: how many frames are really outstanding, what limit is enforced, and what the
-        // experiment reported. rtt ref->best is the number to read: if best is well below ref the window
-        // was keeping a queue alive; if they are close the delay is the path's and nothing was touched.
+    {   // 探测：线上真有多少帧、生效的上限是多少、实验报了什么（看 rtt ref->best）。
         FFRDP_FRAME_NODE *q; uint32_t out = 0;
         for (q = c->send_list_head; q; q = q->next) if (q->flags & FLAG_FIRST_SEND) out++;
         printf("inflight, cap       : %u, %u (kept %u; probes %u keep %u revert %u too-far %u giveback %u)\n",
                out, c->cap, c->cap_kept, c->counter_probe, c->counter_probe_keep,
                c->counter_probe_revert, c->counter_probe_narrow, c->counter_giveback);
-        // step29: the brake that actually holds. it limits frames on the wire, so the round trip stops
-        // carrying a queue we built ourselves; the peer's credit is left alone (it never limited anything).
+        // 真正管住线上的那道闸：限的是在途帧数，对端信用不参与（它从来没限制住过什么）。
         printf("in-flight limit     : %u frames (default %u; the probe lowers it when it proves a win)\n",
                c->inflight_max ? c->inflight_max : FFRDP_INFLIGHT_MAX,
                FFRDP_INFLIGHT_MAX);
@@ -2093,17 +2080,13 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
         printf("probe trigger       : waste %u pm, rtts/rtt_min %u/%u, out %u (needs %u pm, >%ux, OR ①-39 mem: out >= %u and out/2 under the limit above)\n",
                c->probe_waste, c->rtts, c->rtt_min, out,
                FFRDP_PROBE_WASTE_PM, FFRDP_PROBE_QUEUE_RATIO, (uint32_t)FFRDP_MEMPROBE_MIN_OUT);
-        // 1x is the floor itself, and that is the number to watch fall when the probe wins. rtts is
-        // smoothed across intervals while rtt_min is the lowest of this one, so rtts can legitimately read
-        // below the floor; printing that as 0x would read like a fault, so anything at or under it shows 1x.
+        // 1x 就是地板本身，探测赢的时候看它往下掉；rtts 是跨区间平滑、rtt_min 是本区间最低 ⇒ 平滑值可以低于地板，打 0x 像故障，所以 <= 地板一律显示 1x。
         printf("queue test          : rtts %u vs rtt_min %u -> %ux (probe needs >%ux, or waste >= %u pm)\n",
                c->rtts, c->rtt_min,
                (c->rtt_min && c->rtts != (uint32_t)-1 && c->rtts > c->rtt_min)
                    ? c->rtts / c->rtt_min : 1,
                FFRDP_PROBE_QUEUE_RATIO, FFRDP_PROBE_WASTE_PM);
-        // both are the same estimate -- the typical round trip before the probe and its lowest value during
-        // it -- so the difference is directly the proof the probe is looking for: a fall of at least
-        // FFRDP_PROBE_RTT_DROP_MS keeps the smaller window (if the confirmed rate also held).
+        // 两个数来自同一个估计（探测前的典型 RTT 与探测期间的最低值）⇒ 差就是探测要找的证据：至少降 FFRDP_PROBE_RTT_DROP_MS 且确认速率没掉才 keep。
         printf("probe rtt ref/best  : %u, %u (typical before, lowest during; a keep needs a fall of >= %u ms)\n",
                c->probe_rtt_ref, c->probe_best == 0xFFFFFFFF ? 0 : c->probe_best,
                (uint32_t)FFRDP_PROBE_RTT_DROP_MS);
@@ -2121,12 +2104,9 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("counter_send_query  : %u\n"  , c->counter_send_query  );
     printf("counter_resend_rto  : %u\n"  , c->counter_resend_rto  );
     printf("counter_resend_fast : %u\n"  , c->counter_resend_fast );
-    // the three ratios below each need a denominator that can legitimately be zero (a sender that has
-    // not sent anything yet, a receiver-only direction, a sparse sender whose frames were all short).
+    // 下面三个比值各自的分母都可能合理地是 0（还没发过东西的发送方 / 只收的方向 / 全是短帧的稀疏发送方）。
     {   uint32_t resend = c->counter_resend_rto + c->counter_resend_fast;
-        // ratio 与 waste 后面都跟着 (分子 / 分母)：分母小的时候（极低频发送）一眼就能看出这个百分比
-        // 不能当稳态读。例如限速 1KB/s 时"重传 6 次、累计首发 20 次"会印 30.00%，而它其实只是 6/20；
-        // 同理 waste 的 (6 / 6) 说明"对端说我们 6 次重传全部白费"，而不是一个笼统的 100%。
+        // 比值后面都跟着 (分子 / 分母)：分母小的时候一眼看出这个百分比不能当稳态读（如限速时 6/20 会印成 30%）。
         if (c->counter_send_1sttime) printf("counter_resend_ratio: %.2f%% (%u / %u)\n",
                                                 100.0 * resend / c->counter_send_1sttime, resend, c->counter_send_1sttime);
         else                             printf("counter_resend_ratio: n/a\n");
@@ -2142,9 +2122,7 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("counter_ack_hole    : %u\n"  , c->counter_ack_hole    );
     printf("counter_recv_ooo    : %u\n"  , c->counter_recv_ooo    );
     printf("counter_recv_far    : %u\n"  , c->counter_recv_far    );
-    // where out of order arrivals sat relative to the hole, and how much of that we told the peer
-    // about. the three bands add up to counter_recv_ooo; the reach ratio answers the only question
-    // that matters before widening the mask: how much of the out of order traffic is even addressable.
+    // 乱序帧相对洞的位置与我们报出去的比例；三档之和 = counter_recv_ooo，reach 比值回答"加宽位图前唯一要紧的问题"。
     printf("counter_ooo_d1_24   : %u\n"  , c->counter_ooo_d1_24   );
     printf("counter_ooo_d25_64  : %u\n"  , c->counter_ooo_d25_64  );
     printf("counter_ooo_dgt64   : %u\n"  , c->counter_ooo_dgt64   );
@@ -2167,22 +2145,18 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("counter_rto_chain   : %u\n"  , c->counter_rto_chain   );
     printf("counter_rto_stale   : %u\n"  , c->counter_rto_stale   );
     printf("counter_recv_dup    : %u\n"  , c->counter_recv_dup    );
-    // what was thrown away instead of acted on: bad = a fragment whose length cannot describe anything,
-    // drop = a well formed frame further ahead of the hole than the window we advertise. On a healthy
-    // run both stay at zero; a non zero one means somebody is probing the port.
+    // 丢掉而不是处理的：bad = 长度不成话的碎片，drop = 越过洞比通告窗口还远的正常帧。健康时两个都是 0，非 0 = 有人在探端口。
     printf("counter_rx_bad      : %u\n"  , c->counter_rx_bad      );
     printf("counter_recv_drop   : %u\n"  , c->counter_recv_drop   );
     printf("counter_ack_dup     : %u\n"  , c->counter_ack_dup     );
-    // rtt_tail 是这一版"让 RTO 自己够到延迟尾部"的那个学习量（见 FFRDP_MIN_RTO 的注释）；它应当收敛到
-    // 这条链路的确认延迟尾部（真机上是 85~92 ms 那一档），并在链路变好后每秒衰减 1/16。
+    // rtt_tail 是"让 RTO 自己够到延迟尾部"的学习量（见 FFRDP_MIN_RTO）；应收敛到本链路的确认延迟尾部，链路变好后每秒衰减 1/16。
     printf("confirm-wait hist ms: <=16 %u, <=32 %u, <=64 %u, <=128 %u, <=256 %u, <=512 %u, <=1024 %u, more %u (max %u)\n",
            c->counter_conf_16, c->counter_conf_32, c->counter_conf_64, c->counter_conf_128,
            c->counter_conf_256, c->counter_conf_512, c->counter_conf_1024, c->counter_conf_more,
            c->counter_conf_max);
     printf("rto_floor           : %u, rtt_tail %u ms\n"  , c->rto_floor, c->rtt_tail); // 白费率见上面的 counter_resend_waste（同一个量，不再打两遍）
     printf("counter_rto_behind  : %u\n"  , c->counter_rto_behind  );
-        // ①-5：每圈产出 —— sent0 就是"期限说现在有活、却一帧没发"的那类圈 ✗
-        // ①-6：TIMER 分支哪一支 × 期限模型哪一档 ✓（ack-only 不跑整圈 ⇒ 不进协议圈数 ✓）
+    // TIMER 走了哪一支（ack-only 不跑整圈 ⇒ fire 可以远多于 lap）。
         printf("timer branch        : ack-only %u, full-tick %u (ack-only runs no lap, so fires can far exceed laps)\n",
            c->counter_fire_ackonly, c->counter_fire_tick);
     printf("timer due given     : zero %u, <=now %u, now+1..4 %u, >now+4 %u (the '<=now' one asks to go now)\n",
@@ -2254,11 +2228,9 @@ void ffrdp_dump(void *ctxt, int conn, int clearhistory)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ffrdp) return;
-    // conn >= 0 ⇒ 只打那一条（该连接的详细状态 ✓）；conn < 0 ⇒ 表里每条一块 ✓。
-    // 旧注释写着"现在与只印 0 号等价"✗ —— 那是单连接时代的说法 ✓，v2 有多连接，必须按 conn 分 ✓。
+    // conn >= 0 ⇒ 只打那一条；conn < 0 ⇒ 表里每条一块。
     if (conn >= ffrdp->nconn || (conn >= 0 && !ffrdp->table[conn])) return;
-    // 要打印的全是协议状态，而协议现在跑在工作线程里：拿住同一把锁再读，打印出来的一整套数不会是被
-    // 拆散的一半（这正是旧版单线程下不用操心、换线程后必须补上的一件小事）。
+    // 打印的全是协议状态，而协议跑在工作线程里：拿住同一把锁再读 ⇒ 打出来的不会是被拆散的一半。
     pthread_mutex_lock(&ffrdp->lock);
     if (conn < 0) printf("%s---- connection table: %d slots, one block each below ----\n", (ffrdp->nconn > 1 ? "\n" : ""), ffrdp->nconn);
     // ①-9：入口分档 —— 与低层 fire 对照 ⇒ 多出的回调是哪种类型 / 是否发生在 nconn==0 时 ✓
