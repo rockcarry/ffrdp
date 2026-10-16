@@ -4986,3 +4986,24 @@ t_cwnd/t_pseudo 读 ✓）⇒ **那些不能删** ✗（删了会丢覆盖 ✓�
 
 **T2b 还剩** ✓：**c** 窗口/信用显微学（`in-flight occupancy`/`cap-block detail`/`cap wait`/`credit wait`/
 `ack coverage` ✓）；**d** CC 站点点名（`cc sites ①-29` ✓）。
+
+### 26.69 代码瘦身 T2b-c：删掉“窗口/信用显微学”这批一次性仪器（-82 行；sizeof(conn) -88 B ✓）（2026-10-16 晚）✔
+
+第三组一次性仪器（§26.30 步骤2 的 ④-14/④-15 与步骤1-②）✓：删 21 个计数器 + 5 条 dump 行 + 状态区 5 个字段 ✓：
+
+- **credict wait**（`counter_swnd_wait_ep/ms/max` + `tick_swnd_starve` ✓）：`tick_conn` 里"信用什么时候回来"的
+  episode 记账（起点在 `else` 分支、终点在首发成功那一刻 ✓）—— 两句全是仪器 ✓，整块删 ✓。
+- **cap wait**（`counter_cap_wait_ep/ms/max` + `tick_cap_starve` ✓）：同一形状的"被在途闸门挡住多久" ✓。
+- **in-flight occupancy**（`counter_inflight_sum`/`counter_limit_sum`/`counter_inflight_n` ✓）：每圈累加
+  "在途量"与"当圈上限"求占用率 ✓ —— 保留那句 `inflight_used` 的**重数循环** ✓（真状态 ✓），只删三个和 ✓。
+- **cap-block detail**（`counter_capb_floor/above/nosend` ✓）：被挡时上限在不在天花板/地板的分类 ✓。
+  ⚠️ `counter_capblock++` **保留** ✓（它是"send starved/blocked"那行长期读数 ✓）。
+- **ack coverage**（`counter_ack_sent/ondata/ontick/cov0..covN` ✓ + `rx_frames_ref` ✓）：这条 ack 覆盖了几个
+  到达帧 ✓ —— 连带 `rx_frames_ref` 快照一起删 ✓（它只服务这一项 ✓）。
+
+**实测** ✓：`ffrdp.c` 2923 → **2841 行**（−82 ✓）；`sizeof(FFRDPCONN)`（DIAG=1）3848 → **3760 B**（−88 ✓）；
+`sizeof(FFRDPCONTEXT)` 4488 → **4168 B**（−320 ✓，累计）；`ffrdp.o` 44 275 → **42 496**（DIAG=1 ✓）/
+27 243 → 26 859（DIAG=0 ✓）；lo 冒烟 60.7 MB/s / 重传 0.03% ✓；判据 **8/8 PASS** ✓（1016-160507 ✓）；
+两版 `-Wall -Werror` 干净 ✓。
+
+**T2b 只剩最后一组** ✓：**d** CC 站点点名（`cc sites ①-29` ✓，约 6 个计数器 ✓）。
