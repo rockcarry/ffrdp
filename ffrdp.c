@@ -574,25 +574,6 @@ typedef struct {
     // dump 里 cwnd<=2 的档位 14/277（≈5%，几乎都在 server 侧 ✓）⇒ 现象确实在发生 ✓；但它"贵不贵"
     // 要看爬回去多久（t_cwnd 量这个 ✓）⇒ 这里先只计数，一个字节的行为都不动 ✓。
     uint32_t counter_ssth_floor;  // ssthresh 被算到下限（1）的次数：此后只能 +1/ACK 爬
-    // 2026-10-15（lo 调查 ①-2）：lowlevel 报"worker 空转"（期限=现在 ✗）时，协议这边到底
-    // 把期限设成了什么。三种"要求现在"里，只有第三种是纯粹的空转 ✗：
-    uint32_t counter_now_src[8];  // 只读（§26.38 ①-19）：**出口口径** —— next_due 返回值 <= now 时按源记 ✓
-                                  // 为什么缺：①-2 只记了"stale（把过期的改写成 now）"那一种 ✗ ⇒
-                                  // 收尾期那 1.25M 次 `<=now` 的 arm 找不到源 ✗（①-18 把矛盾压到了
-                                  // "tick 之前 vs tick 之后"两次 next_due 之间 ✓ ⇒ 这里两端都记 ✓）。
-    uint32_t counter_due_now_ack;    // ① 欠着对端一个 ack ⇒ 这一刻就该回（合法 ✓）
-    uint32_t counter_due_now_work;   // ② 真有活可干（有队可发/有帧可首发 ✓）
-    uint32_t counter_due_now_stale;  // ③ **没活可干却要求"现在"** ✗ ⇒ 这一项就是自旋来源
-    uint32_t counter_due_future;     // 正常：期限落在未来 ✓
-    // STALE 时是哪个期限源赢的（7 个候选按下面的顺序 ✓）；[0] 未分类 ✓
-    uint32_t counter_stale_src[8];
-    // 2026-10-15（①-3：护栏盲点）：上面三档都只看**护栏之后**的 due ✗ ⇒ 被护栏从
-    // "现在"改写成"1ms 后"的那些，全被记成 future ✗ —— 而真机服务端那 8,969 圈/秒正是它们
-    // （lowlevel-udp.c:232-237：一圈活超过 1ms ⇒ now+1 已过期 ⇒ left=0 ⇒ 实睡 0ms ✗）。
-    // 所以护栏那一支要单独记，并记住是哪个源赢的 ✓。纯计数，不改行为 ✗。
-    uint32_t counter_arm_eq_now;     // 护栏把"正好现在"改写成"1ms 后"的次数 ✗
-    uint32_t counter_arm_eq_src[8];  // 上面那次的源（顺序同 counter_stale_src ✓）
-    uint32_t counter_arm_le2ms;      // 记账后期限离现在 <= 2ms 的次数（真·自旋指标 ✓）
     // 2026-10-15（A 案收尾）：把"被重传过的帧**最后**被确认时等了多久"（conf = now - tick_send ✓）
     // 的**原始**分布记下来。为什么缺这个数：rtt_tail 只留了**限速后**的值 ✗、maxwait 只留了
     // "超时瞬间"的年龄 ✗ ⇒ 两者都分不清"ack 真的迟到"与"洞挡在前面、对端没法确认"✓。
@@ -1788,7 +1769,6 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 {
     const FFRDP_FRAME_NODE *q;
     uint32_t now = get_timestamp32_ms(), due = 0, x;
-    int      tag = 0;                 // 只读（①-2）：当前 due 是哪个源赢的
     int      n_sent = 0;
     int      entry  = 0;              // 表项序号（与 tick 的 i 同坐标系 ✓）
     int      armed_now = 0;           // due 是"立刻就要发东西"（不是某帧的 RTO 到期 ✓）
@@ -1811,21 +1791,21 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         //     叫醒了、没人干活、期限又停在 now ⇒ 自旋 ✓（实测：cwnd=1 时表头没到期、后面那帧过期，
         //     忠实模型一个 tick 里转 60 万次 ✓）。
         //     n_sent 仍然按**全表**数 ✓：它的语义是"在途帧数"，和可见窗口是两件事 ✓。
-        if (entry < (int)c->cwnd && (!due || (int32_t)(q->tick_timeout - due) < 0)) { due = q->tick_timeout; tag = 1; }
+        if (entry < (int)c->cwnd && (!due || (int32_t)(q->tick_timeout - due) < 0)) { due = q->tick_timeout; }
     }
     if (c->cur_new_node) {
         x = c->cur_new_tick + FFRDP_FLUSH_TIMEOUT;
-        if (!due || (int32_t)(x - due) < 0) { due = x; tag = 2; }
+        if (!due || (int32_t)(x - due) < 0) { due = x; }
     }
     x = c->rate_tick + 1000;
-    if (!due || (int32_t)(x - due) < 0) { due = x; tag = 3; }
+    if (!due || (int32_t)(x - due) < 0) { due = x; }
     // 握手期的重传期限（与 tick 里那条重传判据同一个值 ✓）。
     // ⚠️ 少了它，真 lowlevel 在"没有期限"时是**永久 select** ✓ ⇒ 没人来重传 ⇒ SYN 发不出去就永远发不出去 ✗
     //    （客户端建 lowlevel 用 "none"，socket 由它自己的工作线程懒建 ⇒ ffrdp_init 里第一发很可能
     //     撞上 sockfd < 0 ⇒ 静默失败 ✓）—— 仿真里假 lowlevel 没有这层懒建，所以永远看不见 ✗。
     if (c->hs_state == HS_SYN_SENT || c->hs_state == HS_SYN_RCVD || c->hs_state == HS_FIN_WAIT) {
         x = c->hs_tick + FFRDP_HS_RETRY_MS;
-        if (!due || (int32_t)(x - due) < 0) { due = x; tag = 4; }
+        if (!due || (int32_t)(x - due) < 0) { due = x; }
     }
     // keepalive：UP 的连接也要有人来叫醒（否则真 lowlevel 会一直睡到下次有数据 ✗）——
     // 半程探一次（周期跟 idle_ms 走 ⇒ 不会出现"探测周期比超时还长"的自相矛盾组合 ✓）。
@@ -1835,7 +1815,7 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         // ⇒ 每圈都要求"现在" ✗（QUERY 本身是限速的（`tick_send_query` ✓），这条期限却不限速 ✗）
         // ⇒ 与 tick 里那条 QUERY 判据对齐 ✓。（hs:0 走不到这里：hs_state 不是 HS_UP ✓）
         x = MAX(c->tick_last_recv, c->tick_send_query) + (uint32_t)(ffrdp->idle_ms / 2);
-        if (!due || (int32_t)(x - due) < 0) { due = x; tag = 5; }
+        if (!due || (int32_t)(x - due) < 0) { due = x; }
     }
     // 查询窗口的期限：**只有真的欠信用时才需要它** ✓。tick 里那条查询分支长在
     // `c->swnd == 0` 那一段里（没信用、还有帧等着首发才会问对端）⇒ swnd 充足时这条期限根本不可达 ✗
@@ -1845,9 +1825,9 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     // 去发那个查询 ✓ —— 它在 500ms 内提前醒来仍然保留 ✓，避免查询被拖到下一次帧超时才做 ✓。
     if (c->tick_send_query && c->swnd == 0) {
         x = c->tick_send_query + FFRDP_QUERY_CYCLE;
-        if ((int32_t)(x - now) > 0 && (!due || (int32_t)(x - due) < 0)) { due = x; tag = 6; }
+        if ((int32_t)(x - now) > 0 && (!due || (int32_t)(x - due) < 0)) { due = x; }
     }
-    if (c->probe_next)      { x = c->probe_next;                          if (!due || (int32_t)(x - due) < 0) { due = x; tag = 7; } }
+    if (c->probe_next)      { x = c->probe_next;                          if (!due || (int32_t)(x - due) < 0) { due = x; } }
     // 还差一条最容易漏、也最贵的：**现在就有发得出去的东西**（应用排了队，或者发送表里有还没首发的帧），
     // 而且发得出去（有信用、在途数没到限）⇒ 立刻叫一次。
     //   * 少了"应用队列"那一半：应用排完队要等某个 ack 或 RTO 到期才有人来发（实测 50 -> 10 MB/s）；
@@ -1890,16 +1870,15 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                         ((int32_t)(now_a - c->tick_recv_ack) > (int32_t)(ffrdp->idle_ms / 2));
             // ①-41e：上一圈被闸门挡住了（tx_stalled ✓）⇒ 这次别再急着要"现在" ✗ —— 那叫一次也
             // 只是空转 ✗。让它睡到 ack 来敲门（ack 会清掉 tx_stalled ✓，见 ffrdp_apply_acks）✓。
-            if (!c->tx_stalled && !quiet && c->swnd > 0 && (uint32_t)n_sent < limit) { due = now; armed_now = 1; tag = 0; }
+            if (!c->tx_stalled && !quiet && c->swnd > 0 && (uint32_t)n_sent < limit) { due = now; armed_now = 1; }
         }
     }
     // ⚠️ tick 判"到期要重传"用的是 `now - tick_timeout > 0`（**严格**大于 ✓）⇒ tick_timeout 恰好等于
     //    now 的帧，这一圈不会被重传 ✗。若把它当"现在"叫醒，就是在**同一个冻结的 tick 里**空转 ✓
     //    （忠实模型实测：每个这样的步都要撞一次防自旋护栏 ✓）。它只差 1ms，往前挪一下就好 ✓。
     //    注意顺序：必须放在下面"过期 ⇒ 立刻"那句**之前** ✓ —— 真正已过期（< now）的帧 tick 是能干活的 ✓。
+    // 护栏：把"正好现在"改写成"1ms 后"（同 tick 内重传用严格大于 ⇒ 会空转 ✓）。
     if (!armed_now && due && (int32_t)(due - now) == 0) {
-        FFRDP_CNT(c, counter_arm_eq_now);                                     // 只读（①-3）
-        FFRDP_CNT_AT(c, counter_arm_eq_src, tag < 0 || tag > 7 ? 0 : tag);       // 只读：是哪个源要求的 ✗
         due = now + 1;
     }
     if (due && (int32_t)(due - now) < 0) due = now;       // 已经过期 ⇒ 立刻（这也是"快一点"的做法）
@@ -1909,15 +1888,6 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     // "没成帧的"不存在了 ✓，而未发出帧本来就在 send_list 里 ✓ ⇒ 只剩 `send_list_head` ✓。
     // 半帧（cur_new_node）有自己独立的 flush 期限（上面 1786 行 ✓），不该再进这条 nudge ✗。
     if (c->send_list_head) { if (!due || (int32_t)(due - (now + 4)) > 0) due = now + 4; }
-    // 只读记账（①-2）：这一轮把期限设成了什么 ✓
-    if (due && (int32_t)(due - now) <= 0) {
-        if (armed_now) FFRDP_CNT(c, counter_due_now_work);
-        else { FFRDP_CNT(c, counter_due_now_stale); FFRDP_CNT_AT(c, counter_stale_src, tag < 0 || tag > 7 ? 0 : tag); }
-    } else if (due) FFRDP_CNT(c, counter_due_future);
-    // 只读（①-19）：出口口径 —— 返回值是"立刻"就记一次源（tag: 1 frame / 2 flush / 3 rate /
-    // 4 hs / 5 keepalive / 6 query / 7 probe / 0 其它=应用有活 ✓）⇒ 收尾期是谁在要"现在" ✓
-    if (due && (int32_t)(due - now) <= 0) FFRDP_CNT_AT(c, counter_now_src, tag < 0 || tag > 7 ? 0 : tag);
-    if (due && (int32_t)(due - now) <= 2) FFRDP_CNT(c, counter_arm_le2ms);    // 只读（①-3）
     return due;
 }
 
@@ -1934,7 +1904,7 @@ static void ffrdp_arm_timer(FFRDPCONTEXT *ffrdp)
         uint32_t   x;
         if (!c) continue;
         x = ffrdp_next_due(ffrdp, c);
-        if (c->flags & FLAG_ACK_DUE) { x = get_timestamp32_ms(); FFRDP_CNT(c, counter_due_now_ack); ffrdp->arm_ack_win++; }
+        if (c->flags & FLAG_ACK_DUE) { x = get_timestamp32_ms(); ffrdp->arm_ack_win++; }
         if (!due || (int32_t)(x - due) < 0) { due = x; win = i; }
     }
     // 只读（§26.38 ①-18）：取 min 之后的那一跳 —— 分档 + 赢家 ✓（不改行为 ✗）
@@ -2737,8 +2707,7 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     if (c->hs_state == 0 && !(c->flags & FLAG_CONNECTED) &&
         c->send_seq == 0 && c->recv_seq == 0 &&
         c->counter_send_bytes == 0 && c->counter_recv_bytes == 0 &&
-        c->counter_upd_cnt == 0 && c->counter_due_now_ack == 0 &&
-        c->counter_due_now_work == 0 && c->counter_due_now_stale == 0 && c->counter_due_future == 0) {
+        c->counter_upd_cnt == 0) {
         printf("\n---- conn %d   %s   idle: never talked about AND ran no lap (only this line) ----\n", handle, addr);
         goto done;
     }
@@ -2772,23 +2741,8 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     // 三个判据一行打完：drain 早退（它随窗口宏缩放，之前没有计数器）、cwnd 被乱序误判打回、
     // 以及被内核丢包/缓冲压力打回。计数是累计的（测试驱动的 dump 传 clearhistory=0），看增量。
     printf("ssthresh floor hits : %u (cwnd already at the floor, still recomputed => +1/ACK from here)\n", c->counter_ssth_floor);
-    printf("due-now sources     : ack %u, work %u, STALE %u (stale = asks for \"now\" with nothing to do); future %u\n",
-           c->counter_due_now_ack, c->counter_due_now_work, c->counter_due_now_stale, c->counter_due_future);
-    printf("now by source       : frame %u, flush %u, rate %u, hs %u, keepalive %u, query %u, probe %u, other %u\n",
-           c->counter_now_src[1], c->counter_now_src[2], c->counter_now_src[3], c->counter_now_src[4],
-           c->counter_now_src[5], c->counter_now_src[6], c->counter_now_src[7], c->counter_now_src[0]);
-    printf("stale by source     : frame %u, flush %u, rate %u, hs %u, keepalive %u, query %u, probe %u, other %u\n",
-           c->counter_stale_src[1], c->counter_stale_src[2], c->counter_stale_src[3], c->counter_stale_src[4],
-           c->counter_stale_src[5], c->counter_stale_src[6], c->counter_stale_src[7], c->counter_stale_src[0]);
-    // ①-3：被护栏改写过的那批（旧分类会把它记进 future ✗）—— 真机服务端自旋的真身 ✓
-    printf("guard-now ask       : %u (asked for \"exactly now\" => rewritten to now+1; each is a 0ms sleep if a lap takes >1ms)\n",
-           c->counter_arm_eq_now);
-    printf("guard-now by source : frame %u, flush %u, rate %u, hs %u, keepalive %u, query %u, probe %u, other %u\n",
-           c->counter_arm_eq_src[1], c->counter_arm_eq_src[2], c->counter_arm_eq_src[3], c->counter_arm_eq_src[4],
-           c->counter_arm_eq_src[5], c->counter_arm_eq_src[6], c->counter_arm_eq_src[7], c->counter_arm_eq_src[0]);
-    printf("armed <=2ms         : %u (deadline within 2ms of now after accounting; the real spin indicator)\n",
-           c->counter_arm_le2ms);
-    printf("drain-block/backdrop: %u ticks (drain held), cwnd back %u (rto/fast) + %u (send fail)\n",
+                // ①-3：被护栏改写过的那批（旧分类会把它记进 future ✗）—— 真机服务端自旋的真身 ✓
+                printf("drain-block/backdrop: %u ticks (drain held), cwnd back %u (rto/fast) + %u (send fail)\n",
            c->counter_drain_block, c->counter_cwnd_back, c->counter_cwnd_sfail);
     printf("timeout diag        : no-ack-arrived %u, acks-arrived-but-missed %u, max wait %u ms\n",
            c->counter_to_noack, c->counter_to_hadack, c->counter_to_age_max);

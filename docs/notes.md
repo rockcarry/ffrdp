@@ -4934,3 +4934,30 @@ named X" 的地方就是逻辑真读了它** ✓ ⇒ 回填进 KEEP → 重来�
 
 `maxconn = 16` 时：仅这一项每进程 **−9.7 KB** ✓。KEEP 17 个 ✓、搬走 133 个 ✓。判据 **8/8 PASS** ✓（1016-154156 ✓）；
 `DIAG=0` 与 `DIAG=1` 都 `-Wall -Werror` 干净 ✓。
+
+### 26.67 代码瘦身 T2b-a：删掉“圈调度/期限显微学”这批一次性仪器（-46 行；sizeof(conn) -120 B ✓）（2026-10-16 晚）✔
+
+§26.65/§26.66 把**整个诊断子系统**做成了编译期开关（release 里零成本 ✓）。T2b 处理另一半：把 diag 段里
+**已经结案的一次性调查仪表**彻底删掉 ✓（不只是关掉 ✓），因为它们的"周围逻辑"（只为喂计数器而算的局部量 ✓）
+也是**没有性能收益的代码** ✗，属于用户清单里该删的那类 ✓。
+
+**判据怎么定** ✓（重要 ✓）：不能只看"测试 0 引用" —— 96 个计数器在测试里 0 引用 ✓，但其中混着**真有用**的
+读数（`counter_send_bytes`→`total_send/averg_*` ✓、`counter_probe*`→探测 ✓、`counter_recv_bytes` ✓、
+`counter_rx_bad` ✓ …）✗。所以按**语义**分：删"一次性调查仪表"，留"长期读数" ✓。
+反过来也要注意：有些**看着像一次性**的其实有**测试断言** ✓（`counter_send_query` 被 t_keepalive 断言 ≥2 ✓、
+`counter_mack_bits_rx` 被 t_ack 断言 ==5 ✓、`counter_conf_*`/`counter_cwnd_sfail`/`counter_ssth_floor` 被
+t_cwnd/t_pseudo 读 ✓）⇒ **那些不能删** ✗（删了会丢覆盖 ✓）。
+
+**T2b-a 删的是"圈调度/期限显微学"** ✓（①-2/①-3/①-18/①-19，全是 lo 上查自旋时的一次性仪表 ✓，测试 0 引用 ✓）：
+9 个计数器（`counter_now_src[8]`/`counter_stale_src[8]`/`counter_arm_eq_src[8]`/`counter_due_now_ack|work|stale`/
+`counter_due_future`/`counter_arm_eq_now`/`counter_arm_le2ms` ✓）、6 条 dump 行、以及**它们的账本** ——
+`ffrdp_next_due` 里那个 `tag`（8 处赋值 ✓）连同 12 个声明/记账语句一起拔掉 ✓。顺带修了 dump 的"完全空闲"门
+（它原来读 `counter_due_now_*` ✓ ⇒ 改用 `counter_upd_cnt` ✓）。
+
+**实测** ✓：`ffrdp.c` **3056 → 3010 行**（−46 ✓）；`sizeof(FFRDPCONN)` 4080 → **3960 B**（DIAG=1 ✓）；
+`ffrdp.o` 48 341 → **46 642 B**（DIAG=1 ✓）/ 27 840 → 27 702（DIAG=0 ✓）；判据 **8/8 PASS** ✓（1016-155055 ✓）；
+`DIAG=0`/`DIAG=1` 都 `-Wall -Werror` 干净 ✓。
+
+**T2b 还剩** ✓（按同样判据，逐个来 ✓）：**b** 每圈产出/工作量（`lap work ①-26`、`lap period`、`lap output` ✓，
+约 20 个计数器 + 一个较大的账本块 ✓）；**c** 窗口/信用显微学（`in-flight occupancy`/`cap-block detail`/
+`cap wait`/`credit wait`/`ack coverage` ✓）；**d** CC 站点点名（`cc sites ①-29` ✓）。
