@@ -33,6 +33,15 @@ static int  client_cnnt_port     = 8000;
 // ①-41 实验：send 被拒后**立刻重试**多少次（env TEST_APP_SENDRETRY ✓；0 = 老行为：下一个循环再说）。
 // 为什么要它：老循环是"发一条 → 进 10ms 超时的 ffrdp_recv"✓ ⇒ 一旦 send 被拒 ✗，要睡一整个
 // 10ms 才回来重试 ✗✗。而 v1.1 的应用**从不阻塞** ✓ ⇒ 它可以直接成帧还跑得很快 ✓（§26.42/§26.43）。
+// ①-41 分支：send 的等待 —— 没有应用队列之后，**反压**该由协议来做 ✓：
+// 帧额不够时睡在 cond 上，等工作线程确认出空位 ✓（而不是立刻被拒 ✗ 让应用回 10ms 的 recv 重试 ✗✗）。
+// 这才是那 32KB 队列真正干的活（反压）的协议化替代品 ✓。
+static int  app_sendwait_get(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TEST_APP_SENDWAIT_MS"); v = (e && *e) ? atoi(e) : 0; }
+    return v;   // 0 = 老行为（立即被拒）；>0 = 最多等这么久；<0 = 等到能放 ✓
+}
 static int  app_sendretry_get(void)
 {
     static int v = -1;
@@ -320,9 +329,9 @@ static int link_loop(struct link_arg *a)
                 if (room) msg_len = msg_build(sendbuf, send_max, seq, maxp, &rnd);
                 if (msg_len <= 0) { msg_len = 0; break; }
                 tick_msg_first = get_timestamp32_ms(); msg_retries = 0;
-                ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
+                ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, app_sendwait_get());
                 {   int t = app_sendretry_get();   // ①-41 实验：被拒立刻重试（0 = 关 ✓）
-                    while (ret < 0 && t-- > 0) ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
+                    while (ret < 0 && t-- > 0) ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, app_sendwait_get());
                 }
                 if (ret == msg_len) {
                     v.sent_msgs++; v.sent_bytes += (uint32_t)msg_len;
@@ -351,9 +360,9 @@ static int link_loop(struct link_arg *a)
         if (msg_len > 0) {
             // 传 0（不等待）：这个测试的背压方式就是"队列满就下一轮原样重试这一条"，
             // 重试的节拍由下面那次带超时的 ffrdp_recv 提供 ✓。
-            ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
+            ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, app_sendwait_get());
             {   int t = app_sendretry_get();   // ①-41 实验：被拒立刻重试（0 = 关 ✓）
-                while (ret < 0 && t-- > 0) ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
+                while (ret < 0 && t-- > 0) ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, app_sendwait_get());
             }
             if (ret == msg_len) {                       // 整条被接受
                 // 只读（§26.30 ①-①）：这条被拒过 ⇒ 把"从第一次尝试到被接受"的时长记下来 ✓
