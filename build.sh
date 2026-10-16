@@ -33,7 +33,8 @@ build_package()
         exit -1
     fi
 
-    local CFLAGS="-Wall -Werror"
+    # -DFFRDP_DIAG=1：dev 构建保留完整诊断（dump/①-xx/计数器）✓；出货构建去掉该宏 ✓
+    local CFLAGS="-Wall -Werror -DFFRDP_DIAG=1"
     local LDFLAGS="-lpthread"
     case "$CROSS_COMPILE" in
     *mingw*)

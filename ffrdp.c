@@ -8,6 +8,15 @@
 #include "lowlevel.h"
 #include "ffrdp.h"
 
+/* ══ FFRDP_DIAG：诊断/调试代码的总开关（默认 0）═════════════════════════════
+ * 0（默认 · release / 嵌入式）：dump、①-xx、以及“只给 dump 用”的计数器全部**编译掉** ✓
+ *   ⇒ 无 printf、无静态内存、无计数开销；逻辑真正要读的量不受影响 ✓。
+ * 1（dev / 测试）：完整仪表，行为与加开关之前逐字相同 ✓。
+ * 构建：build.sh 与 tools/sim/run.sh 都带 -DFFRDP_DIAG=1（开发）；出货去掉该宏即可。 */
+#ifndef FFRDP_DIAG
+#define FFRDP_DIAG 0
+#endif
+
 // 帧的固定开销：4 字节头（类型/长度）+ FEC 帧再加 2 字节 fec seq。见 frame_node_new / frame_payload_size。
 #define FFRDP_FRAME_HEAD      4
 #define FFRDP_FRAME_FEC_TAIL  2
@@ -811,7 +820,9 @@ static int ffrdp_recv_data_frame(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_FRAME_
 }
 
 static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len);  // lowlevel 的工作线程从这里回到协议
+#if FFRDP_DIAG
 static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int clearhistory); // 按连接 dump；ffrdp_dump_locked 逐连接调用
+#endif
 static int  ffrdp_hs_send(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, uint8_t sub); // 握手：定义在 lowlevel 回调之前
 static void ffrdp_arm_timer(FFRDPCONTEXT *ffrdp);                          // 定义在协议后段（init 里要用 ✓）
 static int  ffrdp_conn_handle(FFRDPCONTEXT *ffrdp, FFRDPCONN *c);
@@ -2654,6 +2665,7 @@ void ffrdp_flush(void *ctxt, int conn)
 }
 
 // 逐连接 dump：conn < 0 ⇒ 表里每条打一块 ✓；conn >= 0 ⇒ **只打那一条** ✓（这就是 ffrdp.h 的承诺 ✓）。
+#if FFRDP_DIAG
 static void ffrdp_dump_locked(FFRDPCONTEXT *ffrdp, int conn, int clearhistory)
 {
     int i;
@@ -2690,8 +2702,10 @@ static void ffrdp_dump_locked(FFRDPCONTEXT *ffrdp, int conn, int clearhistory)
                sum, n, (unsigned)FFRDP_RECVBUF_SIZE);
     }
 }
+#endif
 
 // 握手状态的名字（块头要用 ✓）。
+#if FFRDP_DIAG
 static const char* dump_hs_name(int hs)
 {
     switch (hs) {
@@ -2704,16 +2718,20 @@ static const char* dump_hs_name(int hs)
     default:          return "?";
     }
 }
+#endif
 
 // rtts 在"还没采到样"时是 (uint32_t)-1（算法内部就是这么用的 ✓，见 ffrdp_conn_init）：
 // 直接打出来是 4294967295 ✗，这里打 "-" ✓。
+#if FFRDP_DIAG
 static const char* dump_u32(uint32_t v, char *buf, int buflen)
 {
     if (v == (uint32_t)-1) return "-";
     snprintf(buf, (size_t)buflen, "%u", v);
     return buf;
 }
+#endif
 
+#if FFRDP_DIAG
 static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int clearhistory)
 {
     int      secs;
@@ -2993,9 +3011,11 @@ done:
         memset(&c->counter_send_bytes, 0, (uint8_t*)&c->reserved - (uint8_t*)&c->counter_send_bytes);
     }
 }
+#endif
 
 void ffrdp_dump(void *ctxt, int conn, int clearhistory)
 {
+#if FFRDP_DIAG
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ffrdp) return;
     // conn >= 0 ⇒ 只打那一条（该连接的详细状态 ✓）；conn < 0 ⇒ 表里每条一块 ✓。
@@ -3019,4 +3039,8 @@ void ffrdp_dump(void *ctxt, int conn, int clearhistory)
     }
     ffrdp_dump_locked(ffrdp, conn, clearhistory);
     pthread_mutex_unlock(&ffrdp->lock);
+#else
+    /* 诊断已编译掉（FFRDP_DIAG=0）✓ */
+    (void)ctxt; (void)conn; (void)clearhistory;
+#endif
 }

@@ -4873,3 +4873,31 @@ T1 把"为实验而存在"的**运行时 env 旋钮**全部改成**编译期宏*
 验证 ✓：构建 0 告警；**check.sh 8/8 PASS**；交错 A/B 3 轮 —— 基线 50.2/48.8/54.1 MB/s vs T1 53.7/53.4/53.9
 （同带 ✓）；重传 0.01~0.05% vs 0.02~0.06%（同带 ✓）；`sizeof(UDP_LOWLEVEL)=328`、`conn bufs=143232` 逐字不变 ✓；
 二进制 106 672 → 106 184 B ✓。行数：`ffrdp.c` 3050→3022、`lowlevel-udp.c` 620→607 ✓。
+
+### 26.65 代码瘦身 T2a-1：`FFRDP_DIAG` 总开关 —— dump 子系统整体编译掉 ✓（2026-10-16 傍晚）✔
+
+设计目标见 §26.64。T2a-1 只做**最安全**的一半：把 **dump 子系统**（`ffrdp_dump` / `ffrdp_dump_locked` /
+`ffrdp_dump_conn` / `dump_u32` / `dump_hs_name`，共 359 行 + 118 处诊断 `printf`）用 `#if FFRDP_DIAG`
+整体包起来 ✓；`ffrdp_dump()` 公共入口在 `DIAG=0` 时是**空实现** ✓（调用方无需改 ✓）。
+
+**为什么不顺手把 154 个计数器也关掉** ✗（重要发现 ✓）：它们**不是纯诊断** —— 约 25~30 个的**值直接喂给
+协议逻辑** ✓：`counter_delivered`→`rate_now`（探测的确认速率 ✓）、`counter_resend_rto/fast` +
+`counter_send_1sttime`→探测判据、`counter_ack_recv`→伪超时票据（"等的时候 ack 到没到" ✓）、
+`counter_rxfull`→收进帧速、`counter_capblock`→cap 变化检测。⇒ 关掉它们会**改变协议行为** ✗。
+所以 T2a-2 必须**逐个判**，用编译器当裁判（DIAG=0 编不过的地方 = 逻辑真读了 ✓）。这部分留给 T2a-2 ✓。
+
+**开关**：`#ifndef FFRDP_DIAG / #define FFRDP_DIAG 0 / #endif`（默认 0 = release/嵌入式 ✓）。
+dev 构建带 `-DFFRDP_DIAG=1` ✓（已接进 `build.sh` 与 `tools/sim/run.sh` ✓ —— sim 通过
+`#include "../../ffrdp.c"` 编译，所以那条 `CFLAGS` 就盖得到 ✓）。
+
+**实测（同一份源码，只差这个宏 ✓）**
+
+| 项 | FFRDP_DIAG=0 | FFRDP_DIAG=1 |
+|---|---|---|
+| 预处理后 `printf` 数 | **13**（只剩真正的错误日志 ✓）| 131 |
+| `ffrdp.o` | **32 362 B** | 48 345 B（**−33%** ✓）|
+| `test_ffrdp` | **89 648 B** | 106 184 B（**−16.5 KB / −15.6%** ✓）|
+| `sizeof(conn)/sizeof(context)` | 4080 / 4488 | 4080 / 4488（本层不变 ✓，计数器留待 T2a-2 ✓）|
+
+判据 ✓：`check.sh` **8/8 PASS**（DIAG=1 口径 ✓）；DIAG=0 与 DIAG=1 **都** `-Wall -Werror` 干净 ✓。
+顺带发现一处**预存死代码**：`ffrdp.c` 里有个 `#if 0` 块（留给 T4 处理 ✓）。
