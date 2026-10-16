@@ -14,6 +14,17 @@ fi
 
 gen_libffrdp_pkgconfig_file()
 {
+    # Version 只有**一个来源**：ffrdp.h 里的 FFRDP_VERSION ✓。这里以前是写死的 "1.1.0" ✗ ——
+    # 库升到 v2.0.0 之后生成的 .pc 还在报 1.1.0 ✗（pkg-config 查出来的版本与库不符 ✗）。
+    # 解析失败就报错退出，**绝不静默生成一个假版本** ✓。
+    local ver
+    ver=$(sed -n 's/^[[:space:]]*#[[:space:]]*define[[:space:]][[:space:]]*FFRDP_VERSION[[:space:]][[:space:]]*"\([^"]*\)".*/\1/p' "$TOPDIR/ffrdp.h" | head -n 1)
+    ver=${ver#v}   # pkg-config 的 Version 走 RPM 式版本比较 ⇒ 去掉可选的 "v" 前缀：v2.0.0 ⇒ 2.0.0 ✓
+    if [ -z "$ver" ]; then
+        echo -e "\n\033[31mcannot parse FFRDP_VERSION from $TOPDIR/ffrdp.h (want: #define FFRDP_VERSION \"vX.Y.Z\")\033[0m\n" >&2
+        exit -1
+    fi
+
     echo "prefix=$BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME"  > $TOPDIR/libffrdp.pc
     echo "exec_prefix=\${prefix}"                       >> $TOPDIR/libffrdp.pc
     echo "libdir=\${exec_prefix}/lib"                   >> $TOPDIR/libffrdp.pc
@@ -21,7 +32,7 @@ gen_libffrdp_pkgconfig_file()
     echo ""                                             >> $TOPDIR/libffrdp.pc
     echo "Name: libffrdp"                               >> $TOPDIR/libffrdp.pc
     echo "Description: ffrdp library"                   >> $TOPDIR/libffrdp.pc
-    echo "Version: 1.1.0"                               >> $TOPDIR/libffrdp.pc
+    echo "Version: $ver"                                >> $TOPDIR/libffrdp.pc
     echo "Libs: -L\${libdir} -lffrdp"                   >> $TOPDIR/libffrdp.pc
     echo "Cflags: -I\${includedir}"                     >> $TOPDIR/libffrdp.pc
 }
