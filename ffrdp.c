@@ -820,9 +820,6 @@ static int ffrdp_recv_data_frame(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, FFRDP_FRAME_
 }
 
 static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len);  // lowlevel 的工作线程从这里回到协议
-#if FFRDP_DIAG
-static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int clearhistory); // 按连接 dump；ffrdp_dump_locked 逐连接调用
-#endif
 static int  ffrdp_hs_send(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, uint8_t sub); // 握手：定义在 lowlevel 回调之前
 static void ffrdp_arm_timer(FFRDPCONTEXT *ffrdp);                          // 定义在协议后段（init 里要用 ✓）
 static int  ffrdp_conn_handle(FFRDPCONTEXT *ffrdp, FFRDPCONN *c);
@@ -2666,46 +2663,6 @@ void ffrdp_flush(void *ctxt, int conn)
 
 // 逐连接 dump：conn < 0 ⇒ 表里每条打一块 ✓；conn >= 0 ⇒ **只打那一条** ✓（这就是 ffrdp.h 的承诺 ✓）。
 #if FFRDP_DIAG
-static void ffrdp_dump_locked(FFRDPCONTEXT *ffrdp, int conn, int clearhistory)
-{
-    int i;
-    if (conn >= 0) {
-        // 指定连接：只这一条 ✓（空槽 / 越界在 ffrdp_dump 那层已经被拦掉 ✓）。
-        // 以前这里把整个表都打一遍 ✗ ⇒ 服务端每次 dump 都多出一大段"0 号槽"的零 ✗，
-        // 而那段零看起来就像"同一台机器的另一个时刻"（2026-10-14 实测确实把人误导了 ✓）。
-        FFRDPCONN *c = ffrdp->table[conn];
-        if (c) ffrdp_dump_conn(ffrdp, c, conn, clearhistory);
-        return;
-    }
-    for (i = 0; i < ffrdp->nconn; i++) {
-        FFRDPCONN *c = ffrdp->table[i];
-        // ①-38d（2026-10-16 你的实测意见 ✓）：**服务端那块内嵌 0 号槽**在还没有连接时
-        // 不要整表打出来 ✗。它每圈都被 ffrdp_tick_conn 空跑一遍（每圈的计数都在涨 ✓）⇒ 躲不过
-        // ffrdp_dump_conn 里那道"完全空闲就只打一行"的门 ✗ ⇒ 整表 dump 会多出一大段
-        // "peer not set / 全 0" 的块 ✗，看着就像另一条连接 ✓（就是这次的实测反馈 ✓）。
-        // 判据：服务端 + 它是内嵌主连接 + 从没学到过对端 ✓；**显式点名**（conn >= 0）时不跳 ✓。
-        if (c && ffrdp->is_server && c == &ffrdp->conn && c->peer_addr == 0) continue;
-        if (c) ffrdp_dump_conn(ffrdp, c, i, clearhistory);
-    }
-    // ①-38：只读读数 —— 那两块"按需分配"的大缓冲**实际分配了多少字节** ✓。
-    // 为什么需要它：省内存这件事不能靠"代码里没调用分配"来声称 ✗，而要能在自己的机器上
-    // 直接看到数字 ✓：空转服务端应打 **0 bytes** ✓（它不使用内嵌 conn 0 ✓）；客户端
-    // 打 ~176 KB ✓（主连接的两块 ✓）；服务端 hs:0 的旧路径真用到 conn 0 时也会出现 ✓。
-    {
-        unsigned long long sum = 0;
-        int n = 0;
-        for (i = 0; i < ffrdp->nconn; i++) {
-            FFRDPCONN *c = ffrdp->table[i];
-            if (c && c->recv_cap) { sum += (unsigned long long)c->recv_cap; n++; }
-        }
-        printf("conn bufs ①-38/①-41 : %llu bytes actually allocated over %d conn(s) — recv(%u) bytes per conn (the 32 KB app queue is gone); a server's embedded conn 0 allocates none\n",
-               sum, n, (unsigned)FFRDP_RECVBUF_SIZE);
-    }
-}
-#endif
-
-// 握手状态的名字（块头要用 ✓）。
-#if FFRDP_DIAG
 static const char* dump_hs_name(int hs)
 {
     switch (hs) {
@@ -2718,20 +2675,16 @@ static const char* dump_hs_name(int hs)
     default:          return "?";
     }
 }
-#endif
 
 // rtts 在"还没采到样"时是 (uint32_t)-1（算法内部就是这么用的 ✓，见 ffrdp_conn_init）：
 // 直接打出来是 4294967295 ✗，这里打 "-" ✓。
-#if FFRDP_DIAG
 static const char* dump_u32(uint32_t v, char *buf, int buflen)
 {
     if (v == (uint32_t)-1) return "-";
     snprintf(buf, (size_t)buflen, "%u", v);
     return buf;
 }
-#endif
 
-#if FFRDP_DIAG
 static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int clearhistory)
 {
     int      secs;
@@ -3011,11 +2964,46 @@ done:
         memset(&c->counter_send_bytes, 0, (uint8_t*)&c->reserved - (uint8_t*)&c->counter_send_bytes);
     }
 }
-#endif
+
+static void ffrdp_dump_locked(FFRDPCONTEXT *ffrdp, int conn, int clearhistory)
+{
+    int i;
+    if (conn >= 0) {
+        // 指定连接：只这一条 ✓（空槽 / 越界在 ffrdp_dump 那层已经被拦掉 ✓）。
+        // 以前这里把整个表都打一遍 ✗ ⇒ 服务端每次 dump 都多出一大段"0 号槽"的零 ✗，
+        // 而那段零看起来就像"同一台机器的另一个时刻"（2026-10-14 实测确实把人误导了 ✓）。
+        FFRDPCONN *c = ffrdp->table[conn];
+        if (c) ffrdp_dump_conn(ffrdp, c, conn, clearhistory);
+        return;
+    }
+    for (i = 0; i < ffrdp->nconn; i++) {
+        FFRDPCONN *c = ffrdp->table[i];
+        // ①-38d（2026-10-16 你的实测意见 ✓）：**服务端那块内嵌 0 号槽**在还没有连接时
+        // 不要整表打出来 ✗。它每圈都被 ffrdp_tick_conn 空跑一遍（每圈的计数都在涨 ✓）⇒ 躲不过
+        // ffrdp_dump_conn 里那道"完全空闲就只打一行"的门 ✗ ⇒ 整表 dump 会多出一大段
+        // "peer not set / 全 0" 的块 ✗，看着就像另一条连接 ✓（就是这次的实测反馈 ✓）。
+        // 判据：服务端 + 它是内嵌主连接 + 从没学到过对端 ✓；**显式点名**（conn >= 0）时不跳 ✓。
+        if (c && ffrdp->is_server && c == &ffrdp->conn && c->peer_addr == 0) continue;
+        if (c) ffrdp_dump_conn(ffrdp, c, i, clearhistory);
+    }
+    // ①-38：只读读数 —— 那两块"按需分配"的大缓冲**实际分配了多少字节** ✓。
+    // 为什么需要它：省内存这件事不能靠"代码里没调用分配"来声称 ✗，而要能在自己的机器上
+    // 直接看到数字 ✓：空转服务端应打 **0 bytes** ✓（它不使用内嵌 conn 0 ✓）；客户端
+    // 打 ~176 KB ✓（主连接的两块 ✓）；服务端 hs:0 的旧路径真用到 conn 0 时也会出现 ✓。
+    {
+        unsigned long long sum = 0;
+        int n = 0;
+        for (i = 0; i < ffrdp->nconn; i++) {
+            FFRDPCONN *c = ffrdp->table[i];
+            if (c && c->recv_cap) { sum += (unsigned long long)c->recv_cap; n++; }
+        }
+        printf("conn bufs ①-38/①-41 : %llu bytes actually allocated over %d conn(s) — recv(%u) bytes per conn (the 32 KB app queue is gone); a server's embedded conn 0 allocates none\n",
+               sum, n, (unsigned)FFRDP_RECVBUF_SIZE);
+    }
+}
 
 void ffrdp_dump(void *ctxt, int conn, int clearhistory)
 {
-#if FFRDP_DIAG
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ffrdp) return;
     // conn >= 0 ⇒ 只打那一条（该连接的详细状态 ✓）；conn < 0 ⇒ 表里每条一块 ✓。
@@ -3039,8 +3027,7 @@ void ffrdp_dump(void *ctxt, int conn, int clearhistory)
     }
     ffrdp_dump_locked(ffrdp, conn, clearhistory);
     pthread_mutex_unlock(&ffrdp->lock);
-#else
-    /* 诊断已编译掉（FFRDP_DIAG=0）✓ */
-    (void)ctxt; (void)conn; (void)clearhistory;
-#endif
 }
+#else
+void ffrdp_dump(void *ctxt, int conn, int clearhistory) {}
+#endif
