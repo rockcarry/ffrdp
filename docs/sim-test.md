@@ -1,10 +1,13 @@
 # 差分仿真工具（`tools/sim`）使用说明
 
+> **语言** ✓：本文档**只有中文版** ✗（英文版只有仓库根目录的 [`readme.en.md`](../readme.en.md) ✓）。
+> 需要其它语言请**用 AI 自行翻译** ✓ —— 记得让它保留宏名、命令、代码块与 `✓ / ✗` 符号原文 ✓。
+
 工具本体在仓库的 `tools/sim/`：`run.sh`（构建 + A/B 驱动）、`simnet.c`（假网络）、
-`simll.c`（**假 lowlevel** ✓）、`simdefs.h`（两侧共享声明），以及十二个测试 `e2e.c` / `t_rto.c` / `t_ack.c` / `t_fuzz.c` / `t_peer.c` / `t_handshake.c` / `t_crypto.c` / `t_recvdata.c` / `t_keepalive.c` / `t_init.c` / `t_dump.c` / `t_fec.c` ✓。
+`simll.c`（**假 lowlevel** ✓）、`simdefs.h`（两侧共享声明），以及十四个测试 `e2e.c` / `t_rto.c` / `t_pseudo.c` / `t_cwnd.c` / `t_ack.c` / `t_fuzz.c` / `t_peer.c` / `t_handshake.c` / `t_crypto.c` / `t_recvdata.c` / `t_keepalive.c` / `t_init.c` / `t_dump.c` / `t_fec.c` ✓。
 本文是它的使用说明。所有命令都在**仓库根目录**执行。
 
-相关文档：[`../readme.md`](../readme.md)（概述/编译）、[`ffrdp-v1.md`](ffrdp-v1.md)（协议与优化）、
+相关文档：[`../readme.zh.md`](../readme.zh.md)（概述/编译）、[`ffrdp-v1.md`](ffrdp-v1.md)（协议与优化）、
 [`notes.md`](notes.md)（调试记录）。
 
 ## 它解决什么问题
@@ -19,9 +22,9 @@
 ## 怎么跑
 
 ```bash
-bash tools/sim/run.sh                    # 跑全部（12 个测试） + hs-e2e / e2e-raw / e2e 三个场景组）
+bash tools/sim/run.sh                    # 跑全部（14 个测试 + hs-e2e / e2e-raw / e2e 三个场景组 ✓）
 
-`ASAN=1 bash tools/sim/run.sh`         # 同一套判据再跑一遍：带地址消毒剂、并自动关 ASLR ✓
+ASAN=1 bash tools/sim/run.sh             # 同一套判据再跑一遍：带地址消毒剂、并自动关 ASLR ✓
                                      # 内存类 bug 只有这一遍才露 ✓（真机上踩到的三个都是这样抓出来的 ✓）；
                                      # 现在它是**例行判据**的一部分 ✓ —— 改完必跑 ✓。
 TESTS="e2e"  bash tools/sim/run.sh       # 只跑端到端
@@ -32,7 +35,7 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 
 | 环境变量 | 含义 | 默认 |
 |---|---|---|
-| `TESTS` | 要跑哪些测试 / 场景组（可多选，空格分隔）| `t_rto t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_keepalive t_init t_dump t_fec hs-e2e e2e-raw e2e` |
+| `TESTS` | 要跑哪些测试 / 场景组（可多选，空格分隔）| `t_rto t_pseudo t_cwnd t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_keepalive t_init t_dump t_fec hs-e2e e2e-raw e2e` |
 | `REF` | **基线**源码路径 | `git show HEAD:ffrdp.c` |
 | `ASAN=1` | 打开地址消毒器（并自动加上 `halt_on_error=1` 与 `setarch -R` ✓）| 关 |
 | `SIM_LL_DEADLINE=1` | 假 lowlevel 换**忠实模型**（只在"有帧到"或"期限到"时唤醒 ✓）⚠️ 丢包场景下很贵 ✗，见下文的实测 | 关 ⇒ 用旧模型（每步无条件一次 TIMER ✗）|
@@ -70,11 +73,13 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 > 生成的中间文件（`ffrdp_base.c`、`ffrdp_new.c`、`ffrdp_*.h`、`lowlevel_*.h`、`utils_sim.c`、`*_base`、`*_new`、`*.o`）
 > 都在 `.gitignore` 里 ✓ —— 它们不是源码，每次 `run.sh` 都会重写 ✓。
 
-## 十二个测试
+## 十四个测试
 
 | 测试 | 内容 | 判据 |
 |---|---|---|
 | `t_rto` | 12 个同时过期的帧被逐个重传，观察 RTO 被放大多少次 | 期望"**每往返退让一次**"⇒ `rto_backoff` 只有 1 次，而不是 12 次 ✗ |
+| `t_pseudo` | **伪超时**：ACK **晚到**但一帧没丢 —— 发两帧、只确认第一帧、让第二帧自己到点（等待期间确实收到过 ack ✓，所以它是伪超时 ✓）| ① 确实发生了 RTO 重传（否则没测到东西 ✗）；② 被认成伪超时（`counter_to_hadack >= 1` 且 `counter_to_noack == 0` ✓）；③ **cwnd 没有被拉回 1** ✓（对照 `t_rto`：那里 ack 根本不来 ⇒ 仍应打回 1 ✓）|
+| `t_cwnd` | **塌陷后的恢复代价**："`ssthresh` 被已经塌掉的 cwnd 重算（⇒ 算出 1）到底值不值" ✓ —— 发 1 帧后跳过 100ms 不给 ack ⇒ 过期；连着两次 RTO（第二次时 cwnd 已经是 1 ✓ 这就是被测的那一刀）；之后每轮前进 5ms 并累积确认，把 cwnd 轨迹并排打出来 | 只做**前置测量** ⇒ 两侧都应通过 ✓：场景成立（真发生了 `>= 2` 次 RTO 重传、且塌陷后 `cwnd == 1` ✓）；"改不改 ssthresh"的价码由**人看轨迹**决定 ✓ |
 | `t_ack` | 手工注入 3 个 ACK 帧（无洞 / 连续 / 有洞），验证诊断计数 | 期望 `ack_recv=3 mack=2 hole=1` ⇒ 打印 `PASS` ✓ |
 | `e2e` | 端到端跑 `steps` 步，输出一行摘要 + 若干诊断行 | A/B 对比 `recv`（交付量）与 `resend%`（重传率）✓ |
 | `t_peer` | **夹具自测（P0）**：一个"服务端" slot + 两个对端 slot，验"按对端地址分发" ✓（不含 `ffrdp.c` ✓）| 服务端读到的两帧各自带着正确的来源地址 ✓；按地址回包落到正确 slot、不串台 ✓；未登记地址的 slot 仍走旧路径（源地址 0 ✓）|

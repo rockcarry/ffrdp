@@ -1,5 +1,8 @@
 # ffrdp v2.0.0 接口说明
 
+> **语言** ✓：本文档**只有中文版** ✗（英文版只有仓库根目录的 [`readme.en.md`](../readme.en.md) ✓）。
+> 需要其它语言请**用 AI 自行翻译** ✓ —— 记得让它保留宏名、命令、代码块与 `✓ / ✗` 符号原文 ✓。
+
 > 原设计稿 `ffrdp-v2.h` 已**并入 `ffrdp.h`** ✓（见文件头部的"设计要点与已定的边界" ✓）并删除 ✓ ——
 > 于是对外只有 `ffrdp.h` 这一个头 ✓。
 > 本文写的是**已经落地**的样子 ✓ —— 已经接线的、还是设计中的，都在这里标清楚 ✓。
@@ -115,7 +118,7 @@ ffrdps://0.0.0.0:8000,maxconn:16,handshake_ms:10000,idle_ms:5000,mss:1024,fec:0,
 
 ```
 bash build.sh                 # 真机侧（ffrdp.c + lowlevel-udp.c + socket.c + utils.c + test.c）
-bash tools/sim/run.sh         # 仿真侧：12 个测试 + 场景组（详见 docs/sim-test.md）
+bash tools/sim/run.sh         # 仿真侧：14 个测试 + 场景组（详见 docs/sim-test.md）
 ```
 
 - `tools/sim/run.sh` 会把每个测试编两份：**HEAD 那份**与**工作区那份** ✓ ⇒ 新旧行为可直接逐字对照 ✓。

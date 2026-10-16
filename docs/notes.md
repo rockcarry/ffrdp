@@ -1,10 +1,13 @@
 # ffrdp 调试笔记（工作文档）
 
+> **语言** ✓：本文档**只有中文版** ✗（英文版只有仓库根目录的 [`readme.en.md`](../readme.en.md) ✓）。
+> 需要其它语言请**用 AI 自行翻译** ✓ —— 记得让它保留宏名、命令、代码块与 `✓ / ✗` 符号原文 ✓。
+
 本文档记录 ffrdp 传输层的调试过程、已确认的结论、以及实验档案，避免重复踩坑。
 每一条结论要么有仿真数据、要么有真机 log 支撑，来源都注明。
 
 > **文档分工**（2026-10 起）：协议规格与优化依据在 [`ffrdp-v1.md`](ffrdp-v1.md)（v1 三代）与 [`ffrdp-v2.md`](ffrdp-v2.md)（v2 接口）；
-> 仿真工具用法在 [`sim-test.md`](sim-test.md)；概述/编译/测试在 [`../readme.md`](../readme.md)。
+> 仿真工具用法在 [`sim-test.md`](sim-test.md)；概述/编译/测试在 [`../readme.zh.md`](../readme.zh.md)。
 > **本文是"过程记录"**：动机、试错、被否路线、每次上机的原始 log —— 有新的调试或工作记录就往这里加。
 
 ---
@@ -1015,7 +1018,7 @@ tail ok 稳定为 1（不再抖动）✓
 **决定（不做信号路径）**：为一个测试程序维护信号处理不值得 ✓ ⇒ **删掉整套 Ctrl+C 处理**
 （`sigaction`、处理函数、`select`+`read` 都删掉 ✓），退出只认 `quit` / `exit`（或 stdin 结束 ✓）。
 **Ctrl+C 会直接结束进程、看不到 verify 汇总** ✓ —— 这是**接受的正常结果** ✓；
-要看汇总就用 `quit`/`exit` ✓（文档已写明，见 [`../readme.md`](../readme.md) 的 `test_ffrdp` 一节 ✓）。
+要看汇总就用 `quit`/`exit` ✓（文档已写明，见 [`../readme.zh.md`](../readme.zh.md) 的 `test_ffrdp` 一节 ✓）。
 
 顺带两点：
 
@@ -1176,9 +1179,10 @@ REF=/path/to/ffrdp.c TESTS=e2e bash tools/sim/run.sh
 **场景清单**（`e2e.c`）：干净链路（不同 RTT）、iid 丢包、突发丢包、抖动、上行令牌桶限速器
 （复现 Apical 形态）、下行整形器（带队列上限）、重尾延迟尖峰。
 
-**单测**：`t_rto.c`（超时/退避行为）、`t_ack.c`（ACK 计数接线）。
+**单测**：`t_rto.c`（超时/退避行为）、`t_pseudo.c`（伪超时：ACK 晚到但一帧没丢 ⇒ cwnd 不该被打回 1）、
+`t_cwnd.c`（塌陷后的恢复代价）、`t_ack.c`（ACK 计数接线）、`t_fec.c`（FEC 丢帧恢复）等 —— 完整的**十四个测试**见 [`sim-test.md`](sim-test.md) ✓。
 
-**完整用法**（`TESTS`/`REF`、12 个参数、17 个内置场景、输出解读、使用纪律与局限）见 [`sim-test.md`](sim-test.md) ✓
+**完整用法**（`TESTS`/`REF`、12 个 e2e 参数、17 个内置场景、输出解读、使用纪律与局限）见 [`sim-test.md`](sim-test.md) ✓
 
 ---
 
@@ -1257,7 +1261,10 @@ REF=/path/to/ffrdp.c TESTS=e2e bash tools/sim/run.sh
 
 ## 9. 当前工作区状态
 
-- **交付版本**：`verified-v5-fast-walk`（在途闸门 + 延迟探测，门槛 3×，且"探测赢了就继续问" ⇒
+- **当前版本**：`master` = **v2.0.0** ✓（`ffrdp.h` 的 `FFRDP_VERSION` ✓）—— 接口与连接模型重构
+  （句柄式 `send`/`recv` + 事件回调、三次握手 / 四次挥手、多客户端 `accept`、keepalive、加密回调 ✓），
+  见 [`ffrdp-v2.md`](ffrdp-v2.md) ✓；v1 三代（v1.0.0 / v1.1.0 / v1.2.0）见 [`ffrdp-v1.md`](ffrdp-v1.md) ✓。
+- **v1 时代的交付版本**（历史 ✓）：`verified-v5-fast-walk`（在途闸门 + 延迟探测，门槛 3×，且"探测赢了就继续问" ⇒
   几秒内收敛、无需任何配置值 ✓，见 5.19）✓；
 - **已验证节点用标签记**（每个标签的说明里带着当时的上机证据 ✓，且都指向已合并的提交 ✓）：
   `baseline-preopt`（部署基线，内容与最早的 `c05ea45` 相同）、`verified-v1-rto-floor`（v6）、
@@ -1265,8 +1272,10 @@ REF=/path/to/ffrdp.c TESTS=e2e bash tools/sim/run.sh
   `verified-v4-queue-ratio`（step30）、`verified-v5-fast-walk`（step31）——
   需要某个实验的源码时，用相应标签即可（`tools/steps/` 已不再保留 ✓）；
 - **两端同步**：远端是 Gerrit 上的 `master`，另一台机器 `git pull` 即可 ✓（不再走"复制 patch"✓）；
-  自检看 dump 第一行 `build :`（含 `probe` / `queue ratio`）以及 `ffrdp.c` 的 md5，比记提交号可靠 ✓；
-- **文档布局**（2026-10 整理）：`readme.md`（概述/编译/测试/目录）、`docs/ffrdp-v1.md`（协议与优化）、
+  自检看 dump 里的 **`version & build :`** 行（版本号 + 编译期参数 `probe` / `queue ratio` + 编译时刻 ✓）
+  以及 `ffrdp.c` 的 md5，比记提交号可靠 ✓；
+- **文档布局**（2026-10 整理）：`readme.zh.md`（概述/编译/测试/目录；另有**英文版** `readme.en.md` ✓）、
+  `docs/ffrdp-v1.md`（v1 协议与优化）、`docs/ffrdp-v2.md`（v2 接口 / 握手 / 多客户端 ✓）、
   `docs/notes.md`（本文）、`docs/sim-test.md`（仿真用法）✓；
 - 上机测任何一步前，**先确认工作区是干净的**（曾经被 `git checkout` 清掉未提交的改动）。
 
@@ -2341,7 +2350,7 @@ addr。撤掉它的理由是它**不是后端差异**：`uint64_t = ipv4（高 3
 - `ffrdp_addr_make(ip, port)` / `ffrdp_addr_split(addr, &ip, &port)` —— 位布局的唯一出处；
 - `ffrdp_addr_parse_text(text, &ip, &port, default_port)` —— 解析 `"ip[:port]"`；`default_port < 0` 表示
   **端口必须显式给**；地址要求严格的四段点分十进制（**手写**，不引 socket 头 ⇒ 协议层仍然不碰 socket）；
-- `FFRDP_ADDR_DEFAULT_PORT 8000`（与 `readme.md` / `test.c` 的默认一致）。
+- `FFRDP_ADDR_DEFAULT_PORT 8000`（与 `readme.zh.md` / `test.c` 的默认一致）。
 
 顺手**并掉了两份重复代码**：`lowlevel-udp.c` 里 `"bind:ip:port"` 的字符串解析（原来自己写了一遍
 `strrchr`/`atoi`/`inet_addr`）改为调用同一个函数。`pack`/`unpack` 保留 —— `sockaddr_in ↔ (ip, port)` 的
