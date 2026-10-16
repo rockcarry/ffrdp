@@ -38,8 +38,8 @@ int main(void)
     printf("  sizeof(FFRDPCONTEXT)         %6zu B   （每端点一份）\n", ctx);
     printf("  sizeof(UDP_LOWLEVEL)         %6zu B   （每端点一份）\n", low);
     printf("  sizeof(FFRDP_FRAME_NODE)     %6zu B   （动态分配：按在途帧数 ✓）\n", node);
-    printf("  FFRDP_RECVBUF_SIZE           %6d B   （= 96 帧 × MSS；每连接 malloc 一份 ✓）\n",
-           (int)FFRDP_RECVBUF_SIZE);
+    printf("  FFRDP_RECVBUF_SIZE           %6d B   （= %d 帧 × MSS；每连接 malloc 一份 ✓）\n",
+           (int)FFRDP_RECVBUF_SIZE, (int)FFRDP_RX_WINDOW_FRAMES);
     printf("  ── 每连接合计（结构体 + 接收窗）── %zu B ≈ %zu KB\n",
            conn + (size_t)FFRDP_RECVBUF_SIZE, (conn + (size_t)FFRDP_RECVBUF_SIZE) / 1024);
     printf("  ── 每端点合计（ctx + lowlevel）── %zu B ≈ %zu KB\n", ctx + low, (ctx + low) / 1024);

@@ -105,7 +105,18 @@
 
 // ── 缓冲 ─────────────────────────────────────────────────────────────────
 // 接收窗口（= 我们在 ack 里通告给对端的帧数）；必须大于在途上限并留余量，否则窗口反成瓶颈。
-#define FFRDP_RECVBUF_SIZE  (96 * (FFRDP_MAX_MSS + 0))
+// ── 接收窗口（内存 ↔ 吞吐的总旋钮）──────────────────────────────────────────
+// 单位是**帧**（乘 MSS 得字节 ✓）。它同时就是**通告给对端的窗口** ✓：ack 里那个 8 位字段 =
+// (recv_cap - recv_size) / rmss ✓ ⇒ **缩这个数 = 缩缓冲 + 缩通告窗**（两边自动一致 ✓，不必另改逻辑 ✓）。
+// 默认 96 是回环上量出来的（曲线见 notes §26.84 ✓）；嵌入式几 KB 的预算就调小这里 ✓
+// （16 帧 ≈ 23.8 KB ✓）。⚠️ 调小只影响**吞吐**（窗口小 ⇒ 在途少 ⇒ 等 ack 多 ✓），不影响正确性 ✓。
+#ifndef FFRDP_RX_WINDOW_FRAMES
+#define FFRDP_RX_WINDOW_FRAMES 96
+#endif
+#if FFRDP_RX_WINDOW_FRAMES < 2
+#error "FFRDP_RX_WINDOW_FRAMES 太小（< 2）：窗口至少要让一个在途帧 + 一次握手回环转起来 ✓"
+#endif
+#define FFRDP_RECVBUF_SIZE  (FFRDP_RX_WINDOW_FRAMES * (FFRDP_MAX_MSS + 0))
 // 乱序帧最多能越过洞多远（再远就丢 —— 否则陌生人能用无会话的数据报无限占我们内存）。
 #define FFRDP_RECV_QUEUE_MAX 256
 // 应用侧等待时即使调用方没给期限也周期醒来：不漏掉状态变化，也不让调用方永久睡眠。
