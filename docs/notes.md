@@ -4845,3 +4845,31 @@ revert 仍把这个下探还回去并把下次间隔翻倍（10s→20s→40s→6
 **结论** ✓：§26.30 的清单里，应用队列这一条**最终删掉了** ✓（省 32 KB/连接 ✓）。它当初看起来"不能删"，
 是因为我删的时候顺手引入了一个空转 bug ✓ —— 这也再次印证这个仓库的工作方式：**先把仪表读准，再动手** ✓。
 合并：`a5b51bc`（merge exp/no-app-queue ✓）。
+
+### 26.64 代码瘦身 T1：运行时旋钮 → 编译期宏（删 getenv ✓）（2026-10-16 下午）✔
+
+设计目标（用户给）：**嵌入式 MCU/Linux，低 CPU + 低内存，静态分配优先，靠改宏定义常量配置，编译期确定内存** ✓。
+T1 把"为实验而存在"的**运行时 env 旋钮**全部改成**编译期宏** ✓ —— 这是所有后续"删代码"的前提：旋钮一旦是宏，
+"默认关闭的那条分支"就成了**可编译掉的死代码** ✓（T4 处理 ✓）。
+
+| 原 env 旋钮 | 现在 | 默认 |
+|---|---|---|
+| `FFRDP_INFLIGHT` | `FFRDP_INFLIGHT_MAX`（本就存在 ✓）| 64 |
+| `FFRDP_MAXCWND` | `FFRDP_MAX_CWND_SIZE`（本就存在 ✓）| 128 |
+| `FFRDP_WAITSND` | `FFRDP_MAX_WAITSND`（本就存在 ✓）| 256 |
+| `FFRDP_MEMPROBE` | `FFRDP_MEMPROBE_ENABLE`（新 ✓）| 1 |
+| `FFRDP_UNSENT` | `FFRDP_UNSENT_MAX`（新 ✓）| 24 |
+| `FFRDP_PSEUDO_NOCUT` | `FFRDP_PSEUDO_NOCUT`（新 ✓）| 0 |
+| `FFRDP_HOLE_CUT_ONCE` | `FFRDP_HOLE_CUT_ONCE`（新 ✓）| 1 |
+| `FFRDP_SENDWAKE_COALESCE` | `FFRDP_SENDWAKE_COALESCE`（新 ✓）| 0 |
+| `FFRDP_ACK_COALESCE` | `FFRDP_ACK_COALESCE`（新 ✓）| 0 |
+| `FFRDP_RX_BATCH`（低层）| `FFRDP_LOWLEVEL_RX_BATCH_MAX`（本就存在 ✓）| 2 |
+| `FFRDP_BUFSIZE`（低层）| `FFRDP_LOWLEVEL_BUFSIZE_KB`（新 ✓）| 96 |
+
+删掉的机制 ✓：`ffrdp_read_knobs()`、`g_knobs_read`、`ffrdp_ack_coalesce()`，以及 5 个 `g_*` 变量；
+`ffrdp.c` 与 `lowlevel-udp.c` 里 `getenv` 归零 ✓。**测试/dev 的 env 不动** ✓（`TEST_APP_*` 与
+`FFRDP_HS/IDLE/CLOSE` 都在 `test.c` 里；`check.sh` 只依赖那三个 ✓）。
+
+验证 ✓：构建 0 告警；**check.sh 8/8 PASS**；交错 A/B 3 轮 —— 基线 50.2/48.8/54.1 MB/s vs T1 53.7/53.4/53.9
+（同带 ✓）；重传 0.01~0.05% vs 0.02~0.06%（同带 ✓）；`sizeof(UDP_LOWLEVEL)=328`、`conn bufs=143232` 逐字不变 ✓；
+二进制 106 672 → 106 184 B ✓。行数：`ffrdp.c` 3050→3022、`lowlevel-udp.c` 620→607 ✓。

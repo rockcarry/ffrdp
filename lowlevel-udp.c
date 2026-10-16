@@ -25,6 +25,9 @@
 // 取 2：反馈永远不该成为瓶颈，而 ack 数仍比"一帧一个"少一半。链路 RTT 是真的（不像回环）时攒大一些
 // 更省 ack，但那要另一个旋钮（按 RTT 或按时间自适应），不是现在这一步的事。
 #define FFRDP_LOWLEVEL_RX_BATCH_MAX 2
+// 套接字缓冲请求值（KB ✓；内核会翻倍后再夹到 rmem_max ✓）。①-37 实测膝点：96 KB ⇒ 实给 192 KB，
+// 仍在默认 rmem_max 之内（部署端不必改 sysctl ✓）；64 KB ⇒ 实给 128 KB ⇒ lo 上吞吐不足 25 MB/s ✗。
+#define FFRDP_LOWLEVEL_BUFSIZE_KB 96
 
 typedef struct {
     int  (*send )(void *fl, uint64_t addr, uint8_t *buf, int len);
@@ -71,10 +74,9 @@ typedef struct {
     uint32_t        stat_arm_dnow;       // <= now（真的要求"现在" ✗）
     uint32_t        stat_arm_dnear;      // now+1..4
     uint32_t        stat_arm_dfar;       // > now+4
-    // ①-25（本轮实验 ✓）：RX 批上限从宏改成**运行时可调**（env FFRDP_RX_BATCH ✓，默认仍是
-    // FFRDP_LOWLEVEL_RX_BATCH_MAX=2 ✓ —— 那个值是文件头那张实测表选出来的 ✓）。
-    int             rx_batch;             // 一圈最多收几帧（默认 2 ✓）
-    int             bufsize;              // ①-30：套接字缓冲请求值（字节 ✓；env 可调 ✓）
+    // RX 批上限 = FFRDP_LOWLEVEL_RX_BATCH_MAX（文件头那张实测表选出来的 2 ✓）。
+    int             rx_batch;             // 一圈最多收几帧（= FFRDP_LOWLEVEL_RX_BATCH_MAX ✓）
+    int             bufsize;              // 套接字缓冲请求值（字节 ✓）= FFRDP_LOWLEVEL_BUFSIZE_KB * 1024
     int             buf_rcv_eff;          // 内核实际给的（getsockopt ✓，dump 里打 ✓）
     int             buf_snd_eff;
     int             stat_rx_errno;       // 第一次失败的 errno（0 = 还没失败过 ✓）
@@ -457,11 +459,11 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
     printf("udp lowlevel rx cost: batch-full %u, of which socket still had data %u, laps with 1 frame %u, with >=2 frames %u, callback %u us total, %u us max\n",
            udp->stat_rx_batch_full, udp->stat_rx_capped_more, udp->stat_lap_rx1, udp->stat_lap_rxmulti,
            udp->stat_cb_us_sum, udp->stat_cb_us_max);
-    printf("udp lowlevel rx batch: %d frames per lap (env FFRDP_RX_BATCH; default = %d)\n",
+    printf("udp lowlevel rx batch: %d frames per lap (compile-time FFRDP_LOWLEVEL_RX_BATCH_MAX = %d)\n",
            udp->rx_batch, FFRDP_LOWLEVEL_RX_BATCH_MAX);
     printf("footprint ①-35      : sizeof(UDP_LOWLEVEL) %u bytes (plus the two sockets' kernel buffers above)\n",
            (unsigned)sizeof(UDP_LOWLEVEL));
-    printf("udp lowlevel buffers : requested %d B, kernel gave rcv %d B / snd %d B (①-30; env FFRDP_BUFSIZE in KB; rmem_max caps it)\n",
+    printf("udp lowlevel buffers : requested %d B, kernel gave rcv %d B / snd %d B (FFRDP_LOWLEVEL_BUFSIZE_KB; rmem_max caps it)\n",
            udp->bufsize, udp->buf_rcv_eff, udp->buf_snd_eff);
     {   // 内存盘点（只读 ✓）：**唤醒 socket** 的内核缓冲 —— 它上面从来没设过大小，
         // 拿的是内核默认值（Linux 常见 rmem_default/wmem_default ≈ 212 KB ✗），
@@ -586,23 +588,8 @@ FFRDP_LOWLEVEL* ffrdp_udp_lowlevel_init(void *params, FFRDP_LOWLEVEL_CB callback
     udp->exit         = ffrdp_udp_lowlevel_exit;
     udp->sockfd       = -1;   // 0 is a valid descriptor, so "no socket yet" cannot be spelled with a zero
     udp->notify       = -1;
-    {   // ①-25：默认 = 宏（2 ✓）；env 可覆盖（1..64 ✓）
-        const char *e = getenv("FFRDP_RX_BATCH");
-        udp->rx_batch = FFRDP_LOWLEVEL_RX_BATCH_MAX;
-        if (e && *e) { int v = atoi(e); if (v >= 1 && v <= 64) udp->rx_batch = v; }
-    }
-    {   // ①-30：缓冲请求值（KB ✓）；默认 = 源码常量 ✓
-        const char *e = getenv("FFRDP_BUFSIZE");
-        // ①-37（2026-10-15）：**188 KB → 96 KB**。判据是用户给的"lo 25 MB/s 就够" +
-        //   "省内存优先" ⇒ 这个值只在**够用**的前提下取最小。实测膝点（lo，各两轮，内核把请求翻倍）：
-        //     请求 64 KB ⇒ 实给 128 KB ⇒ 15.5 / 20.2 MB/s（**不足 25** ✗）
-        //     请求 96 KB ⇒ 实给 192 KB ⇒ **42.0 / 29.8 MB/s** ✓（重传 0.24 / 0.35% ✓）
-        //     请求 188 KB（旧值）⇒ 实给 376 KB ⇒ 38.1 / 40.1 MB/s（同带 ✓）但内存翻倍 ✗
-        //   ⇒ 取 96 KB：**每 socket 省 368 KB** ✓，而实给 192 KB 仍在默认 rmem_max（208 KB）之内
-        //     ⇒ **部署端不必改 sysctl** ✓（旧值 188 KB 反而要求把上限抬高 ✓）。
-        udp->bufsize = 96 * 1024;
-        if (e && *e) { int v = atoi(e); if (v >= 4 && v <= 65536) udp->bufsize = v * 1024; }
-    }
+    udp->rx_batch = FFRDP_LOWLEVEL_RX_BATCH_MAX;
+    udp->bufsize = FFRDP_LOWLEVEL_BUFSIZE_KB * 1024;
     udp->callback     = callback;
     udp->cbctx        = cbctx;
     udp->mthread.proc = ffrdp_udp_lowlevel_proc;
