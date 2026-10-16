@@ -78,6 +78,12 @@ static int ffrdp_udp_wakeup_create(UDP_LOWLEVEL *udp)
     int                fd  = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (fd < 0) return -1;
     socket_setopt(fd, "nonblock_io", 1);   // a caller must never block on a full queue
+    // 这个 socket 一辈子只传唤醒字节，可它原来从没设过大小 ⇒ 拿内核默认值（本机实测收/发各 212,992 B，
+    // 因为 rmem_default == rmem_max）⇒ 一个唤醒 socket 白占 416 KB，比一条连接的协议缓冲还贵。请求 4 KB
+    // （内核翻倍 ⇒ 8 KB）。安全性：它是非阻塞的，事件循环每次醒来都把它读空；就算真被填满（那意味着已经
+    // 积了成千上万个没人处理的唤醒 ⇒ 循环本来就醒着），丢一个唤醒字节也无害。见 notes §26.61。
+    socket_setopt(fd, "send_buffer", 4096);
+    socket_setopt(fd, "recv_buffer", 4096);
     lo.sin_family      = AF_INET;
     lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     lo.sin_port        = 0;                // the kernel picks; nobody else ever needs to know it

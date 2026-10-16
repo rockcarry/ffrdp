@@ -31,7 +31,7 @@ v1.2.0 起传输层独立成文件（`lowlevel-udp.c` 约 380 行，另加 `sock
 |---|---|---|---|
 | **v1.0.0** | `v1.0.x` | 4 字节帧头；ACK 8 字节 | 基础 ARQ（选择重传/快重传/UNA+MACK/rwnd）+ FEC |
 | **v1.1.0** | `v1.1.x` | **未变** ✓ | 协议**逻辑**优化：ACK 回传白费计数（唯一新增的可选字节）、对端证据驱动的 RTO 下限、快重传等待纪律、在途量闸门 + 延迟探测 |
-| **v1.2.0**（当前）| `v1.2.x` | **未变** ✓ | **传输层重构**（`lowlevel` 接口 + 工作线程驱动）与随后的协议修正（唤醒判据、当圈回 ack、窗口定标）；参数与规范见 [`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) §3.1 |
+| **v1.2.0**（当前）| `v1.2.x` | **未变** ✓ | **传输层重构**（`lowlevel` 接口 + 工作线程驱动）、协议修正（唤醒判据、当圈回 ack、窗口定标），以及 2026-10-16 从开发线回迁的一轮**内存 / 吞吐 / 代码瘦身**（删应用发送队列、`FFRDP_DIAG` 与 `FFRDP_FEC_ENABLE` 编译期开关、伪超时不再打回 cwnd、探针判据定稿）；参数与规范见 [`docs/ffrdp-protocol.md`](docs/ffrdp-protocol.md) §3.1，逐项记录见 [`docs/notes.md`](docs/notes.md) §26.15 |
 
 **怎么认版本** ✓：看 dump 里的 `version & build : … compiled <日期> <时刻>` 行（dump 把 `version` 与 `build` 合成了一行 ✓），再对上编译时的 commit ✓。
 （`FFRDP_VERSION` 是**当前工作树**才有的 ✓；

@@ -33,7 +33,13 @@ void ffrdp_socket_setopt(SOCKET sock, char *opt, int val)
     struct timeval tv;
 #endif
     int    ret = 0;
+    // 无效句柄要分平台判：Windows 的 SOCKET 是 winsock2 的 UINT_PTR（**无符号**）⇒ 只能比 INVALID_SOCKET
+    //（原来写 `sock < 0` 在 mingw 下**恒假** —— 这个"守门"从来没生效过；-Wextra 的 -Wtype-limits 抓住了它）。
+#ifdef WIN32
+    if (sock == INVALID_SOCKET) { log_printf("<4> socket_setopt, invalid socket %d\n", (int)sock); return; }
+#else
     if (sock < 0) { log_printf("<4> socket_setopt, invalid socket %d\n", sock); return; }   // 0 is a valid fd
+#endif
     if (strcmp(opt, "recv_timeout") == 0) {
 #ifdef WIN32
         ret = setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (void*)&val, sizeof(val));

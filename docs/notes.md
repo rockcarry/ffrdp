@@ -3003,3 +3003,182 @@ if (!(p->flags & FLAG_TIMEOUT_RESEND)) {
   （要删就得整组删 ⇒ 会失去"伪超时属于哪一种"这个判据 ✓）；注释已改成"不是临时调试，保留" ✓；
 - 遗留 nits ✓：`counter_swnd0` / `counter_capblock` 落在 dump 的重置区间之外（语义上应与其它区间计数一致 ✓）；
   `docs/ffrdp-protocol.md` 的 41 行 LF-only 是**改动前就有**的 ✗（HEAD 里 743/784 CRLF ✓），未动 ✓。
+
+
+### 26.15 从 master 回迁的优化（协议 / 内存 / 吞吐 / 删应用队列 / 代码瘦身）
+
+
+
+master 上 2026-10-13 之后的一整轮优化（当时与本分支同源，分叉点 `c2b495c`）已经回迁到本条线上。
+
+逐项、以及**没有回迁的东西**与理由：
+
+
+
+**一、内存（每端点）**
+
+
+
+| 项 | 改法 | 省 |
+
+|---|---|---|
+
+| 内核套接字缓冲 | `FFRDP_LOWLEVEL_BUFFER_SIZE` 188 KiB → **96 KiB**（`lowlevel.h`） | 每 socket 368 KB（收+发） |
+
+| 唤醒 socket | 创建时就请求 4 KB 收发（原来从没设过 ⇒ 拿内核默认 212,992 B） | 416 KB |
+
+| 应用发送队列 | **整条删除**（见下） | 64 KB |
+
+| FEC 收发缓冲 | `FFRDP_FEC_ENABLE`（默认 0 ⇒ 整块编译掉） | 2,996 B |
+
+| 诊断计数器 | `FFRDP_DIAG`（默认 0 ⇒ 只给 dump 用的计数器不存在） | 184 B（dev 口径对照） |
+
+| 接收窗口 | `FFRDP_RX_WINDOW_FRAMES` 编译期可配，**默认仍是 128**（逐字不变） | 嵌入式可自行调小 |
+
+
+
+`sizeof(FFRDPCONTEXT)`：**260,176 → 191,456 B**（出货口径）。
+
+新增 `tools/size.sh` 把这份账做成一条命令（`bash tools/size.sh`，`--padded` 还能看结构体填充）。
+
+
+
+**二、删掉应用发送队列（master 的 ①-41）**
+
+
+
+应用线程现在在 `ffrdp_send` 里**直接成帧**（`ffrdp_frame_message` 本来就写成原子的：先把这一条要用的
+
+**所有**节点预分配好，再拷字节 ⇒ 调用方只会看到 len 或 <0）。队列"替内核做突发整形"那一半职责由
+
+`FFRDP_UNSENT_MAX`（未发出帧预算，24 帧）接管 —— 直接用未发出量当闸门会在 lo 上崩（实测 35.6 → 3.3 MB/s、
+
+重传 0.16% → 5.55%：应用一次可以攒 100+ 帧一把灌进内核缓冲）。
+
+
+
+顺带修掉的两处：
+
+- 受理判据里那条"单条消息比队列还大 ⇒ 永久返回 -1"随队列一起消失 ⇒ **任何大小的消息都能发**；
+
+- `pub_wait_snd`（协议发布给应用看的镜像）没有读者了 ⇒ 删除，应用直接读锁内的 `wait_snd`。
+
+
+
+**三、协议 / 吞吐**
+
+
+
+- **伪超时不再把 cwnd 打回 1**：新增 `CEVENT_ACK_TIMEOUT_MISSED`。"等待期间 ack 到过、只是没覆盖这一帧"
+
+  是估计器看不见（尾部在 `rtt_tail` 里），不是链路丢包 —— 现在与快速重传同档（**减半**）。
+
+  `FFRDP_PSEUDO_NOCUT=1` 还可以选择"完全不动窗口"。
+
+- **洞等够久那一支的减半守卫**（`FFRDP_HOLE_CUT_ONCE=1`）：那一支每次 ack 都会重走发送表 ⇒ 同一帧原来
+
+  会被反复判减半。现在只认第一次。
+
+- **在途闸门 5 → 64**（`FFRDP_INFLIGHT_MAX`）：5 是"坏唤醒"时期的临时值，本分支的唤醒问题（见下）
+
+  已经修掉 ⇒ 回到无害的那个默认值，由探针自己往下试。
+
+- **重开延迟探测**（`FFRDP_PROBE_ENABLE` 0 → 1），并把它那一套判据补齐到 master 的定稿：
+
+  `rate_best` 衰减 1/16 → **1/4**；keep **不再要求"看到 RTT 下降"**（只看速率没掉，或重传强度降了 20% 以上）；
+
+  giveback 要**连续健康 5 秒**才允许还，且两处还窗口共用一个周期预算（`last_giveback`）、步长 `*2` → `+25%`；
+
+  探测期间 `probe_next` 跟着推到未来；新增 **①-39 内存视角触发**（`FFRDP_MEMPROBE_*`：上限远高于这一圈真正
+
+  在线的量也值得试）。
+
+- **`next_due` 的抗空转三件套**：`entry < cwnd`（只有这一圈看得见的帧才配设期限）、
+
+  `armed_now`（tick 用严格 `>` 判到期 ⇒ 恰好等于 now 的期限要挪成 now+1，否则在同一个冻结的 tick 里空转）、
+
+  以及 **`tx_stalled`**（上一圈有活却被闸门挡住、一帧没发 ⇒ 这次别再要"现在"，让 ack 来敲门）。
+
+  这是把"收尾期空转"从**协议侧**堵掉的做法。
+
+- **没有回迁 master 的 `quiet`（对端静默）那一条**：本分支复现不出收尾期空转（上一个移植尝试的 P4 结论），
+
+  而它要多一个猜出来的阈值（master 用 `idle_ms/2`，本分支没有 `idle_ms`）⇒ 不加。
+
+- **没有回迁 `FFRDP_SENDWAKE_COALESCE`**：master 自己把它定为默认 0（不开），本分支就不引入这段代码。
+
+
+
+**四、代码瘦身**
+
+
+
+- `FFRDP_DIAG` 总开关（默认 0）：`ffrdp_dump_locked` 整段 + 只给 dump 用的计数器一起编译掉，
+
+  写点统一走 `FFRDP_CNT` / `FFRDP_CNT_ADD` 宏（DIAG=0 时冒空）。
+
+  ⚠️ 结构体里把**决策要读**的几个计数（首发/重传计数、`counter_ack_recv`、`counter_delivered`）与
+
+  `ack_lat_*`、`counter_to_age_max` 一起搬到了 `reserved` 之前 —— 它们原来落在 dump 的 memset 区间里，
+
+  `clearhistory=1` 会把 `tx_stalled` 与探针的基准一起清零（那是个真 bug，不是风格问题）。
+
+- 删掉 lap 节奏的一次性仪器（`tick_last_upd` / `counter_upd_cnt` / `counter_upd_gap` /
+
+  `counter_upd_gap_max` / `counter_upd_cost_max`）与 `counter_drain_block`（队列删了 ⇒ 没有写点）。
+
+- v1 内置 AES 的那两个标志位挪进 `#ifdef CONFIG_ENABLE_AES256`（关掉时它们没有任何使用点，
+
+  会被 `-Wunused-macros` 点名）。**没有删整条 AES 链**（那会改 `ffrdp_init` 的 `txkey`/`rxkey` 两个参数 = 改 API）。
+
+- 构建门槛：`-Wall -Werror` → `-Wall -Werror -Wextra -Wunused-macros`（四种口径 × 四个编译单元零告警）。
+  加严立刻抓出两个真问题：① `socket.c` 的 `if (sock < 0)` 在 mingw 下**恒假**（Windows 的 `SOCKET` 是无符号的
+  `UINT_PTR`）⇒ 这个"无效句柄守门"从来没生效过，已改成按平台判（`INVALID_SOCKET` / `sock < 0`）；
+  ② 那两个关掉的内置 AES 标志宏（见上）。
+
+- **没有搬** master 的大规模注释压缩（它那 277 行主要是把英文长注释改写成中文短注释）：
+
+  本分支的行数收益小、diff 噪声大，等下次一起做。
+
+
+
+**五、量到的结果**
+
+
+
+| 量 | HEAD | 现在（出货口径） |
+
+|---|---|---|
+
+| `sizeof(FFRDPCONTEXT)` | 260,176 B | **191,456 B** |
+
+| `ffrdp.o`（-Os） | 28,536 B | **14,472 B**（≈ −49%） |
+
+| `test_ffrdp`（-Os） | 50,144 B | **45,920 B** |
+
+| 每端点内核侧请求 | 188 KiB ×2 + 416 KB 唤醒 | **96 KiB ×2 + 8 KB 唤醒** |
+
+| 回环吞吐（lo，10 s × 4 轮，两侧各钉一核，取**中位数**） | 38.2 MiB/s | 38.2 MiB/s（无回归） |
+
+
+
+**六、判据**
+
+
+
+- `bash build.sh`（dev 口径：`DIAG=1` + `FEC=1`）；
+
+- 四种口径编译零告警：`DIAG∈{0,1} × FEC∈{0,1}` × `{ffrdp, lowlevel-udp, socket, utils}`；
+
+- `tools/sim/run.sh`（`t_rto` / `t_ack` / `t_fuzz` / `e2e`）差分：work 侧全通过；
+
+- `bash tools/size.sh`；回环 A/B（见上表最后一行）；
+- **交叉编译**（`i686-w64-mingw32-gcc-13.2.0`）：`TOOLCHAIN_NAME=mingw CROSS_COMPILE=i686-w64-mingw32- bash build.sh` 通过
+  （`libffrdp.a` + `test_ffrdp.exe`），严格告警同样零命中。
+
+
+
+⚠️ **§26.13 的结论已被本次取代**：`FFRDP_APP_TX_SIZE`（64 KiB 的应用队列）不再存在 ——
+
+"单条消息上限"这个概念随之消失，"突发整形"由 `FFRDP_UNSENT_MAX`（未发出帧预算）承担。
+

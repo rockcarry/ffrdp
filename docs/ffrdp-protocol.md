@@ -493,15 +493,21 @@ iperf3 TCP 跑时 ping      374~704 ms     ← TCP 用 550~700KB 在途，自残
      并且**砍半后的上限必须严格低于当前上限**（否则问的是同一个问题），且不越过地板
      `FFRDP_INFLIGHT_MIN = 4` 帧；
   2. 探测：把在途上限**砍一半**，保持 `2×rtt + 500ms`；
-  3. 判定：**典型 RTT（`rtts`，不是最近一次采样 `rttm`）比探测前低 ≥ `FFRDP_PROBE_RTT_DROP_MS`
-     （默认 2ms）且 对端确认速率没掉** ⇒ 保留该上限（并可继续下探）；
-     否则**立即还原**（延迟没掉 = 不是我们的；吞吐掉了 = 砍过头）；
+  3. 判定：**对端确认速率没掉**（不低于"探测前一秒"与"见过的最好一秒"里的较大者的 85%，
+     `rate_best` 每秒衰减 1/4）**或** 重传强度明显降了（探测期间"重传/交付"比探测前低 20% 以上）
+     ⇒ 保留该上限（并可继续下探）；
+     否则**立即还原**（速率掉了 = 砍过头；重传没降 = 不是我们的队列）；
+     ⚠️ 判据里**不再要求"看到 RTT 下降"**：2ms 的差在 20ms 的抖动里读不出来 ⇒ 那条要求等于把判定
+     交给抖动，而上面两条都是直接量到的（见 [`notes.md`](notes.md) §26.15）；
   4. 队列消失后慢慢放开（giveback），链路变快时能自动回升 —— 但"队列消失"用的是**绝对判据**
      `rtts − rtt_min < FFRDP_PROBE_RTT_DROP_MS`（2ms ✓），而**不是**触发用的 3× 比值 ✗：
      3× 允许最多 12ms 的队列仍算"没在排队" ⇒ 真机上 giveback 会时开时关（300s 里漏过 7 次 ✗，
      每次都把已证明的 4 抬回 5，见 [`notes.md`](notes.md) 11.6 ✓）⇒
-     **触发与归还用两把不同的尺子** ✓；
-  5. 失败后探测间隔翻倍（最多 60s）。
+     **触发与归还用两把不同的尺子** ✓；还窗口因此还要**连续健康 `FFRDP_PROBE_GIVEBACK_IDLE_S`（5）秒**，
+     步长 `+25%`（`×2` 会让"刚降下来又被抬回去"），且按秒 giveback 与这里共用一个周期预算（`last_giveback`）✓；
+  5. 失败后探测间隔翻倍（最多 60s）；
+  6. ①-39 **内存视角触发**（`FFRDP_MEMPROBE_ENABLE`）：上限比"这一圈真正在线上"高一倍以上也值得试 ——
+     那种情况下砍半不降延迟，但能把我们给自己留的在途预算降下来（要求 `out ≥ FFRDP_MEMPROBE_MIN_OUT`）✓。
 - **安全网**：还原逻辑保证"砍错"只损失一次 1.5 秒半窗口 ⇒ 不属于负优化。
 - **证据（真机）**：`probes 3 keep 3 revert 0`；`rtts` 215ms → 12~19ms（在途 64→8~16 帧）；
   负载 ping 220ms → 18~27ms；服务端吞吐反而 **+40%**；中途一次链路打嗝（461ms）探测**没有乱砍**。
@@ -736,19 +742,20 @@ FFRDP_UDPSBUF_SIZE = FFRDP_UDPRBUF_SIZE = 128 × (MSS + 6)   仅作 socket 选�
 
 ### 2.4.4 两条受理判据（都在 `ffrdp_send` 里）
 
-1. **帧数**：`ceil(len / smss) + pub_wait_snd > FFRDP_MAX_WAITSND` ⇒ 拒绝。
-   `pub_wait_snd` 是协议发布的镜像（每个回调结束时刷新），含义是"**已成帧、未确认**"的帧数，
-   **不含还排在队列里、尚未成帧的消息** ⇒ 这是一条**近似**判据。
-2. **字节**：`len + 4 + 队列里现有字节 > 队列容量`（v1.1.0 的队列容量 = `WAITSND × (MSS+4)` ✓） ⇒ 拒绝或等待（按 `timeout_ms`）。
-   这一条是精确的，也是上面那一条的兜底。
+> **2026-10-16（§26.15）**：应用发送队列已删除 ⇒ `ffrdp_send` 在锁内**直接成帧**，
+> 受理判据改成三条（都在循环里判，见 `ffrdp_send`）：① 未发出帧预算 `FFRDP_UNSENT_MAX`；
+> ② 在途上限 `wait_snd < FFRDP_MAX_CWND_SIZE`；③ 帧数闸 `need + wait_snd ≤ FFRDP_MAX_WAITSND`。
+> 下面这一节描述的是删除之前的形态，保留作为背景。
 
-两条合起来夹住"在途 + 排队"的总量：帧数上限（近似）+ 队列容量（精确）。
+1. **帧数**：`ceil(len / smss) + wait_snd > FFRDP_MAX_WAITSND` ⇒ 拒绝。
+   （v1.1.0 里读的是协议发布的镜像 `pub_wait_snd`；镜像已随队列一起删除，现在直接读锁内的 `wait_snd`。）
+2. **字节**：`len + 4 + 队列里现有字节 > 队列容量`（队列容量 = 64 KiB ✓） ⇒ 拒绝或等待（按 `timeout_ms`）。
 
 
 ### 2.4.5 `FFRDP_MAX_WAITSND`（帧数闸门，默认 256）
 
-它**只**管帧数：`ffrdp_send` 的受理判据（`ceil(len/smss) + pub_wait_snd > WAITSND` ⇒ 拒）与
-发送路径上的早退判据都用它。**它同时乘出应用队列容量**（§2.4.3 ✓）—— 两者绑死是本版的一个已知假取舍（见 §2.4.6 ✓）。
+它**只**管帧数：`ffrdp_send` 的受理判据（`ceil(len/smss) + wait_snd > WAITSND` ⇒ 拒）用它。
+（v1.1.0 里它同时乘出应用队列容量，那是个假取舍；2026-10-16 队列删除后这个乘法没了，见 §26.15 ✓。）
 
 内存上它只影响 `send_list` 里的帧节点数（每帧 ≈ `smss + 54` 字节，堆上），而且是"在途量"本身 ——
 **在途字节 = 带宽 × RTT（BDP）是物理需求**，不是浪费：要跑满高 BDP 链路就必须留得住这些帧。
@@ -889,14 +896,14 @@ FFRDP_UDPSBUF_SIZE = FFRDP_UDPRBUF_SIZE = 128 × (MSS + 6)   仅作 socket 选�
 
 | 常量 | v1.1.0 | **v1.2.0** | 说明 |
 |---|---|---|---|
-| `FFRDP_INFLIGHT_MAX` | **64**（默认上限；运行期由探测 keep 到 4~7）| **5** | v1.2.0 直接取到链路 BDP 附近（≈3 帧）⇒ 窗口成为**纯延迟旋钮** ✓ |
+| `FFRDP_INFLIGHT_MAX` | **64**（默认上限；运行期由探测 keep 到 4~7）| **64**（2026-10-16 从 5 回到 64）| 5 是"唤醒坏掉"时期的临时值；唤醒修好后回到无害默认值，由探测自己往下试 ✓ |
 | `FFRDP_INFLIGHT_MIN` | **4**（探测地板）| **4** | 同值、**含义变了**：v1.1.0 里它是"探测能下探到的最低位" ✓；v1.2.0 里它是"闸门下限的一部分"（探测关闭时实际闸门 = `MAX(MAX, MIN)`）✓ |
-| `FFRDP_PROBE_ENABLE` | **1**（打开）| **0**（暂时关闭）| 探测的判据与地板是在"唤醒坏掉"的时期调出来的 ⇒ 重开前先复核（§3.2.4.2 第 3 条 ✓）|
-| `FFRDP_MAX_CWND_SIZE` | **64** | **128** | 翻倍（真机 A/B 的拐点在 128 ⇒ 见 §2.4.5 的表 ✓）；⚠️ **别跟着窗口调它** ✗：它同时是发送循环的早退判据 ✓ |
+| `FFRDP_PROBE_ENABLE` | **1**（打开）| **1**（2026-10-16 重新打开）| 曾因"唤醒坏掉"暂时关闭；那一轮唤醒修复已在 `ffrdp_next_due` 里落定（`entry<cwnd` / `armed_now` / `tx_stalled`）⇒ 重开 ✓ |
+| `FFRDP_MAX_CWND_SIZE` | **64** | **128** | 翻倍（真机 A/B 的拐点在 128 ⇒ 见 §2.4.5 的表 ✓）；⚠️ **别跟着窗口调它** ✗：它同时是 `ffrdp_send` 受理判据的一条 ✓ |
 | `FFRDP_MAX_WAITSND` | 256 | 256（未变 ✓）| 必须 ≥ `INFLIGHT_MAX` 且 ≥ `MAX_CWND_SIZE` ✓ |
 | `FFRDP_RECVBUF_SIZE` / RTO 一族 / QUERY 一族 | — | **未变 ✓** | 见 §2.4 / §2.5 ✓ |
 | `FFRDP_MAX_MSS` 的来源 | `ffrdp.c` 里的字面量 `(1500-8)` | `FFRDP_LOWLEVEL_FRAME_MAX - 6`（`lowlevel.h` 派生）| 帧上限从协议层挪到 lowlevel ✓ |
-| `FFRDP_APP_TX_SIZE` | **没有**（队列容量 = `WAITSND × (MSS+4)` ≈374 KiB）| **独立常量 64 KiB** | **解耦** ✓：省 310 KiB 且吞吐中性 ⇒ 见下面 |
+| `FFRDP_APP_TX_SIZE` | **没有**（队列容量 = `WAITSND × (MSS+4)` ≈374 KiB）| 曾为独立常量 64 KiB，**2026-10-16 整条删除** | 应用线程改为在 `ffrdp_send` 里直接成帧；突发整形由 `FFRDP_UNSENT_MAX`（未发出帧预算）承担 ⇒ 见 §26.15 |
 | `FFRDP_UDPSBUF_SIZE` / `FFRDP_UDPRBUF_SIZE` | `128 × (MSS+6)` 的两个字面宏 | `FFRDP_LOWLEVEL_BUFFER_SIZE` | 只是改名与归属 ✓ |
 | 一圈最多收几帧 | 无（应用循环里 `recvfrom` 就绪就收）| `FFRDP_LOWLEVEL_RX_BATCH_MAX = 2` | 新旋钮（吞吐 / 延迟）|
 | `FFRDP_SELECT_SLEEP` / `SELECT_TIMEOUT` / `USLEEP_TIMEOUT` | 1 / 10000 / 1000 | **删除** | 改由工作线程 + `timer()` 期限驱动 |
@@ -1015,12 +1022,12 @@ v1.1.0 的"上限"是 bufferbloat 实验的起点；v1.2.0 的"上限"**就是**
 
 | 常量 | 当前值 | 说明 |
 |---|---|---|
-| `FFRDP_INFLIGHT_MAX` | **5** | **在途量上限 = 延迟地板**。本链路 BDP ≈ 3 帧 ⇒ 取 5 留余量 ✓。它才是真正的"窗口" |
+| `FFRDP_INFLIGHT_MAX` | **64** | **在途量上限**。取值事先挑不出来（模拟器低于 64 会崩、真机目标链路要 2~6）⇒ 默认取无害值，由探针自己往下试 ✓ |
 | `FFRDP_INFLIGHT_MIN` | **4** | 探针的地板；探针关闭时实际闸门 = `MAX(INFLIGHT_MAX, INFLIGHT_MIN)` |
-| `FFRDP_PROBE_ENABLE` | **0** | 暂时关闭：判据与地板是在"唤醒坏掉"的时期调出来的 ⇒ 重开前先复核（见 §3.2.4.2 第 3 条）|
-| `FFRDP_MAX_CWND_SIZE` | 128（**别动**）| 它同时是 `ffrdp_drain_tx()` 的早退判据（见 §3.2.4.2 第 1 条）|
+| `FFRDP_PROBE_ENABLE` | **1** | 打开：唤醒修复已落定（见 `ffrdp_next_due`），判据也补齐到定稿（§2.3.3.5）✓ |
+| `FFRDP_UNSENT_MAX` | 24 帧（≈32 KB）| 未发出帧预算：接管原应用队列的突发整形；0 = 关（那时 lo 上会崩，见 §26.15）✓ |
+| `FFRDP_MAX_CWND_SIZE` | 128（**别动**）| 它同时是 `ffrdp_send` 受理判据的一条（见 §3.2.4.2 第 1 条）|
 | `FFRDP_MAX_WAITSND` | 256（别动）| 必须 ≥ `INFLIGHT_MAX` 且 ≥ `MAX_CWND_SIZE` ✓ |
-| `FFRDP_APP_TX_SIZE` | 64 KiB（别动）| 只决定"单条消息上限"与背压时机，对吞吐中性 ✓ |
 | `FFRDP_RECVBUF_SIZE` | 128 × MSS（别动）| 它决定我们广告的 `rwnd` ⇒ 要动必须**和对端成对**考虑 ✓ |
 | `FFRDP_MIN_RTO` / `rtt_tail` | 16 ms / 学习值（别动）| 直接决定重传率与真丢包的恢复速度 ✓ |
 | `FFRDP_LOWLEVEL_FRAME_MAX` | 1500（按平台）| 嵌入式**第一个该动**的旋钮 ✓ |
@@ -1030,7 +1037,7 @@ v1.1.0 的"上限"是 bufferbloat 实验的起点；v1.2.0 的"上限"**就是**
 #### 3.2.4.2 四条"别这么改"（都有真机证据）
 
 1. **不要把 `FFRDP_MAX_CWND_SIZE` 跟着窗口一起调小** ✗
-   它同时是 `ffrdp_drain_tx()` 的早退判据（`wait_snd >= MAX_CWND_SIZE` ⇒ 这一圈不再成帧）。
+   它同时是 `ffrdp_send` 受理判据的一条（`wait_snd < MAX_CWND_SIZE` ⇒ 否则拒收）。
    实测把它和窗口一起设成 8 / 16 时：**`inflight` 恒为 0** ✗、两端吞吐塌到 **0.03~0.13 MB/s** ✗。
    **降窗口只改 `INFLIGHT_MAX` / `INFLIGHT_MIN`** ✓。
 2. **不要把窗口设大**（16 / 32 / 128）✗

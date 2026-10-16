@@ -12,10 +12,12 @@
 // for the UDP header on top.
 #define FFRDP_LOWLEVEL_FRAME_MAX 1500
 
-// 这个端点给自己开的收发缓冲大小（字节）：按上面的一帧上限算 128 帧，再给每帧留 6 字节余地 —— 协议层
-// 会在一帧外面套几字节（4 字节帧头 + 2 字节 FEC seq），这里不引用它的宏：那是协议的事，传输层只需要
-// 一个"装得下一段时间里在途的帧"的数。它跟着实现走（UDP 用一个 socket 缓冲，别的后端可能完全没有）。
-#define FFRDP_LOWLEVEL_BUFFER_SIZE (128 * (FFRDP_LOWLEVEL_FRAME_MAX + 6))
+// 这个端点给自己开的收发缓冲大小（字节）：套接字的请求值，**96 KB** —— 内核把请求翻倍后实给约 192 KB，
+// 正好落在 Linux 默认的 rmem_max/wmem_max（208 KB）之内 ⇒ 部署端不必再改 sysctl（旧值 188 KB 反而要求
+// 抬高上限）。96 KB 是实测膝点（见 notes §26.57）：请求 64 KB 时回环只有 15~20 MB/s，96 KB 是 30~42 MB/s，
+// 188 KB 吞吐同带但内存翻倍 ⇒ 每 socket 省 368 KB（收 + 发各一半）。它跟着实现走（UDP 用一个 socket 缓冲，
+// 别的后端可能完全没有）。
+#define FFRDP_LOWLEVEL_BUFFER_SIZE (96 * 1024)
 
 enum {
     FFRDP_LOWLEVEL_TYPE_RECV  = 1,
