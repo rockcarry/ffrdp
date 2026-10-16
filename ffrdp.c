@@ -36,9 +36,24 @@
 #define FFRDP_FRAME_HEAD      4
 #define FFRDP_FRAME_FEC_TAIL  2
 #define FFRDP_FRAME_OVERHEAD  (FFRDP_FRAME_HEAD + FFRDP_FRAME_FEC_TAIL)
-// 单帧载荷上限：由传输层的一帧上限派生（**不再写死 1500**）——减掉最大帧开销，再向下对齐到 4 字节。
-// 1500 - 6 = 1494 ⇒ &~3 = 1492，与旧值 (1500 - 8) 相同 ⇒ 这次只是把来源写清、行为不变。
-#define FFRDP_MAX_MSS       ((FFRDP_LOWLEVEL_FRAME_MAX - FFRDP_FRAME_OVERHEAD) & ~3)
+
+// ── 收 / 发两个 MSS，**必须分开** ─────────────────────────────────────────
+// 背景：lowlevel 是 UDP 实现时，线上字节 = 本层帧 + UDP 8 + IPv4 20 = 帧 + 28。
+//   只按"传输层一帧上限"建帧（1500）时，线上是 1524 > 1500（以太网 MTU）⇒ **每个满帧都被 IP
+//   分片**（丢任一分片 = 整个数据报报废）；根因是 lowlevel.h 的注释只减了 UDP 头、
+//   漏算 IP 头那 20 字节 ✗。
+// FFRDP_MAX_RX_MSS：**能收多大**，**不能缩** ✗ —— 收包节点按它建，超了是**静默截断** ✗，
+//   缩了它，老对端（仍按 1492 发）的满帧会被悄悄切掉尾巴 ⇒ 流被静默改坏 ✗。
+//   1500 - 6 = 1494 ⇒ &~3 = **1492**，与旧值逐字相同 ⇒ **收侧行为不变** ✓。
+// FFRDP_MAX_MSS：**发多大**，再扣掉网络头并对齐 4 字节。取 1464（而不是 1468）是为了让
+//   **FEC 帧**也刚好不出 MTU：普通满帧 4+1464+28 = 1496 ✓、FEC 帧 4+1464+2+28 = 1498 ✓。
+#define FFRDP_NET_HEADER_RESERVE 28   // UDP 8 + IPv4 20
+#define FFRDP_MAX_RX_MSS    ((FFRDP_LOWLEVEL_FRAME_MAX - FFRDP_FRAME_OVERHEAD) & ~3)   // 1492
+#define FFRDP_MAX_MSS       ((FFRDP_MAX_RX_MSS - FFRDP_NET_HEADER_RESERVE) & ~3)       // 1464
+#define FFRDP_ETHERNET_MTU  1500
+#if (FFRDP_MAX_MSS + FFRDP_FRAME_HEAD + FFRDP_FRAME_FEC_TAIL + FFRDP_NET_HEADER_RESERVE) > FFRDP_ETHERNET_MTU
+#error "满 FEC 帧 + UDP/IP 头超过以太网 MTU ⇒ 会 IP 分片：该缩 FFRDP_MAX_MSS（或这条链路上本来就有 jumbo）"
+#endif
 #define FFRDP_MIN_RTO        16   // RTO 硬下限（v1.1.0 原值）。
                                   // 2026-10-12 真机教训：改成的不是这个常数，而是"让 RTO 自己去够到延迟尾部"。
                                   // 真机上原有的 33~55 次/秒伪超时（resend_waste 99.7~100%）不是 RTO 太小，
@@ -162,7 +177,7 @@
 #if FFRDP_RX_WINDOW_FRAMES < 2
 #error "FFRDP_RX_WINDOW_FRAMES 太小（< 2）：窗口至少要让一个在途帧 + 一次回环转起来"
 #endif
-#define FFRDP_RECVBUF_SIZE  (FFRDP_RX_WINDOW_FRAMES * (FFRDP_MAX_MSS + 0))
+#define FFRDP_RECVBUF_SIZE  (FFRDP_RX_WINDOW_FRAMES * (FFRDP_MAX_RX_MSS + 0))   // 收侧容量 ⇒ 按收 MSS 算（用发 MSS 会缩掉窗口）
 // 未发出帧预算：那条 64 KiB 的**应用发送队列**（FFRDP_APP_TX_SIZE / app_tx_buff）已被删除 ——
 // 应用线程现在在 ffrdp_send 里**直接成帧**。队列"替内核做突发整形"那一半职责由这个量接管。
 // 为什么必须是这个量：实测（lo，burst 2）删掉队列后吞吐 35.6 → 3.3 MB/s、重传 0.16% → 5.55%，
@@ -270,7 +285,7 @@ typedef struct {
 
 #if FFRDP_FEC_ENABLE
     uint8_t  fec_txbuf[4 + FFRDP_MAX_MSS + 2];   // 发送侧 XOR 累加器（每个 1498 B，占结构体的大头）
-    uint8_t  fec_rxbuf[4 + FFRDP_MAX_MSS + 2];   // 接收侧 XOR 累加器 / 组内首个 FEC 帧
+    uint8_t  fec_rxbuf[4 + FFRDP_MAX_RX_MSS + 2]; // 接收侧 XOR 累加器 / 组内首个 FEC 帧（按**收** MSS：对端可以比我们发得大）
 #endif
     uint8_t  fec_txredundancy, fec_rxredundancy;
     uint16_t fec_txseq;
@@ -613,7 +628,7 @@ void* ffrdp_init(char *addr, char *txkey, char *rxkey, int server, int smss, int
     ffrdp->ssthresh = FFRDP_DEF_CWND_SIZE;
     ffrdp->rtts     = (uint32_t) -1;
     ffrdp->rto      = FFRDP_MIN_RTO;
-    ffrdp->rmss     = FFRDP_MAX_MSS;
+    ffrdp->rmss     = FFRDP_MAX_RX_MSS;   // rmss 是"对端能发多大"（收到的是多大）⇒ 用收 MSS，不是我们发多大
     ffrdp->smss     = MAX(1, MIN(smss, FFRDP_MAX_MSS));
     ffrdp->fec_txredundancy = FFRDP_FEC_ENABLE ? MAX(0, MIN(sfec, FFRDP_FRAME_TYPE_FEC32)) : 0;  // 关掉 ⇒ 帧不加冗余尾
 #if !FFRDP_FEC_ENABLE
@@ -1621,11 +1636,11 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
             }
             if (!(ffrdp->flags & FLAG_SERVER) || (ffrdp->flags & FLAG_CONNECTED)) {
                 int n = msg->len;
-                FFRDP_FRAME_NODE *node = frame_node_new(FFRDP_FRAME_TYPE_FEC2, FFRDP_MAX_MSS);
+                FFRDP_FRAME_NODE *node = frame_node_new(FFRDP_FRAME_TYPE_FEC2, FFRDP_MAX_RX_MSS);
                 if (!node) ret = -1;
                 else {
                     FFRDP_RX_BATCH b;
-                    // 传输层一帧最大 FFRDP_LOWLEVEL_FRAME_MAX，接收节点按 MSS 建：夹一下，别越界。
+                    // 传输层一帧最大 FFRDP_LOWLEVEL_FRAME_MAX，接收节点按**收** MSS 建：夹一下，别越界。
                     if (n > (int)node->size) n = (int)node->size;
                     memcpy(node->data, msg->buf, (size_t)n);
                     b.recv_una  = ffrdp->recv_seq;
