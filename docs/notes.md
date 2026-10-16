@@ -7,7 +7,8 @@
 每一条结论要么有仿真数据、要么有真机 log 支撑，来源都注明。
 
 > **文档分工**（2026-10 起）：协议规格与优化依据在 [`ffrdp-v1.md`](ffrdp-v1.md)（v1 三代）与 [`ffrdp-v2.md`](ffrdp-v2.md)（v2 接口）；
-> 仿真工具用法在 [`sim-test.md`](sim-test.md)；概述/编译/测试在 [`../readme.zh.md`](../readme.zh.md)。
+> 仿真工具用法在 [`sim-test.md`](sim-test.md)；**音视频（H.265 / VBR）的延迟预算与调优**在
+> [`ffrdp-latency.md`](ffrdp-latency.md)；概述/编译/测试在 [`../readme.zh.md`](../readme.zh.md)。
 > **本文是"过程记录"**：动机、试错、被否路线、每次上机的原始 log —— 有新的调试或工作记录就往这里加。
 
 ---
@@ -1276,7 +1277,7 @@ REF=/path/to/ffrdp.c TESTS=e2e bash tools/sim/run.sh
   以及 `ffrdp.c` 的 md5，比记提交号可靠 ✓；
 - **文档布局**（2026-10 整理）：`readme.zh.md`（概述/编译/测试/目录；另有**英文版** `readme.en.md` ✓）、
   `docs/ffrdp-v1.md`（v1 协议与优化）、`docs/ffrdp-v2.md`（v2 接口 / 握手 / 多客户端 ✓）、
-  `docs/notes.md`（本文）、`docs/sim-test.md`（仿真用法）✓；
+  `docs/notes.md`（本文）、`docs/sim-test.md`（仿真用法）、`docs/ffrdp-latency.md`（音视频延迟预算 ✓）；
 - 上机测任何一步前，**先确认工作区是干净的**（曾经被 `git checkout` 清掉未提交的改动）。
 
 ---
