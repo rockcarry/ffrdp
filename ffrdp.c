@@ -2641,6 +2641,20 @@ static void ffrdp_dump_locked(FFRDPCONTEXT *ffrdp, int conn, int clearhistory)
         FFRDPCONN *c = ffrdp->table[i];
         if (c) ffrdp_dump_conn(ffrdp, c, i, clearhistory);
     }
+    // ①-38：只读读数 —— 那两块"按需分配"的大缓冲**实际分配了多少字节** ✓。
+    // 为什么需要它：省内存这件事不能靠"代码里没调用分配"来声称 ✗，而要能在自己的机器上
+    // 直接看到数字 ✓：空转服务端应打 **0 bytes** ✓（它不使用内嵌 conn 0 ✓）；客户端
+    // 打 ~176 KB ✓（主连接的两块 ✓）；服务端 hs:0 的旧路径真用到 conn 0 时也会出现 ✓。
+    {
+        unsigned long long sum = 0;
+        int n = 0;
+        for (i = 0; i < ffrdp->nconn; i++) {
+            FFRDPCONN *c = ffrdp->table[i];
+            if (c && (c->recv_cap || c->app_tx_cap)) { sum += (unsigned long long)c->recv_cap + c->app_tx_cap; n++; }
+        }
+        printf("conn bufs ①-38      : %llu bytes actually allocated over %d conn(s) — recv(%u)+appq(%u) bytes per conn; a server's embedded conn 0 allocates none\n",
+               sum, n, (unsigned)FFRDP_RECVBUF_SIZE, (unsigned)FFRDP_APP_TX_SIZE);
+    }
 }
 
 // 握手状态的名字（块头要用 ✓）。
