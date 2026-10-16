@@ -1123,7 +1123,10 @@ int ffrdp_send(void *ctxt, int conn, char *buf, int len, int timeout_ms)
     {   int counted = 0;
         for (;;) {
             uint32_t need = (uint32_t)((len + c->smss - 1) / c->smss);
-            if ((!g_unsent || c->tx_unsent + need <= g_unsent) &&
+            // ⚠️ ①-41d：`tx_unsent == 0` 时**总放一条** ✗✓ —— 否则预算比一条消息的帧数还小
+            //    （比如 UNSENT=8 而一条 16KB 消息要 13 帧 ✓）时 `tx_unsent + need > g_unsent` 永远成立
+            //    ⇒ 这条消息永远进不来 ✗✗（lo 实测 UNSENT=8 ⇒ 吞吐掉到 1.5KB/s ✗，就是这个 ✓）。
+            if ((!g_unsent || c->tx_unsent == 0 || c->tx_unsent + need <= g_unsent) &&
                 c->wait_snd < (uint32_t)g_max_cwnd &&
                 need + c->wait_snd <= g_waitsnd) {
                 uint32_t seq0 = c->send_seq;   // ①-26：这一条消息成帧用了几帧 ✓（口径从"每圈"改成"每次 send"✓）
@@ -1853,7 +1856,13 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     //     护栏能打断（实测 0.05 丢包 300 步要 63s、撞 4 次护栏 ✗）。护栏是给仿真兜底的，
     //     不该被当成设计的一部分 ✗。
     //   * 或者发送表里那个"还没首发"的帧，真的落在 tick 这一圈看得见的范围内（序号 < cwnd）。
-    if (((c->send_list_head || c->cur_new_node) && c->wait_snd < (uint32_t)FFRDP_MAX_CWND_SIZE) ||
+    // ⚠️ ①-41c（修正我的 ①-41 的错 ✓）：这里要的是"有**没成帧**的数据 ⇒ 现在跑"（原来是
+    // `c->app_tx_size` ✓ —— drain 一抽干就清零 ✓）。①-41 时我错换成 `send_list_head || cur_new_node` ✗
+    // —— 而 `send_list_head` 装着**所有未确认帧**（整个传输期间恒非空 ✗）⇒ 这句恒真 ⇒ `due=now`
+    // 恒触发 ⇒ 低层被 deadline 以 11.5 万圈/s 反复叫醒、98% 空跑 ✗（lo 实测 laps 187 万、
+    // `arm_timer due <=now` 191 万 ✗）。正确的"新东西没成帧"在无队列版里就是 **tx_unsent > 0**
+    // （已成帧但还没上过线 ✓ —— 那个计数器本来就是为此建的 ✓）。
+    if ((c->tx_unsent > 0 && c->wait_snd < (uint32_t)FFRDP_MAX_CWND_SIZE) ||
         (pending_first && sent_before_pending < (int)c->cwnd)) {
         uint32_t limit = MAX(c->inflight_max ? c->inflight_max : g_inflight_max, (uint32_t)FFRDP_INFLIGHT_MIN);
         // 用本圈刚数出来的 n_sent（= 在途帧数）。不能用 c->inflight_used：它只在 ffrdp_tick_conn
@@ -1888,7 +1897,10 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     if (due && (int32_t)(due - now) < 0) due = now;       // 已经过期 ⇒ 立刻（这也是"快一点"的做法）
     // 兜底：有未确认的帧、或应用队列非空时最多睡 4ms。上面那条判据修好后它不该再触发；
     // 真机上 lap 最大曾到 59/114/222ms，每漏一次小窗口就少送好几帧，而多醒几次只费一点 CPU。
-    if (c->send_list_head || c->cur_new_node) { if (!due || (int32_t)(due - (now + 4)) > 0) due = now + 4; }
+    // ①-41c：master 是 `send_list_head || app_tx_size`（"还没发出去的活儿" ⇒ now+4 ✓）。无队列版里
+    // "没成帧的"不存在了 ✓，而未发出帧本来就在 send_list 里 ✓ ⇒ 只剩 `send_list_head` ✓。
+    // 半帧（cur_new_node）有自己独立的 flush 期限（上面 1786 行 ✓），不该再进这条 nudge ✗。
+    if (c->send_list_head) { if (!due || (int32_t)(due - (now + 4)) > 0) due = now + 4; }
     // 只读记账（①-2）：这一轮把期限设成了什么 ✓
     if (due && (int32_t)(due - now) <= 0) {
         if (armed_now) c->counter_due_now_work++;
