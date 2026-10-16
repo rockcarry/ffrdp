@@ -15,27 +15,19 @@
 #define TEST_STREAM_MAX        (256 * 1024) // 接收侧累积缓冲：ffrdp_recv 是字节流，消息要自己拼回来
 #define TEST_RECV_WAIT_MS       10      // 没有数据时 ffrdp_recv 等这么久：应用侧的节拍点
 
-// 每条消息的格式（全部小端）：
-//   [4B 总长 len][4B seq][payload...][4B crc32]      len = 整条消息字节数（含头尾）
-//   crc32 覆盖 len + seq + payload（不含 crc 自身）
-// ffrdp_recv 是"有序可靠字节流"（没有消息边界），所以必须自带定长头才能解析。
-// ffrdp_send 是原子的（要么整条接受、要么返回 -1），所以 seq 只在 ret == len 时才 +1。
+// 每条消息（全小端）：[4B len][4B seq][payload][4B crc32]；len 含头尾，crc 覆盖 len+seq+payload。
+// ffrdp_recv 是有序字节流（没有消息边界）⇒ 必须自带定长头；ffrdp_send 是原子的 ⇒ 只有 ret == len 时才 seq+1。
 #define TEST_MSG_OVERHEAD        12
 
-// 退出只有一条路：输入 quit / exit（或 stdin 结束）。两个对等端线程看到它之后收尾，
-// 打印 verify 汇总并 ffrdp_free。Ctrl+C 不做任何特殊处理 —— 进程会直接结束（看不到汇总），
-// 这是接受的代价：测试程序不值得为信号路径维护额外逻辑（见 docs/notes.md 5.21）。
+// 退出只有一条路：输入 quit/exit（或 stdin 结束）⇒ 收尾 + verify 汇总 + ffrdp_free；Ctrl+C 直接结束、看不到汇总（接受的代价）。
 static volatile int g_exit = 0;
 static char server_bind_ip[32]   = "0.0.0.0";
 static char client_cnnt_ip[32]   = "127.0.0.1";
 static int  server_bind_port     = 8000;
 static int  client_cnnt_port     = 8000;
-// ①-41 实验：send 被拒后**立刻重试**多少次（env TEST_APP_SENDRETRY ✓；0 = 老行为：下一个循环再说）。
-// 为什么要它：老循环是"发一条 → 进 10ms 超时的 ffrdp_recv"✓ ⇒ 一旦 send 被拒 ✗，要睡一整个
-// 10ms 才回来重试 ✗✗。而 v1.1 的应用**从不阻塞** ✓ ⇒ 它可以直接成帧还跑得很快 ✓（§26.42/§26.43）。
-// ①-41 分支：send 的等待 —— 没有应用队列之后，**反压**该由协议来做 ✓：
-// 帧额不够时睡在 cond 上，等工作线程确认出空位 ✓（而不是立刻被拒 ✗ 让应用回 10ms 的 recv 重试 ✗✗）。
-// 这才是那 32KB 队列真正干的活（反压）的协议化替代品 ✓。
+// ①-41 的两个应用侧旋钮（env ✓，默认 = 老行为 ✓）：
+//   TEST_APP_SENDRETRY：send 被拒后立刻重试几次（0 = 下一个循环再说，会白等一次 10ms 的 recv ✗）；
+//   TEST_APP_SENDWAIT_MS：送进 ffrdp_send 的等待额 —— 队列删掉之后，反压改由协议在 cond 上做 ✓。
 static int  app_sendwait_get(void)
 {
     static int v = -1;
@@ -54,23 +46,16 @@ static int  send_speed           = 0;   // 本进程的发送限速，单位 KB/
 static int  g_idle_sec           = 0;   // FFRDP_IDLE>0：**不发应用数据**，专门验 keepalive 不误杀 ✓
 static int  g_do_close           = 0;   // FFRDP_CLOSE=1：退出前用 ffrdp_close() 主动关（验四次挥手）✓
 static int  g_use_hs             = 1;   // 本侧是否走握手（FFRDP_HS=0 ⇒ 老路径 ⇒ 服务端句柄就是 0 ✓）
-// 2026-10-15（①-22）：应用侧**突发**（只在环境变量 TEST_APP_BURST>0 时打开 ✓）。为什么会缺这个数：
-// v2 的应用循环是"造一条 + 发一条 + 阻塞进带超时的 ffrdp_recv"✗（那个 recv 是**应用侧唯一的等待点** ✓），
-// 而 v1 的应用循环**从不阻塞**（send/recv 无超时 + 每轮 ffrdp_update）✓ ⇒ 三路对照里 v1.1 每圈搬
-// ≈65 KB、v2 只有 ≈8.2 KB ✗，分不清是"应用节拍"还是"协议容量"✗。这个开关就是把前者拆出来 ✓。
-// 默认 0 ⇒ 一个字节的行为都不动 ✓（下面那段整段不执行 ✓）。
+// ①-22：应用侧突发开关（env TEST_APP_BURST>0 才打开 ✓，默认 0 ⇒ 一个字节的行为都不动 ✓）——
+// 用来把"应用节拍"与"协议容量"分开（v1.1 每圈搬 ≈65 KB、v2 ≈8.2 KB ⇒ 混在一起指不出等在哪 ✗）。
 static int  g_app_burst          = 0;
-// 2026-10-15（①-32b）：**应用侧的等待点本身**做成旋钮 ✓。为什么：①-26 之后卡点转回应用 ——
-// 那个"造一条 + 发一条 + 阻塞进带超时的 recv"的节拍里，recv 的超时是最硬的一段 ✗（①-23：
-// 501 次 × 10 ms = 5.1 s / 15 s ✗）。`TEST_APP_RECVWAIT_MS=0` ⇒ 非阻塞 ✓（配 `TEST_APP_SPIN_US`
-// 在没有数据时短睡 ✓，避免空转成 100% CPU ✗）。默认 10 / 0 ⇒ 与现状逐字一致 ✓。
+// ①-32b：应用侧等待点做成旋钮（env TEST_APP_RECVWAIT_MS / TEST_APP_SPIN_US ✓）。默认 10/0 ⇒ 与现状逐字一致 ✓
+//（RECVWAIT=0 ⇒ 非阻塞 ✓；没有数据时 SPIN_US 短睡，免得空转吃满 CPU ✗）。
 static int  g_recv_wait_ms       = TEST_RECV_WAIT_MS;
 static int  g_spin_us            = 0;
 static pthread_mutex_t g_mutex;
 
-// 2026-10-15（①-23）：应用侧的 **µs** 时钟。为什么缺这个数：test.c 只有 ms 口径 ✗，而应用循环
-// 的节奏点（那次带 TEST_RECV_WAIT_MS 超时的 ffrdp_recv ✓）就在 µs 量级 ⇒ 用 ms 只能看到"每轮 0ms"✗。
-// 只读 ✓：不改变任何行为 ✓。
+// ①-23：应用侧的 µs 时钟（只读 ✓）；ms 口径看不出"带超时的 recv"那一段的节奏 ✓。
 static uint32_t app_us(void)
 {
     struct timespec ts;
@@ -103,14 +88,9 @@ static TEST_PEER g_peers[] = {
 
 static uint32_t g_crc_table[256];
 
-// 应用句柄与事件回调（v2）：持着协议锁被调用 ⇒ 只记句柄，绝不回调 ffrdp_* ✓
-// ── 应用句柄的投递队列 ────────────────────────────────────────────────────────
-// 事件回调是在**协议锁里**被调用的 ⇒ 这里只入队（记下句柄 ✓），
-// 绝不在此建线程、也绝不回调 ffrdp_* ✓（会自锁 ✗）。真正的连接循环由服务端
-// 角色线程取走句柄后**另起一个 link 线程**来跑 ⇒ 一个服务端可以同时服务 N 个客户端 ✓。
-// ⚠️ 这里写死字面量：FFRDP_MAXCONN 定义在 ffrdp.c 里（不在 ffrdp.h ✓），
-//    而 test.c 是**独立编译单元**（只链 libffrdp.a ✓）⇒ 拿不到那个宏 ✗。
-//    数值必须与 ffrdp.c 的 FFRDP_MAXCONN 保持一致（连接表上限 ✓）。
+// 应用句柄队列：事件回调是在**协议锁里**被调用的 ⇒ 这里只入队 ✓（绝不回调 ffrdp_* ✗ 会自锁 ✓）；
+// 服务端另起 link 线程取走句柄 ⇒ 一个服务端能同时服务 N 个客户端 ✓。
+// ⚠️ 下面写死的 64 必须与 ffrdp.c 的 FFRDP_MAXCONN 一致 —— 那个宏不在头文件里（test.c 是独立编译单元 ✓）。
 #define TEST_MAX_LINK   16     // = ffrdp.c 的 FFRDP_MAXCONN
 static pthread_mutex_t g_accept_lock = PTHREAD_MUTEX_INITIALIZER;
 static int  g_accept_q[TEST_MAX_LINK];
@@ -197,10 +177,8 @@ typedef struct {
     uint32_t seq_gap, seq_missing;    // 序号缺口次数 / 累计缺失条数
     uint32_t crc_err, len_err, partial_err;
     uint32_t log_seq, log_crc, log_len, log_part; // 每类错误的打印计数（限流用）
-    // 2026-10-15（§26.30 步骤1-①）：应用侧在队列闸门上**等了多久** ✓。为什么缺这个数：ffrdp_send
-    // 传的是 0（不等待 ✓），"等待"在这里表现为"同一条消息被下一轮原样重试"✗ ⇒ 从第一次被拒到最后
-    // 被接受的那段时间，就是应用真实付出的代价 ✓（重试节拍由那次带超时的 recv 提供 = 10ms ✓）。
-    // 纯计数 ✓，不改行为 ✗。
+    // 应用在闸门上等了多久（只读 ✓）：从第一次被拒到最后被接受的那段 = 应用真实付出的代价 ✓
+    //（重试的节拍由那次带超时的 recv 提供 ✓）。
     uint32_t send_retries;      // 被拒的总次数（同一条消息可能被拒多次 ✓）
     uint32_t send_wait_msgs;    // 等过（被拒 >= 1 次）的消息条数 ✓
     uint32_t send_wait_ms;      // 等待时长之和（ms ✓）
@@ -251,19 +229,15 @@ static int msg_parse(TEST_VERIFY *v, const char *name, const char *peer, const u
     return off;
 }
 
-// 对端是否已失联：协议自己这么判定，或者我们已经很久没收到它的任何数据。
-// 两侧用同一个判据（历史上只有客户端有"看多久没收到数据"这一半）。
+// 对端是否已失联（两侧同一判据：协议自己这么判，或我们已经很久没收到它的任何数据 ✓）。
 static int peer_is_lost(void *ffrdp, int handle, uint32_t tick_recv)
 {
     if (ffrdp_isdead(ffrdp, handle)) return 1;       // 按句柄问（v2：一个上下文 → N 条连接 ✓）
     return (int32_t)get_timestamp32_ms() - (int32_t)tick_recv > TEST_PEER_SILENCE_MS;
 }
 
-// 一条连接上的应用循环（原 peer_thread 的主体 ✓，改成"句柄化"）：
-//   * ffrdp / handle / peer 都由调用方给（服务端一个上下文要同时跑 N 条 ✓）；
-//   * 返回 1 = **这条连接断了**（客户端据此重建 ✓；服务端不需要重建 ✓）；
-//   * 返回 0 = 收到 quit（整个角色收工 ✓）。
-// owns_ctx=1 只给"自己拥有这个上下文"的那条（客户端 ✓）：只有它负责 ffrdp_exit ✓。
+// 一条连接上的应用循环：ffrdp/handle/peer 由调用方给（服务端一个上下文要同时跑 N 条 ✓）；
+// 返回 1 = 这条断了（客户端据此重建 ✓）、返回 0 = 收到 quit；owns_ctx=1 的那条负责 ffrdp_exit ✓。
 struct link_arg {
     void           *ffrdp;
     int             handle;
@@ -283,9 +257,7 @@ static int link_loop(struct link_arg *a)
     uint32_t tick_dump, tick_recv = 0, tick_speed, tokens, rnd = 0x12345678u, seq = 1;
     uint32_t tick_msg_first = 0, msg_retries = 0;   // 只读（§26.30 ①-①）：这一条消息的首次尝试时刻 / 被拒次数 ✓
     int      ret, connected = 0, stream_len = 0, msg_len = 0, max_payload, hb = 0, lost = 0;
-    // ①-23：应用循环的账（只读 ✓）。为什么会缺这个数：应用是"造一条 + 发一条 + 带超时的 recv"✗，
-    // 而 dump 里全是协议侧的低层/协议圈 ✗ ⇒ "谁在等"在**应用这一格**上是空的 ✗（§26.42 只量到
-    // "应用与 v1.1 差 9 倍圈率"，指不出等在哪一步 ✓）。
+    // ①-23：应用循环的账（只读 ✓）—— dump 里全是协议侧 ⇒ "谁在等"在应用这一格本来是空的 ✗。
     uint32_t loop_iters = 0, t_loop0 = 0, t_loop1 = 0, t_w;
     uint32_t rd_n = 0, rd_us = 0, re_n = 0, re_us = 0, rf_n = 0, rf_us = 0;
     TEST_VERIFY v;
@@ -316,8 +288,7 @@ static int link_loop(struct link_arg *a)
             }
         }
 
-        // ①-22：把"应用每周起一次、只塞一条"这个节拍拆开的开关 ✓。放在"造消息"**之前** ✓（原来放在后面 ✗ ⇒ 进循环体时 msg_len 已经 >0 ⇒ 一次都不跑 ✗ —— 实测踩过 ✓）
-        // 且 g_app_burst>1 时进入 ✓ ⇒ 默认整段跳过 ✓。被拒就立刻退出，节拍交回下面那次带超时的 recv ✓。
+        // ①-22：这个开关要放在"造消息"**之前** ✓（原来放后面 ⇒ 进循环体时 msg_len 已 >0 ⇒ 一次都不跑 ✗，实测踩过 ✓）。
         if (!g_idle_sec && g_app_burst > 1) {
             int k;
             for (k = 1; k < g_app_burst && !g_exit && msg_len == 0; k++) {
@@ -358,8 +329,7 @@ static int link_loop(struct link_arg *a)
         }
 
         if (msg_len > 0) {
-            // 传 0（不等待）：这个测试的背压方式就是"队列满就下一轮原样重试这一条"，
-            // 重试的节拍由下面那次带超时的 ffrdp_recv 提供 ✓。
+            // 传 0（不等待）：这个测试的背压方式是"被拒就下一轮原样重试"，节拍由那次带超时的 recv 提供 ✓。
             ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, app_sendwait_get());
             {   int t = app_sendretry_get();   // ①-41 实验：被拒立刻重试（0 = 关 ✓）
                 while (ret < 0 && t-- > 0) ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, app_sendwait_get());
@@ -463,19 +433,15 @@ done:
     } else if (v.recv_msgs) {
         printf("[%s] verify: OK -- received %u messages, seq contiguous and crc all correct\n", peer->name, v.recv_msgs);
     }
-    // 2026-10-15（§26.36 ①-16）：**退出时**也打一次全表 ✓。为什么缺：原来的 dump 由"收到数据"触发
-    //（每 10s ✓），而对端走了以后就没有任何数据了 ✗ ⇒ 收尾那一段（客户端先退、服务端多活 ⇒ 实测
-    // 回环 8s 里低层转了 129 万圈 ✗、真机 server 的 fire 是 timer 的 10 倍 ✗）在**协议侧账上根本
-    // 不存在** ✗ —— 这就是"账被输出时点挡住"的第三次 ✓（§26.26 两次 ✓）。纯输出侧 ✓，放在 verify
-    // 之后、close 之前 ⇒ 走 close 的场景也拿得到 ✓。
+    // ①-16：**退出时**也打一次全表 —— 对端走了之后就没有任何数据 ✗ ⇒ 收尾那一段在协议账上原本不存在（"账被输出时点挡住" ✓）；
+    // 放在 verify 之后、close 之前 ⇒ 走 close 的场景也拿得到 ✓。
     if (ffrdp) {
         printf("[%s] --- exit dump (protocol counters; includes the teardown tail) ---\n", peer->name);
         fflush(stdout);
         pthread_mutex_lock(&g_mutex); ffrdp_dump(ffrdp, -1, 0); pthread_mutex_unlock(&g_mutex);
     }
     if (g_do_close && ffrdp) {
-        // 主动关闭（验四次挥手）：ffrdp_close ⇒ 我方发 FIN ⇒ 对端回 FIN ⇒ 双方各自 DISCONN ✓。
-        // ⚠️ 只有走握手的连接才有 FIN ✓（hs:0 下没有 FIN ⇒ 只做本地拆除 ✓，见 ffrdp.h ✓）。
+        // 主动关闭（验四次挥手）：ffrdp_close ⇒ 我方 FIN ⇒ 对端 FIN ⇒ 各自 DISCONN ✓；⚠️ hs:0 下没有 FIN（只做本地拆除 ✓）。
         int r = ffrdp_close(ffrdp, handle);
         int t0 = (int)get_timestamp32_ms();
         char tmp[512];
@@ -512,10 +478,8 @@ static void* link_thread(void *param)
     return NULL;
 }
 
-// 角色入口：
-//   客户端 ⇒ 建上下文、跑**唯一那条**主连接（handle 0 ✓）；丢了就重建（与以前一致 ✓）。
-//   服务端 ⇒ 建上下文后就只做"取句柄、起 link 线程"（主连接不参与收发 ✓），
-//             收到 quit 时 join 全部 link 线程 ✓。
+// 角色入口：客户端 ⇒ 建上下文 + 跑唯一那条主连接（handle 0 ✓），丢了就重建 ✓；
+// 服务端 ⇒ 只做"取句柄、起 link 线程"（主连接不参与收发 ✓），收到 quit 时 join 全部 link 线程 ✓。
 static void* peer_thread(void *param)
 {
     const TEST_PEER *peer = (const TEST_PEER*)param;
@@ -528,9 +492,7 @@ static void* peer_thread(void *param)
             char addr[80];
             snprintf(addr, sizeof(addr), "%s:%d", peer->ip, *peer->port);
             {
-                // v2 接口：角色进 scheme，smss/sfec 进配置串（v1 是位置参数）。
-                // FFRDP_HS（真机排查/A-B 用）：0 ⇒ 强制老路径 hs:0；1 ⇒ 强制握手；
-                // 不设 ⇒ 跟随协议默认（v2 起默认就是握手）。远端的 v1 二进制不认这个键 ⇒ 只影响本侧 ✓。
+                // v2 接口：角色进 scheme、smss/sfec 进配置串 ✓；FFRDP_HS（A/B 用）0 ⇒ 老路径、1 ⇒ 强制握手、不设 ⇒ 跟随默认 ✓。
                 char params[160];
                 const char *hs = getenv("FFRDP_HS");
                 snprintf(params, sizeof(params), "%s://%s,mss:1280,fec:0%s",
@@ -547,16 +509,14 @@ static void* peer_thread(void *param)
             // 客户端：只有主连接（handle 0 ✓）⇒ 直接在本线程里跑 ✓
             struct link_arg a;
             a.ffrdp = ffrdp; a.handle = 0; a.peer = peer; a.is_server = 0; a.owns_ctx = 1;
-            // ⚠️ owns_ctx=1 ⇒ link_loop 自己已经 ffrdp_exit 了 ✓，这里**绝不能再退一次** ✗
-            //   （实测：再退一次 ⇒ 进程在退出时 SIGSEGV ✓，而数据判据全是 OK ⇒ 很难从日志看出来 ✗）。
+            // ⚠️ owns_ctx=1 ⇒ link_loop 自己已经 ffrdp_exit ⇒ 这里**绝不能再退一次**（再退一次会在进程退出时 SIGSEGV ✗）。
             link_loop(&a);
             ffrdp = NULL;
             if (g_exit) break;
             continue;                               // 断了 ⇒ 重建（原来的行为 ✓）
         }
 
-        // ⚠️ hs:0（老路径）下协议**不发 ACCEPT** ⇒ 服务端的应用句柄就是 0 ✓，
-        //    必须照旧直接在 0 号上收发（否则受控 A/B 里那一路就整个哑掉 ✗）。
+        // ⚠️ hs:0（老路径）下协议**不发 ACCEPT** ⇒ 服务端的应用句柄就是 0，必须照旧直接在 0 号上收发 ✓。
         if (!g_use_hs) {
             struct link_arg a;
             a.ffrdp = ffrdp; a.handle = 0; a.peer = peer; a.is_server = 1; a.owns_ctx = 1;
@@ -584,9 +544,7 @@ static void* peer_thread(void *param)
 
     for (i = 0; i < nlink; i++) pthread_join(links[i], NULL);
     if (ffrdp) {
-        // 2026-10-15（§26.36 ①-16b）：上下文拆掉**前一刻**再打一次 ✓。为什么还要这一次：link_loop 一旦
-        // 退（对端静默 ⇒ lost ✓，实测 18s ✓）就再也没有 dump 触发了 ✗，而低层在那之后还在转
-        //（实测这一段 5 s 里 120 万圈 ✗）⇒ 账必须打到这里才闭合 ✓（第三次"账被输出时点挡住"✓）。
+        // ①-16b：上下文拆掉**前一刻**再打一次 —— link_loop 退掉后就再没有 dump 触发 ✗，而低层还在转 ⇒ 账打到这里才闭合 ✓。
         printf("[%s] --- final dump (right before ffrdp_exit) ---\n", peer->name);
         fflush(stdout);
         pthread_mutex_lock(&g_mutex); ffrdp_dump(ffrdp, -1, 0); pthread_mutex_unlock(&g_mutex);
@@ -628,8 +586,7 @@ int main(int argc, char *argv[])
         if (strstr(argv[i], "--server=") == argv[i]) {
             server_en = 1;
             if (strcmp(argv[i] + 9, "") != 0) {
-                // snprintf 而不是 strncpy：源串可能比目标长，strncpy 会把 32 字节填满而不留
-                // 结尾的 0（-O2 下 gcc 的 -Wstringop-truncation 就会拦下它）。
+                // snprintf 而不是 strncpy：源串可能比目标长 ⇒ strncpy 会填满 32 字节而不留结尾的 0（-O2 下 -Wstringop-truncation 拦下 ✓）。
                 snprintf(server_bind_ip, sizeof(server_bind_ip), "%s", argv[i] + 9);
             }
         } else if (strstr(argv[i], "--client=") == argv[i]) {
@@ -695,8 +652,7 @@ int main(int argc, char *argv[])
     // 退出只认 quit / exit，或 stdin 结束（Ctrl+D、管道关闭）—— 后者在脚本里跑很有用。
     while (!g_exit) {
         char cmd[256];
-        // %255s：宽度必须比缓冲区小一个字节，否则一个 256 字符的输入就会把那一个 NUL 写到栈上（ASAN 报
-        // 的就是这个：WRITE of size 257）。这个 bug 与协议无关，是在这次验证里被撞出来的。
+        // %255s：宽度必须比缓冲区小一个字节 ⇒ 否则 256 字符的输入会把那个 NUL 写到栈上（ASAN 就是这么报的 ✓）。
         if (scanf("%255s", cmd) != 1) break;
         if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) g_exit = 1;
     }
