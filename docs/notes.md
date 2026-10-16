@@ -4961,3 +4961,28 @@ t_cwnd/t_pseudo 读 ✓）⇒ **那些不能删** ✗（删了会丢覆盖 ✓�
 **T2b 还剩** ✓（按同样判据，逐个来 ✓）：**b** 每圈产出/工作量（`lap work ①-26`、`lap period`、`lap output` ✓，
 约 20 个计数器 + 一个较大的账本块 ✓）；**c** 窗口/信用显微学（`in-flight occupancy`/`cap-block detail`/
 `cap wait`/`credit wait`/`ack coverage` ✓）；**d** CC 站点点名（`cc sites ①-29` ✓）。
+
+### 26.68 代码瘦身 T2b-b：删掉“每圈产出/工作量”（①-5/①-26）这批一次性仪器（-87 行；sizeof(conn) -112 B ✓）（2026-10-16 晚）✔
+
+承 §26.67 的同一判据（按语义删"一次性调查仪表" ✓），这次是**最大的一块**：lo 上查"每圈只发 ≈2 帧"时
+留下的三组桶 ✓ —— 删 29 个计数器（`counter_upd_cnt`/`counter_upd_gap`/`counter_upd_gap_max`/
+`counter_upd_cost_max` ✓、`counter_lap_sent0/1/N` ✓、`counter_dr0/1/2/M` ✓、`counter_ls0/1/2/3/5` ✓、
+`counter_sp_list/cwnd/cap/swnd0/other` ✓、`counter_ll0/2/8/M` ✓）、3 条 dump 行、以及**只为它们存在的账本**：
+
+- `tick_last_upd`/`lap_sent_ref`/`cap_ref`/`counter_upd_gap_max`/`counter_upd_cost_max` 五个状态字段 ✓
+  （前三个只在被删的账本里用 ✓ ⇒ 留着就是 set-but-unused ✗）
+- `ffrdp_tick_conn` 里的"上一圈结算"整块（含 `s_now`/`lap_sent_ref` 快照 ✓）、"每圈 gap"块、
+  "每圈耗时"块 ✓（后两者是 `tick_last_upd` 的唯一消费者 ✓）
+- `ffrdp_send` 里"这一条消息成帧了几帧"的 `seq0`/`d` 账 ✓
+- 快照变量 `cap0`/`sw0`（`s0` 留下 ✓ —— 它还给 ①-41e 的 `tx_stalled` 供数 ✓）
+
+**⚠️ 保留 ①-41e 的真逻辑** ✓：发送循环那个 `{ ... }` 块里，除了桶之外还有
+`if (d == 0 && p) c->tx_stalled = 1; else if (d > 0) c->tx_stalled = 0;` ✓ —— 那是慢 AP 空转的修复 ✓，
+**不是仪器** ✓ ⇒ 只删桶、保留 `d` 与 `tx_stalled` ✓（这次最需要小心的一处 ✓）。
+
+**实测** ✓：`ffrdp.c` 3010 → **2923 行**（−87 ✓）；`sizeof(FFRDPCONN)`（DIAG=1）3960 → **3848 B**（−112 ✓）；
+`ffrdp.o` 46 642 → **44 275**（DIAG=1 ✓）/ 27 702 → 27 243（DIAG=0 ✓）；lo 冒烟 61.0 MB/s / 重传 0.08% ✓；
+判据 **8/8 PASS** ✓（1016-160045 ✓）；两版 `-Wall -Werror` 干净 ✓。
+
+**T2b 还剩** ✓：**c** 窗口/信用显微学（`in-flight occupancy`/`cap-block detail`/`cap wait`/`credit wait`/
+`ack coverage` ✓）；**d** CC 站点点名（`cc sites ①-29` ✓）。

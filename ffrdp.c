@@ -354,21 +354,14 @@ typedef struct {
     uint32_t counter_ack_recv   ; // ack frames received
     uint32_t rtt_min;             // lowest round trip seen this interval: the path's floor, the number to judge latency by
     uint32_t inflight_used;       // frames actually on the wire (recounted every pass): what step29 limits
-    // 下面这几个量的是工作线程"每圈"（lap）的节奏。名字里的 upd 是旧版留下的：那时协议由应用每轮调
-    // ffrdp_update 驱动，现在由 lowlevel 的 TIMER 回调驱动，量的是同一件事的另一种来源。
-    uint32_t tick_last_upd  ;     // tick of the previous lap
-    uint32_t counter_upd_gap_max; // longest gap between two laps, in ms
-    uint32_t lap_sent_ref;        // 上一圈结束时的(首发+重传)计数快照（0 = 还没结算过 ✓）
     uint32_t counter_to_dmax;
     uint32_t tx_woken;               // ①-35c："已经叫过、工作线程还没跑过" ✓（①-41：改由 tick 末尾清零 ✓）
     uint32_t counter_cut_max;     // 单帧最多被减半几次 ✓
     uint32_t counter_swnd_wait_max; // 最长的一个 episode（ms）
     uint32_t tick_swnd_starve;      // 当前 episode 的起点（0 = 不在 episode 里 ✓）
     uint32_t rx_frames_ref;        // 上一条 ack 时的 counter_rxfull 快照 ✓
-    uint32_t cap_ref;              // 上一圈结算时的 counter_capblock 快照 ✓
     uint32_t counter_cap_wait_max; // ... 最长（ms ✓）
     uint32_t tick_cap_starve;      // 当前 episode 的起点（0 = 不在 episode 里 ✓）
-    uint32_t counter_upd_cost_max;// longest time spent inside one lap, in ms
     uint32_t ack_una;             // last una seen in an ack frame
     uint32_t counter_conf_max;    // 见过的最大原始 confirm 等待（ms ✓）
     uint32_t counter_to_age_max;  // 超时时"距首发"的最大毫秒数
@@ -471,23 +464,6 @@ typedef struct {
 
     uint32_t counter_rto_backoff; // times the rto was multiplied
     uint32_t counter_timeout_evt; // laps in which at least one frame timed out
-    uint32_t counter_upd_cnt;     // number of laps
-    uint32_t counter_upd_gap;     // sum of the gaps between laps, in ms
-    // 2026-10-15（①-5）：上一圈**发出去几帧** ✓。为什么缺这个数：真机服务端 656k 次 fire
-    //（期限说"现在有活"）却只发了约 70k 帧 ✗ ⇒ 90% 的整 tick 一帧都发不出去 ✗，而
-    // `ffrdp_next_due` 的 `armed_now` 判据却一直判"有活" ⇒ 两者并不真的对齐（同 §26.21 那类病 ✓）。
-    // 纯计数 ✓：lap_sent_ref 是上一圈的快照（0 当哨兵 ✓），四个桶只加不清 ✓。
-    uint32_t counter_lap_sent0;   // 上一圈一帧都没发出去 ✗（模型却要求"现在"）
-    uint32_t counter_lap_sent1;   // 上一圈发出去 1 帧 ✓
-    uint32_t counter_lap_sentN;   // 上一圈发出去 >= 2 帧 ✓
-    // 2026-10-15（①-26）：每个协议圈**干了多少活** + **为什么停** ✓。为什么缺这个数：§26.45 把两个
-    // 候选（ack 时机 / RX 批上限）都排除之后，剩下的事实只有一条 —— 每圈只往线上放 ≈2 帧 ✗，而
-    // `cwnd=128` / 在途上限 64 / `swnd` 充足 / 三个闸门全 0 ✓ ⇒ **分不出**是"没人喂进表"还是
-    // "喂了却发不出去" ✗。四组桶各自独立 ✓，纯计数 ✓，不改行为 ✗。
-    uint32_t counter_dr0, counter_dr1, counter_dr2, counter_drM;      // 这一圈 drain_tx 成帧了几帧（口径 = send_seq 差 ✓）
-    uint32_t counter_ls0, counter_ls1, counter_ls2, counter_ls3, counter_ls5;  // 这一圈发出几帧
-    uint32_t counter_sp_list, counter_sp_cwnd, counter_sp_cap, counter_sp_swnd0, counter_sp_other;  // 发送循环停在哪一条
-    uint32_t counter_ll0, counter_ll2, counter_ll8, counter_llM;      // 圈末在途表长（0 / 1-2 / 3-8 / >=9 ✓）
     // 2026-10-15（①-28 A）：超时帧**距 ack 的 una 多远** ✓ + 在不在 ack 的 24 位位图里 ✓。
     // 为什么缺这个数：零丢包的 lo 上 100% 的超时是伪超时 ✓，但"为什么 ack 没覆盖它"没有数 ✗ ——
     // ack 报的是 una + 24 位位图（`ffrdp_apply_acks` 里 `for (i=23; ...)` ✓）⇒ 若窗口一大、帧跑到
@@ -1124,14 +1100,7 @@ int ffrdp_send(void *ctxt, int conn, char *buf, int len, int timeout_ms)
             if ((!FFRDP_UNSENT_MAX || c->tx_unsent == 0 || c->tx_unsent + need <= FFRDP_UNSENT_MAX) &&
                 c->wait_snd < (uint32_t)FFRDP_MAX_CWND_SIZE &&
                 need + c->wait_snd <= FFRDP_MAX_WAITSND) {
-                uint32_t seq0 = c->send_seq;   // ①-26：这一条消息成帧用了几帧 ✓（口径从"每圈"改成"每次 send"✓）
                 rc = ffrdp_frame_message(ffrdp, c, (const uint8_t*)buf, len);   // 原子 ✓：整条或一个字节都不收
-                {   uint32_t d = c->send_seq - seq0;
-                    if      (d == 0) FFRDP_CNT(c, counter_dr0);
-                    else if (d == 1) FFRDP_CNT(c, counter_dr1);
-                    else if (d == 2) FFRDP_CNT(c, counter_dr2);
-                    else             FFRDP_CNT(c, counter_drM);
-                }
                 if (rc > 0) break;                              // 整条被接受 ✓
                 rc = FFRDP_EAGAIN;                              // 节点分配失败 ⇒ 稍后重试（计数由 out: 统一记 ✓）
             } else if (!counted) { FFRDP_CNT(c, counter_refuse_wnd); counted = 1; }
@@ -1942,7 +1911,7 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     int32_t got_timeout = 0, i;
     uint8_t data[8];
     // ①-26（只读 ✓）：这一圈的入口快照
-    uint32_t s0 = 0, cap0 = 0, sw0 = 0;
+    uint32_t s0 = 0;   // 本圈开始时"已发帧数"的快照（①-41e 的 tx_stalled 判据 ✓）
     // ①-41：成帧已经在 ffrdp_send（应用线程）里做完 ⇒ 这里不再 drain ✓。
     // ①-35c：应用喊过"叫醒"、这一轮工作线程已经跑过 ⇒ 允许它下次再喊 ✓（原来的清零点在 drain 里 ✓）。
     c->tx_woken = 0;
@@ -1967,31 +1936,6 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             FFRDP_CNT(c, counter_send_query);
         }
     }
-    // how fast the work thread comes round: a starved lap delays acks and retransmits exactly
-    // like a congested network does, and the two need to be told apart.
-    FFRDP_CNT(c, counter_upd_cnt);
-    {   // 只读（①-5）：结算**上一圈**的产出 —— 模型说"现在有活"时，它到底发出去了几帧 ✗
-        uint32_t s_now = c->counter_send_1sttime + c->counter_resend_rto + c->counter_resend_fast;
-        // ⚠️ 2026-10-15 修：原来拿 1 当 0 的哨兵（`s_now ? s_now : 1` ✗）⇒ 对**一帧都没发过的
-        //    内嵌槽**（服务端 0 号 ✓）会无符号下溢 ✗ ⇒ 它那行被打成 ">=2 帧"（真机实测过 ✓）。
-        //    现在：0 = 这个连接还没发过任何帧 ✓ ⇒ 两侧都非零才算一圈 ✓（丢掉第一圈，可忽略 ✓）。
-        if (s_now && c->lap_sent_ref) {
-            uint32_t d = s_now - c->lap_sent_ref;
-            if (d == 0)      FFRDP_CNT(c, counter_lap_sent0);
-            else if (d == 1) FFRDP_CNT(c, counter_lap_sent1);
-            else             FFRDP_CNT(c, counter_lap_sentN);
-            // 只读（§26.30 ④-15）：这一圈被闸门挡过、而且**一帧都没出去** ⇒ 闸门直接掐住 ✓（最硬的证据 ✓）
-            if (c->counter_capblock != c->cap_ref && d == 0) FFRDP_CNT(c, counter_capb_nosend);
-        }
-        c->cap_ref = c->counter_capblock;
-        c->lap_sent_ref = s_now;
-    }
-    if (c->tick_last_upd) {
-        uint32_t gap = get_timestamp32_ms() - c->tick_last_upd;
-        FFRDP_CNT_ADD(c, counter_upd_gap, gap);
-        if (gap > c->counter_upd_gap_max) c->counter_upd_gap_max = gap;
-    }
-    c->tick_last_upd = get_timestamp32_ms();
 
     if (c->cur_new_node && ((int32_t)get_timestamp32_ms() - (int32_t)c->cur_new_tick > FFRDP_FLUSH_TIMEOUT || c->flags & FLAG_FLUSH)) {
         c->cur_new_node->data[0] = FFRDP_FRAME_TYPE_SHORT;
@@ -2011,8 +1955,7 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         FFRDP_CNT_ADD(c, counter_limit_sum, MAX(c->inflight_max ? c->inflight_max : FFRDP_INFLIGHT_MAX, (uint32_t)FFRDP_INFLIGHT_MIN));
         FFRDP_CNT(c, counter_inflight_n);
     }
-    s0   = c->counter_send_1sttime + c->counter_resend_rto + c->counter_resend_fast;   // ①-26
-    cap0 = c->counter_capblock; sw0 = c->counter_swnd0;                                // ①-26
+    s0 = c->counter_send_1sttime + c->counter_resend_rto + c->counter_resend_fast;
     for (i = 0, p = c->send_list_head; i < (int32_t)c->cwnd && p; i++, p = p->next) {
         if (!(p->flags & FLAG_FIRST_SEND)) { // first send
             // 顺序：先看信用、再看在途闸门。反过来的话，在途一满就 break，谁都到不了下面那条"要窗口"
@@ -2122,23 +2065,8 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             p->tick_timeout+= c->rto;
         }
     }
-    {   // ①-26：这一圈发了几帧 + 循环停在哪一条 + 圈末在途表长 ✓（纯计数 ✓）
+    {   // ①-41e（无队列版的空转修复 ✓）：这一圈"有活却被闸门挡住、一帧没发" ⇒ tx_stalled=1 ⇒
         uint32_t d = (c->counter_send_1sttime + c->counter_resend_rto + c->counter_resend_fast) - s0;
-        if      (d == 0) FFRDP_CNT(c, counter_ls0);
-        else if (d == 1) FFRDP_CNT(c, counter_ls1);
-        else if (d == 2) FFRDP_CNT(c, counter_ls2);
-        else if (d <= 4) FFRDP_CNT(c, counter_ls3);
-        else             FFRDP_CNT(c, counter_ls5);
-        if      (!p)                          FFRDP_CNT(c, counter_sp_list);   // 表走完了 ⇒ 没得发
-        else if (i >= (int32_t)c->cwnd)       FFRDP_CNT(c, counter_sp_cwnd);
-        else if (c->counter_capblock  > cap0) FFRDP_CNT(c, counter_sp_cap);
-        else if (c->counter_swnd0     > sw0)  FFRDP_CNT(c, counter_sp_swnd0);
-        else                                  FFRDP_CNT(c, counter_sp_other);
-        if      (c->inflight_used == 0)       FFRDP_CNT(c, counter_ll0);
-        else if (c->inflight_used <= 2)       FFRDP_CNT(c, counter_ll2);
-        else if (c->inflight_used <= 8)       FFRDP_CNT(c, counter_ll8);
-        else                                  FFRDP_CNT(c, counter_llM);
-        // ①-41e（无队列版的空转修复 ✓）：这一圈"有活却被闸门挡住、一帧没发" ⇒ tx_stalled=1 ⇒
         // next_due 别再急着要"现在" ✓。判据：d==0（没发 ✓）且 p 非空（循环被闸门**打断**，
         // 不是表走完了 ✓ —— 表走完是没活，那不叫被挡 ✓）。有进展（d>0）⇒ 解除 ✓。
         if (d == 0 && p) c->tx_stalled = 1;
@@ -2375,10 +2303,6 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                 c->cap         = c->cap_kept;
             }
         }
-    }
-    {   // cost of one pass, so a slow application or a slow peer can be told apart from a slow link
-        uint32_t cost = get_timestamp32_ms() - c->tick_last_upd;
-        if (cost > c->counter_upd_cost_max) c->counter_upd_cost_max = cost;
     }
 }
 
@@ -2706,8 +2630,7 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     //    就必须打全块 ✓。
     if (c->hs_state == 0 && !(c->flags & FLAG_CONNECTED) &&
         c->send_seq == 0 && c->recv_seq == 0 &&
-        c->counter_send_bytes == 0 && c->counter_recv_bytes == 0 &&
-        c->counter_upd_cnt == 0) {
+        c->counter_send_bytes == 0 && c->counter_recv_bytes == 0) {
         printf("\n---- conn %d   %s   idle: never talked about AND ran no lap (only this line) ----\n", handle, addr);
         goto done;
     }
@@ -2888,19 +2811,9 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
            c->counter_conf_max);
     printf("rto_floor           : %u, rtt_tail %u ms\n"  , c->rto_floor, c->rtt_tail); // 白费率见上面的 counter_resend_waste（同一个量，不再打两遍）
     printf("counter_rto_behind  : %u\n"  , c->counter_rto_behind  );
-    printf("lap period avgmax   : %u, %u ms (%u laps, cost max %u ms)\n",
-           c->counter_upd_gap / MAX(c->counter_upd_cnt - 1, 1), c->counter_upd_gap_max,
-           c->counter_upd_cnt, c->counter_upd_cost_max);
-    // ①-5：每圈产出 —— sent0 就是"期限说现在有活、却一帧没发"的那类圈 ✗
-    printf("lap output sent     : 0 frames %u, 1 frame %u, >=2 frames %u (0 means a lap that was asked to go now and put nothing on the wire)\n",
-           c->counter_lap_sent0, c->counter_lap_sent1, c->counter_lap_sentN);
-    // ①-6：TIMER 分支哪一支 × 期限模型哪一档 ✓（ack-only 不跑整圈 ⇒ 不进协议圈数 ✓）
-    printf("lap work ①-26       : framed/send 0/%u 1/%u 2/%u >=3/%u | sent 0/%u 1/%u 2/%u 3-4/%u >=5/%u | stop: list-empty %u, cwnd %u, inflight-cap %u, swnd0 %u, other %u | end in-flight 0/%u 1-2/%u 3-8/%u >=9/%u\n",
-           c->counter_dr0, c->counter_dr1, c->counter_dr2, c->counter_drM,
-           c->counter_ls0, c->counter_ls1, c->counter_ls2, c->counter_ls3, c->counter_ls5,
-           c->counter_sp_list, c->counter_sp_cwnd, c->counter_sp_cap, c->counter_sp_swnd0, c->counter_sp_other,
-           c->counter_ll0, c->counter_ll2, c->counter_ll8, c->counter_llM);
-    printf("timer branch        : ack-only %u, full-tick %u (ack-only runs no lap, so fires can far exceed laps)\n",
+        // ①-5：每圈产出 —— sent0 就是"期限说现在有活、却一帧没发"的那类圈 ✗
+        // ①-6：TIMER 分支哪一支 × 期限模型哪一档 ✓（ack-only 不跑整圈 ⇒ 不进协议圈数 ✓）
+        printf("timer branch        : ack-only %u, full-tick %u (ack-only runs no lap, so fires can far exceed laps)\n",
            c->counter_fire_ackonly, c->counter_fire_tick);
     printf("timer due given     : zero %u, <=now %u, now+1..4 %u, >now+4 %u (the '<=now' one asks to go now)\n",
            c->counter_fire_d0, c->counter_fire_dnow, c->counter_fire_dnear, c->counter_fire_dfar);
