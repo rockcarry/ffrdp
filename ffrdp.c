@@ -230,7 +230,7 @@ typedef struct {
     uint64_t counter_send_bytes;   // payload of the frames the peer acked: bytes DELIVERED, not bytes put on the wire
     uint32_t counter_send_err;     // 内核没接下的 sendto 次数（数据 / ack / query / fec 各路径合计）
     uint64_t counter_recv_bytes;   // 我们 ack 过的帧的字节数（必须 64 位：32 位累计到 4 GiB 回绕 ⇒ averg_* 印出假速率）
-    uint32_t counter_send_failed;  // ffrdp_send refused the call (app queue full, or an allocation failed)
+    uint32_t counter_send_failed;  // 受理失败：被闸门拒 / 帧分配失败（细分见下面 refuse_* 那一组）
     uint32_t counter_send_query;
     uint32_t counter_reach_maxrto;
     uint32_t counter_recv_dup;   // data frames that arrived although we already had them
@@ -268,8 +268,6 @@ typedef struct {
     uint32_t counter_send_wake_skip;
     // 应用侧被哪一道闸门拒掉（只看 counter_send_failed 分不出是谁挡的）。
     uint32_t counter_refuse_wnd;   // 帧数闸：need + wait_snd > FFRDP_MAX_WAITSND（见 ffrdp_send 的受理判据）
-    uint32_t counter_refuse_bytes; // ①-41 起退役（应用队列没了 ⇒ 没有字节闸），恒 0
-    uint32_t counter_refuse_big;   // ①-41 起退役（随队列一起消失），恒 0
     // 上面三条 gate 之外的其余拒绝出口（裸 return / goto 那几条）。
     uint32_t counter_ref_closing;  // ffrdp->closing ⇒ CLOSED
     uint32_t counter_ref_notconn;  // 服务端、对端还没连上 ⇒ CLOSED
@@ -1340,7 +1338,7 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         due = now + 1;
     }
     if (due && (int32_t)(due - now) < 0) due = now;       // 已经过期 ⇒ 立刻（这也是"快一点"的做法）
-    // 兜底：有未确认的帧、或应用队列非空时最多睡 4ms。上面那条判据修好后它不该再触发；
+    // 兜底：有未确认的帧时最多睡 4ms。上面那条判据修好后它不该再触发；
     // 真机上 lap 最大曾到 59/114/222ms，每漏一次小窗口就少送好几帧，而多醒几次只费一点 CPU。
     if (c->send_list_head) { if (!due || (int32_t)(due - (now + 4)) > 0) due = now + 4; }
     return due;
@@ -2014,9 +2012,9 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
            c->counter_to_noack, c->counter_to_hadack, c->counter_to_age_max);
     printf("peer wnd raw/clamped: %u, %u\n", c->peer_wnd_raw, c->swnd);
     printf("send starved/blocked: swnd0 %u frames, cap-block %u ticks\n", c->counter_swnd0, c->counter_capblock);
-    // §26.30 ①-①：被**哪一道闸门**拒（配 counter_send_failed 看总数 ✓；total = wnd + bytes + big + 其它 ✓）
-    printf("send refused by gate : frame-count %u, queue-bytes %u, too-big %u | conn-state: closing %u, not-connected %u, hs-failed %u, hs-down %u (see counter_send_failed for the total)\n",
-           c->counter_refuse_wnd, c->counter_refuse_bytes, c->counter_refuse_big,
+    // 被哪一道闸门拒（配 counter_send_failed 看总数）；conn-state 那几条是没有 c 的出口（①-24）。
+    printf("send refused by gate : frame-count %u | conn-state: closing %u, not-connected %u, hs-failed %u, hs-down %u (see counter_send_failed for the total)\n",
+           c->counter_refuse_wnd,
            c->counter_ref_closing, c->counter_ref_notconn, c->counter_ref_hsfail, c->counter_ref_hsdown);
                 printf("ack latency         : %u us avg, %u us max (%u acks)\n",
            c->ack_lat_n ? (uint32_t)(c->ack_lat_sum_us / c->ack_lat_n) : 0,

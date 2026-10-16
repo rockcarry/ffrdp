@@ -50,7 +50,7 @@ typedef struct {
     pthread_mutex_t lock;      // guards deadline and asleep, which are written from other threads
     uint32_t        deadline;  // absolute ms on the get_timestamp32_ms() clock, 0 = nothing due
     // 2026-10-15（lo 结构性代价调查 ①）：只读统计 —— 这个 worker 一圈一圈到底在干什么 ✓。
-    // 为什么要它：协议侧只看得见"圈数"（counter_upd_cnt ✓）与"收到多少帧"✗，分不出**空圈**
+    // 为什么要它：协议侧只看得见"圈数"（stat_lap ✓）与"收到多少帧"✗，分不出**空圈**
     // 是"被通知叫醒却没数据"✗ 还是"期限到点"✓ —— 而 lo 上 master 的疑点正是"≈2.2 圈/帧"✗
     // （参考实现 ≈1.05 ✓）⇒ 先把这个数拆开，再决定动不动 timer 的唤醒条件 ✓。纯计数，不改行为 ✗。
     uint32_t        stat_lap;         // 圈数：每次 select 归来算一圈 ✓

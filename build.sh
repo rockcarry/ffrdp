@@ -33,8 +33,9 @@ build_package()
         exit -1
     fi
 
+    # -Wextra / -Wunused-macros：多余参数、隐式落空、未用宏都当错（2026-10-16 实测 5 个单元全干净 ✓）
     # -DFFRDP_DIAG=1：dev 构建保留完整诊断（dump/①-xx/计数器）✓；出货构建去掉该宏 ✓
-    local CFLAGS="-Wall -Werror -DFFRDP_DIAG=1"
+    local CFLAGS="-Wall -Werror -Wextra -Wunused-macros -DFFRDP_DIAG=1"
     local LDFLAGS="-lpthread"
     case "$CROSS_COMPILE" in
     *mingw*)
