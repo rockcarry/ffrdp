@@ -9,6 +9,25 @@
 #include "utils.h"
 #include "lowlevel.h"
 
+// ── 诊断开关：与协议层的 FFRDP_DIAG 同一口径 ✓ ─────────────────────────────────
+// 出货构建（不传 -DFFRDP_DIAG=1）⇒ 本文件的统计字段 / 计时 / 收尾打印**整块不存在** ✓：
+// 省下常驻内存 ✓，并去掉每次 timer() 与采样圈里的那几次 clock_gettime ✓。
+#ifndef FFRDP_DIAG
+#define FFRDP_DIAG 0
+#endif
+
+#if FFRDP_DIAG
+#define LSTAT(u, f)         ((u)->f++)
+#define LSTAT_ADD(u, f, v)  ((u)->f += (uint32_t)(v))
+#define LSTAT_SET(u, f, v)  ((u)->f = (v))
+#else
+#define LSTAT(u, f)         ((void)(u))
+#define LSTAT_ADD(u, f, v)  ((void)(u), (void)(v))
+#define LSTAT_SET(u, f, v)  ((void)(u), (void)(v))
+#endif
+// 注意：只有"不门控的写点"才用这三个宏 ✓；`#if FFRDP_DIAG` 块**内部**直接写 `udp->stat_x++` ✓
+// （那个块本来就只在 dev 编译 ✓ ⇒ 不必再套一层空宏 ✓，也不会留下没人用的宏 ✗）。
+
 // The wakeup the loop waits on is a UDP socket connected to its own loopback address, not a pipe. A pipe is
 // cheaper per call (measured here: 0.54us against 1.44us for write+drain) but select() on Windows only ever
 // reports sockets, and one code path for both platforms is worth more than that difference -- what matters
@@ -49,7 +68,11 @@ typedef struct {
     int             asleep;    // 1 while the loop is inside select(); written and read under this lock
     pthread_mutex_t lock;      // guards deadline and asleep, which are written from other threads
     uint32_t        deadline;  // absolute ms on the get_timestamp32_ms() clock, 0 = nothing due
-    // 2026-10-15（lo 结构性代价调查 ①）：只读统计 —— 这个 worker 一圈一圈到底在干什么 ✓。
+#if FFRDP_DIAG
+    // 只读统计（dev 构建才有 ✓）：这个 worker 一圈一圈到底在干什么 ✓。
+    // 为什么要它：协议侧只看得见"圈数"（stat_lap ✓）与"收到多少帧"✗，分不出**空圈**
+    // 是"被通知叫醒却没数据"✗ 还是"期限到点"✓ —— 而 lo 上 master 的疑点正是"≈2.2 圈/帧"✗
+    // （参考实现 ≈1.05 ✓）⇒ 先把这个数拆开，再决定动不动 timer 的唤醒条件 ✓。纯计数，不改行为 ✗。
     // 为什么要它：协议侧只看得见"圈数"（stat_lap ✓）与"收到多少帧"✗，分不出**空圈**
     // 是"被通知叫醒却没数据"✗ 还是"期限到点"✓ —— 而 lo 上 master 的疑点正是"≈2.2 圈/帧"✗
     // （参考实现 ≈1.05 ✓）⇒ 先把这个数拆开，再决定动不动 timer 的唤醒条件 ✓。纯计数，不改行为 ✗。
@@ -74,9 +97,11 @@ typedef struct {
     uint32_t        stat_arm_dnow;       // <= now（真的要求"现在" ✗）
     uint32_t        stat_arm_dnear;      // now+1..4
     uint32_t        stat_arm_dfar;       // > now+4
+#endif
     // RX 批上限 = FFRDP_LOWLEVEL_RX_BATCH_MAX（文件头那张实测表选出来的 2 ✓）。
     int             rx_batch;             // 一圈最多收几帧（= FFRDP_LOWLEVEL_RX_BATCH_MAX ✓）
     int             bufsize;              // 套接字缓冲请求值（字节 ✓）= FFRDP_LOWLEVEL_BUFSIZE_KB * 1024
+#if FFRDP_DIAG
     int             buf_rcv_eff;          // 内核实际给的（getsockopt ✓，dump 里打 ✓）
     int             buf_snd_eff;
     int             stat_rx_errno;       // 第一次失败的 errno（0 = 还没失败过 ✓）
@@ -125,6 +150,7 @@ typedef struct {
     uint32_t        stat_arm_us_loop;   // 它们花掉的微秒 ✓
     uint32_t        stat_arm_n_other;   // 跨线程 arm 的次数（应用 send 后催一下 ✓）
     uint32_t        stat_arm_us_other;
+#endif
 } UDP_LOWLEVEL;
 
 // 跨 API 的 addr 是 uint64：布局是两条层共同的约定（见 utils.h 的 ffrdp_addr_make），不是本文件的私事。
@@ -219,13 +245,14 @@ static void ffrdp_udp_sleep_end(UDP_LOWLEVEL *udp)
     pthread_mutex_unlock(&udp->lock);
 }
 
-// §26.30 ①-③ / ④-13 用的微秒时钟：量"每收一帧一次回调"与"一圈三段"都要它 ✓
-//（与 ffrdp.c 里量 ack 延迟那个同源 ✓）。放在 timer() 之前：④-13 的 arm 计时也要用它 ✓。
+#if FFRDP_DIAG
+// 量"每收一帧一次回调"与"一圈三段"用的微秒时钟（与 ffrdp.c 里量 ack 延迟那个同源 ✓）。
 static uint64_t ffrdp_udp_us(void)
 {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
 }
+#endif
 
 // Deliver a tick that has come due. The deadline is consumed BEFORE the callback runs, so a callback that
 // arms its next one is not overwritten by this, and a callback that arms nothing stops the clock rather
@@ -235,10 +262,10 @@ static void ffrdp_udp_tick(UDP_LOWLEVEL *udp)
     uint32_t now = get_timestamp32_ms();
     pthread_mutex_lock(&udp->lock);
     if (!udp->deadline || (int32_t)(udp->deadline - now) > 0) {
-        if (!udp->deadline) udp->stat_tick_none++; else udp->stat_tick_early++;   // 只读（①-4）
+        if (!udp->deadline) LSTAT(udp, stat_tick_none); else LSTAT(udp, stat_tick_early);
         pthread_mutex_unlock(&udp->lock); return;
     }
-    udp->stat_tick_fire++;                                                        // 只读（①-4）
+    LSTAT(udp, stat_tick_fire);
     udp->deadline = 0;
     pthread_mutex_unlock(&udp->lock);
     if (udp->callback) udp->callback(udp->cbctx, FFRDP_LOWLEVEL_TYPE_TIMER, NULL, 0);
@@ -256,7 +283,7 @@ static int ffrdp_udp_lowlevel_timer(void *fl, uint32_t deadline_ms)
 {
     UDP_LOWLEVEL *udp = (UDP_LOWLEVEL *)fl;
     uint32_t      old;
-    int           wake;
+    int           wake, from_loop;
     if (!udp) return -1;
     pthread_mutex_lock(&udp->lock);
     old           = udp->deadline;
@@ -264,10 +291,10 @@ static int ffrdp_udp_lowlevel_timer(void *fl, uint32_t deadline_ms)
     wake          = (old == 0) || ((int32_t)(deadline_ms - old) < 0) || udp->asleep;
     pthread_mutex_unlock(&udp->lock);
     // The same "am I the loop?" test exit() uses: a callback is running on the loop's own thread.
-    {   // 只读记账（①）："arm 成已到点"分两类 ✓
-        int from_loop = (udp->mthread.hthread && udp->mthread.hthread == (void*)pthread_self());
-        uint64_t t_arm0 = ffrdp_udp_us();                                  // 只读（④-13）：arm/wake 自己值多少 ✓
-        // 只读（①-17）：分档 —— 0 是"没有期限"的哨兵，**不是**"现在" ✓（①-2 原来把它算进去 ✗）
+    from_loop = (udp->mthread.hthread && udp->mthread.hthread == (void*)pthread_self());
+#if FFRDP_DIAG
+    {   uint64_t t_arm0 = ffrdp_udp_us();      // arm/wake 自己值多少 ✓
+        // 分档：0 是"没有期限"的哨兵，**不是**"现在" ✓
         {   int32_t left = (int32_t)(deadline_ms - get_timestamp32_ms());
             if      (!deadline_ms)  udp->stat_arm_d0++;
             else if (left <= 0)   { udp->stat_arm_dnow++;
@@ -275,12 +302,13 @@ static int ffrdp_udp_lowlevel_timer(void *fl, uint32_t deadline_ms)
             else if (left <= 4)     udp->stat_arm_dnear++;
             else                    udp->stat_arm_dfar++;
         }
-        if (wake && !from_loop) ffrdp_udp_notify(udp);
         {   uint32_t d_arm = (uint32_t)(ffrdp_udp_us() - t_arm0);
             if (from_loop) { udp->stat_arm_n_loop++;  udp->stat_arm_us_loop  += d_arm; }
             else           { udp->stat_arm_n_other++; udp->stat_arm_us_other += d_arm; }
         }
     }
+#endif
+    if (wake && !from_loop) ffrdp_udp_notify(udp);
     return 0;
 }
 
@@ -308,13 +336,15 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
             socket_setopt(udp->sockfd, "nonblock_io", 1);
             socket_setopt(udp->sockfd, "send_buffer", udp->bufsize);   // ①-30
             socket_setopt(udp->sockfd, "recv_buffer", udp->bufsize);   // ①-30
-            {   // ①-30：把内核**实际**给的值记下来（Linux 会翻倍后再夹到 rmem_max/wmem_max ✓）
+#if FFRDP_DIAG
+            {   // 把内核**实际**给的值记下来（Linux 会翻倍后再夹到 rmem_max/wmem_max ✓）
                 socklen_t sl = sizeof(int);
                 udp->buf_rcv_eff = udp->buf_snd_eff = 0;
                 getsockopt(udp->sockfd, SOL_SOCKET, SO_RCVBUF, (void*)&udp->buf_rcv_eff, &sl);
                 sl = sizeof(int);
                 getsockopt(udp->sockfd, SOL_SOCKET, SO_SNDBUF, (void*)&udp->buf_snd_eff, &sl);
             }
+#endif
             if (udp->sockfd < 0) { printf("<2> ffrdp-udp failed to create socket !\n"); usleep(100 * 1000); continue; }
             if ((udp->flags & FLAG_BIND_ADDR) && bind(udp->sockfd, (struct sockaddr*)&udp->addr, sizeof(udp->addr)) < 0) {
                 printf("<2> udpproxy failed to bind socket to port %d !\n", ntohs(udp->addr.sin_port));
@@ -322,10 +352,12 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
             }
         }
 
-        // 只读（§26.30 ④-13）：一圈三段计时 —— 每 64 圈采一次 ✓（代价量不出 ✓，见字段注释）
+#if FFRDP_DIAG
+        // 一圈三段计时：每 64 圈采一次 ✓（摊薄到全部圈 ≈ 1.5 ns/圈 ⇒ 量不出代价 ✓）
         int      cost  = ((udp->stat_lap & 63) == 0);
         uint64_t t_c0 = 0, t_c1 = 0, t_c2 = 0, t_c3 = 0;
         if (cost) t_c0 = ffrdp_udp_us();
+#endif
         // Sleep until a frame arrives, the deadline passes, or someone wakes us -- and when there is no
         // deadline at all, sleep indefinitely. The old fixed 100ms wakeup both capped what precision the
         // layer above could ask for and kept an idle endpoint waking ten times a second.
@@ -333,17 +365,17 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
         uint32_t dl = ffrdp_udp_sleep_begin(udp);
         if (dl) {
             int32_t left = (int32_t)(dl - get_timestamp32_ms());
-            // 只读（①-4）：left<0 就是"实睡 0ms"的那种自旋圈 ✗（select 返回 0 ⇒ 又是一圈）
-            if (left < 0)       udp->stat_left_le0 ++;
-            else if (left == 0) udp->stat_left_0   ++;
-            else if (left <= 9) udp->stat_left_1_9 ++;
-            else                udp->stat_left_ge10++;
+            // left<0 就是"实睡 0ms"的那种自旋圈 ✗（select 返回 0 ⇒ 又是一圈）
+            if (left < 0)       LSTAT(udp, stat_left_le0);
+            else if (left == 0) LSTAT(udp, stat_left_0);
+            else if (left <= 9) LSTAT(udp, stat_left_1_9);
+            else                LSTAT(udp, stat_left_ge10);
             if (left < 0) left = 0;                    // due already: come straight back
             tv.tv_sec  = left / 1000;
             tv.tv_usec = (left % 1000) * 1000;
             tvp = &tv;
         } else {
-            udp->stat_sleep_none++;                    // 只读（①-4）：没有期限 ⇒ 永久睡 ✓
+            LSTAT(udp, stat_sleep_none);               // 没有期限 ⇒ 永久睡 ✓
         }
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -351,15 +383,16 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
         FD_SET(udp->notify, &rfds);
         ret = select(MAX(udp->sockfd, udp->notify) + 1, &rfds, NULL, NULL, tvp);
         ffrdp_udp_sleep_end(udp);       // awake again, whatever select() answered
-        if (cost) t_c1 = ffrdp_udp_us();                                              // 只读（④-13）：pre 段结束 ✓
+#if FFRDP_DIAG
+        if (cost) t_c1 = ffrdp_udp_us();                                              // pre 段结束 ✓
+#endif
         if (ret == -1) {
             if (socket_errno() == EINTR) continue;     // a signal is not an error, and not a reason to sleep
             printf("select error !\n"); fflush(stdout); usleep(100 * 1000); continue;
         }
-        // 只读记账（①）：一圈一笔 ✓
-        udp->stat_lap++;
-        if (ret == 0) udp->stat_lap_timeout++;
-        if (ret > 0 && FD_ISSET(udp->notify, &rfds)) udp->stat_lap_notify++;
+        LSTAT(udp, stat_lap);                                  // 一圈一笔 ✓
+        if (ret == 0) LSTAT(udp, stat_lap_timeout);
+        if (ret > 0 && FD_ISSET(udp->notify, &rfds)) LSTAT(udp, stat_lap_notify);
 
         if (ret > 0 && FD_ISSET(udp->notify, &rfds)) ffrdp_udp_notify_drain(udp);
         // No stop test here, nor in the receive loop below: the condition at the top is enough, because every
@@ -381,11 +414,11 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
                 // bytes either way, and the cast is what keeps -Wall -Werror clean on both.
                 ret = recvfrom(udp->sockfd, (void*)buf, sizeof(buf), 0, (struct sockaddr*)&from, &fromlen);
                 if (ret <= 0) {        // zero length datagram, an empty socket, or a socket error
-                    udp->stat_rx_fail++;
-                    if (udp->stat_rx_errno == 0) udp->stat_rx_errno = socket_errno();
+                    LSTAT(udp, stat_rx_fail);
+                    LSTAT_SET(udp, stat_rx_errno, socket_errno());
                     break;
                 }
-                frames++; udp->stat_rx_frames++; if (frames == 1) udp->stat_lap_frame++;
+                frames++; LSTAT(udp, stat_rx_frames); if (frames == 1) LSTAT(udp, stat_lap_frame);
                 if (udp->callback) {
                     // The message carries where the frame came from, so a reply goes straight back out through
                     // send() with the very same addr -- that is the only reason this layer reports an address
@@ -396,7 +429,8 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
                     msg.addr = ffrdp_udp_addr_pack(&from);
                     msg.buf  = buf;
                     msg.len  = ret;
-                    {   // 只读（§26.30 ①-③）：给这一次回调标价 ✓（两次 clock_gettime，量的是协议侧一段 ✓）
+#if FFRDP_DIAG
+                    {   // 给这一次回调标价（量的是协议侧那一段 ✓）
                         uint64_t t_cb = ffrdp_udp_us();
                         udp->callback(udp->cbctx, FFRDP_LOWLEVEL_TYPE_RECV, &msg, sizeof(msg));
                         {   uint32_t dt = (uint32_t)(ffrdp_udp_us() - t_cb);
@@ -404,12 +438,15 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
                             if (dt > udp->stat_cb_us_max) udp->stat_cb_us_max = dt;
                         }
                     }
+#else
+                    udp->callback(udp->cbctx, FFRDP_LOWLEVEL_TYPE_RECV, &msg, sizeof(msg));
+#endif
                 }
             }
-            // 只读（§26.30 ①-③）：这一圈是"被上限截断"还是"socket 真收空了"✗
-            // ⚠️ 光数"收满 2 帧就停"**证不出**积压 ✗（可能刚巧就是 2 帧 ✓）⇒ 收满时再问一次
-            //    零超时 select ✓：它能读 ⇒ socket 里真的还有货 = 这一圈是被上限截断的 ✓。
-            //    不消费任何数据报 ✓（不像再 recvfrom 一次 ✗ —— 那会把下一圈要的帧吃掉 ✓）。
+#if FFRDP_DIAG
+            // 这一圈是"被上限截断"还是"socket 真收空了"✗ —— 光数"收满就停"**证不出**积压 ✗
+            // （可能刚巧就是这么多 ✓）⇒ 收满时再问一次**零超时 select** ✓：它能读 ⇒ 真有货 ✓。
+            // 不消费任何数据报 ✓（不像再 recvfrom 一次 ✗ —— 那会把下一圈要的帧吃掉 ✓）。
             if (frames >= udp->rx_batch) {                       // ①-25 ✓
                 udp->stat_rx_batch_full++;
                 {   fd_set pf; struct timeval z; int pr;
@@ -420,12 +457,16 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
                 }
             }
             if (frames == 1) udp->stat_lap_rx1++; else if (frames >= 2) udp->stat_lap_rxmulti++;
+#endif
         }
-        if (cost) t_c2 = ffrdp_udp_us();                                              // 只读（④-13）：mid 段结束 ✓
+#if FFRDP_DIAG
+        if (cost) t_c2 = ffrdp_udp_us();                                              // mid 段结束 ✓
+#endif
         // Received work first, then the clock, so the two are never handed over interleaved. A tick armed
         // from inside a receive callback is therefore delivered in the same lap rather than the next one.
         ffrdp_udp_tick(udp);
-        if (cost) {                                                                   // 只读（④-13）：tick 段结束 ⇒ 记账 ✓
+#if FFRDP_DIAG
+        if (cost) {                                                                   // tick 段结束 ⇒ 记账 ✓
             t_c3 = ffrdp_udp_us();
             udp->stat_cost_n++;
             udp->stat_cost_pre_us  += (uint32_t)(t_c1 - t_c0);
@@ -438,8 +479,10 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
                 udp->stat_cost_slow_us += (uint32_t)(t_c3 - t_c0);
             }
         }
+#endif
     }
 
+#if FFRDP_DIAG
     // ① 的读出点：这一行 ASCII，任何控制台都不乱码 ✓。空圈 = 总圈 - 带帧圈 ✓。
     printf("udp lowlevel laps: %u total, %u with frames, %u notify-woken, %u deadline, %u empty, %u frames, %u rx-fail (errno %d)\n",
            udp->stat_lap, udp->stat_lap_frame, udp->stat_lap_notify, udp->stat_lap_timeout,
@@ -486,6 +529,7 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
            udp->stat_cost_slow_n, udp->stat_cost_slow_us);
     printf("udp lowlevel arm cost: from loop %u calls %u us, from other threads %u calls %u us\n",
            udp->stat_arm_n_loop, udp->stat_arm_us_loop, udp->stat_arm_n_other, udp->stat_arm_us_other);
+#endif
     closesocket(udp->sockfd); udp->sockfd = -1;
     {   int fd = udp->notify;
         udp->notify = -1;              // 先摘引用、再关：晚到的 timer() 只会看到"没有"，不会发到已关的 fd 上
@@ -502,10 +546,10 @@ static int ffrdp_udp_lowlevel_send(void *fl, uint64_t addr, uint8_t *buf, int le
     if (!udp || !buf || len <= 0 || udp->sockfd < 0) return -1;
     ffrdp_udp_addr_unpack(addr, &to);
     int ret = (int)sendto(udp->sockfd, (void*)buf, len, 0, (struct sockaddr*)&to, sizeof(to));
-    // 只读（§26.30 ①-③）：每帧 sendto 次数 —— 本架构是"一帧一个数据报"✓，这个调用数就是分子 ✓
-    // （分母是 ffrdp 那一块里的帧数：首发+两种重传 ✓）。ack / query 也走这里 ✓，所以它 >= 帧数 ✓。
-    udp->stat_tx_calls++;
-    if (ret > 0) udp->stat_tx_bytes += (uint32_t)ret;
+    // 每帧 sendto 次数：本架构是"一帧一个数据报"✓，这个调用数就是分子 ✓；
+    // 分母是 ffrdp 那一块里的帧数（首发 + 两种重传 ✓），ack/query 也走这里 ⇒ 它 >= 帧数 ✓。
+    LSTAT(udp, stat_tx_calls);
+    if (ret > 0) LSTAT_ADD(udp, stat_tx_bytes, ret);
     if (ret == len) return 0;
     // The socket is non blocking, so a full send buffer is a normal answer on a busy link and is not worth
     // a line of output on every frame; the caller decides what to do with the failure. Anything else is a
