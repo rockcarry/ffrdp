@@ -321,9 +321,6 @@ static int link_loop(struct link_arg *a)
                 if (msg_len <= 0) { msg_len = 0; break; }
                 tick_msg_first = get_timestamp32_ms(); msg_retries = 0;
                 ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
-            {   int t = app_sendretry_get();   // ①-41 实验：被拒立刻重试（0 = 关 ✓）
-                while (ret < 0 && t-- > 0) ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
-            }
                 {   int t = app_sendretry_get();   // ①-41 实验：被拒立刻重试（0 = 关 ✓）
                     while (ret < 0 && t-- > 0) ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, 0);
                 }
