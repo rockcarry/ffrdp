@@ -100,7 +100,7 @@ gcc -O1 -w $HAVE_B -DSIMLL_BASE -c simll.c -o simll_base.o
 # utils.c lives one level up (run.sh works from tools/sim).
 # -I../..: the copy sits here, so its quoted includes ("utils.h") need the repo root on the path.
 gcc -O1 -w -I../.. -c utils_sim.c -o utils.o
-TESTS="${TESTS:-t_rto t_pseudo t_cwnd t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_flush t_keepalive t_init t_dump t_fec hs-e2e e2e-raw e2e}"
+TESTS="${TESTS:-t_rto t_pseudo t_cwnd t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_flush t_probe t_sweep t_keepalive t_init t_dump t_fec hs-e2e e2e-raw e2e}"
 
 # 每一侧的输出同时进终端与一份日志：末尾的"判定汇总"从日志里读，免得靠人眼看统计数字。
 # 统计行（resend%、rto_floor、ooo 直方图……）随负载与旋钮变化，不是判据。
@@ -125,6 +125,7 @@ for t in $TESTS; do
         grep -q 'uint32_t rmss, smss, swnd, inflight' ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_INFLIGHT"
         grep -q counter_ooo_d1_24 ffrdp_$v.c && EXTRA="$EXTRA -DOOO_HIST"
         grep -q counter_ooo_d65_128 ffrdp_$v.c && EXTRA="$EXTRA -DOOO_HIST2"
+        grep -q counter_tailprobe ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_TAILPROBE"
         # ffrdp_send/recv gained a timeout argument at some point, and the tests are compiled against both
         # sides, so tell them which shape they are looking at (the tests' TEST_SEND/TEST_RECV wrappers
         # mean "do not wait" on both, which is what HEAD does).
@@ -217,6 +218,25 @@ for t in $TESTS; do
         echo "===== t_flush: 半帧冲刷（指定连接 / 一次性）====="
         echo "-- HEAD --" | tee -a "$SIMLOG"; run $RUN ./t_flush_base
         echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_flush_new ;;
+    t_probe)
+        # A′：尾部探测 —— 健康链路零动作；静默（RTO 已退避）后提前 1/4 RTO 恢复
+        echo
+        echo "===== t_probe: 尾部探测（RTO ≥ 4×RTT 才出手）====="
+        echo "-- HEAD --" | tee -a "$SIMLOG"; run $RUN ./t_probe_base
+        echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_probe_new ;;
+    t_sweep)
+        # A′ 的收益扫参：尾巴丢失后"放开链路 → 第一次收到数据"的步数，随 RTT / 静默时长。
+        # ⚠️ 两侧要真不同：A′ 已进 HEAD ⇒ base 侧要用 REF=<加 A′ 之前的 ffrdp.c> 重编
+        #    （REF=/tmp/x.c TESTS=t_sweep bash run.sh），否则 base 与 work 逐字相同 ——
+        #    差 0 是"没有对照"，不是"没有收益"。这里只负责把两侧的数字并排打出来。
+        echo
+        echo "===== t_sweep: 尾巴丢失扫参（恢复步数，越低越好）====="
+        for d in 2 4 10 40; do
+            for s in 150 400 900; do
+                printf "  HEAD " | tee -a "$SIMLOG"; run $RUN ./t_sweep_base $d $s
+                printf "  work " | tee -a "$SIMLOG"; run $RUN ./t_sweep_new  $d $s
+            done
+        done ;;
     t_crypto)
         # 加密回调：协议层把帧载荷交给应用（原地改、长度不变 ⇒ 对 send/recv 透明 ✓）
         # 两条出口（攒满 smss / 超时短帧）都必须挂上，否则一种帧明文出去 ✗。
