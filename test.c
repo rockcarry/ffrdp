@@ -164,12 +164,14 @@ int main(int argc, char *argv[])
         if (strstr(argv[i], "--server=") == argv[i]) {
             server_en = 1;
             if (strcmp(argv[i] + 9, "") != 0) {
-                strncpy(server_bind_ip, argv[i] + 9, sizeof(server_bind_ip));
+                // snprintf 而不是 strncpy：源串可能比目标长 ⇒ strncpy 会填满 32 字节而不留结尾的 0
+                // （-O2 下 gcc 的 -Wstringop-truncation 就会拦下它）。
+                snprintf(server_bind_ip, sizeof(server_bind_ip), "%s", argv[i] + 9);
             }
         } else if (strstr(argv[i], "--client=") == argv[i]) {
             client_en = 1;
             if (strcmp(argv[i] + 9, "") != 0) {
-                strncpy(client_cnnt_ip, argv[i] + 9, sizeof(client_cnnt_ip));
+                snprintf(client_cnnt_ip, sizeof(client_cnnt_ip), "%s", argv[i] + 9);
             }
         } else if (strcmp(argv[i], "--server") == 0) {
             server_en = 1;
@@ -199,9 +201,13 @@ int main(int argc, char *argv[])
     if (server_en) pthread_create(&hserver, NULL, server_thread, NULL);
     if (client_en) pthread_create(&hclient, NULL, client_thread, NULL);
 
+    // 退出只认 quit / exit，或 stdin 结束（Ctrl+D、管道关闭）—— 后者在脚本里跑很有用。
     while (!g_exit) {
         char cmd[256];
-        scanf("%256s", cmd);
+        // %255s：宽度必须比缓冲区小一个字节 ⇒ 否则 256 字符的输入会把那个 NUL 写到栈上（ASAN 就是这么报的 ✓）。
+        // 返回值必须判：EOF（管道关闭 / Ctrl+D）时 cmd 里是旧内容或未初始化，不能拿去 strcmp（-Wunused-result ✓）；
+        // 判到 EOF 要顺手置 g_exit ⇒ 否则两条收发线程的 while (!g_exit) 永远不会停，join 就挂住了 ✗。
+        if (scanf("%255s", cmd) != 1) { g_exit = 1; break; }
         if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) {
             g_exit = 1;
         }
