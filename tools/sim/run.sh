@@ -127,6 +127,8 @@ for t in $TESTS; do
         grep -q counter_ooo_d65_128 ffrdp_$v.c && EXTRA="$EXTRA -DOOO_HIST2"
         grep -q counter_tailprobe ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_TAILPROBE"
         grep -q counter_cap_rise ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_CAPRISE"
+        # ① 的 RTT 地板保护（rtt_sample 抽成函数之后才可单测）⇒ HEAD 侧没有，t_cap 的 D 项判红 ✓
+        grep -q ffrdp_rtt_sample ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_RTTGUARD"
         # ffrdp_send/recv gained a timeout argument at some point, and the tests are compiled against both
         # sides, so tell them which shape they are looking at (the tests' TEST_SEND/TEST_RECV wrappers
         # mean "do not wait" on both, which is what HEAD does).

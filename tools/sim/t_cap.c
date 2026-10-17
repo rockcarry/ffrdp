@@ -128,6 +128,37 @@ static void case_c(void)
            conn0()->cap_kept, conn0()->inflight_max, conn0()->counter_probe);
 }
 
+// D：RTT 地板的离群保护（真机 §26.97 复测踩到：200 ms 链路上一个 60 ms 的假样本把 rtt_min 钉死，
+//    于是 B2 的"没队列"恒假、探测的"排队"恒真 ⇒ cap 被 revert 到 40、rise 一次都没动 ✗）
+#ifdef HAVE_RTTGUARD
+static void case_d(void)
+{
+    FFRDPCONN *c = conn0();
+    uint32_t m0 = c->rtt_min, s0 = c->rtts, d0 = c->rttd, t0 = (uint32_t)c->rttm;
+
+    printf("D RTT 地板：离群低样本不许钉死地板，同量级的新低仍然认\n");
+    c->rtt_min = 201; c->rtts = 201; c->rttd = 0; c->rttm = 201;
+
+    ffrdp_rtt_sample(c, 60);                       // 3.35 倍的低样本 ⇒ 只当噪声
+    check(c->rtt_min == 201, "60 ms 的离群样本没有下调地板");
+    ffrdp_rtt_sample(c, 190);                      // 与平滑值同量级 ⇒ 正常下调
+    check(c->rtt_min == 190, "190 ms 与平滑值同量级 ⇒ 地板照常下调");
+    ffrdp_rtt_sample(c, 195);                      // 不低了 ⇒ 地板不动
+    check(c->rtt_min == 190, "更高的样本不动地板");
+
+    check(FFRDP_PROBE_IDLE_SLACK(201u) >= 12u, "200 ms 链路的\"没队列\"容差随 RTT 缩放（>= 12 ms）");
+    check(FFRDP_PROBE_IDLE_SLACK(20u) == FFRDP_PROBE_RTT_DROP_MS, "20 ms 链路仍是 2 ms（旧行为不变）");
+
+    c->rtt_min = m0; c->rtts = s0; c->rttd = d0; c->rttm = (int32_t)t0;
+}
+#else
+static void case_d(void)
+{
+    printf("D RTT 地板：离群低样本不许钉死地板\n");
+    check(0, "HEAD 侧没有 rtt_min 离群保护（这一侧本来就该红 ✗）");
+}
+#endif
+
 // B：有常驻队列的链路（同样的 RTT，整形器 600 KB/s、队列 200 KB）⇒ 闸门不许升
 static void case_b(void)
 {
@@ -150,6 +181,7 @@ int main(void)
 
     case_a();
     if (p_c1) case_c();
+    if (p_c1) case_d();
     pair_down();
 
     case_b();

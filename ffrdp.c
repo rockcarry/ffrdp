@@ -119,6 +119,10 @@
 #define FFRDP_PROBE_ENABLE          1
 #define FFRDP_PROBE_HOLD_MS         500 // 保持时长（= 两个 RTT + 这些）
 #define FFRDP_PROBE_RTT_DROP_MS     2   // rtts 至少要降这么多 ms 才算赢（绝对值；相对值会被单次采样带偏）
+// "没队列"的**容差**（与上面那个"要降多少"不是一回事 ✓）：绝对 2 ms 在 200 ms 链路上只占 1%，
+// 链路上一点抖动就把判据钉死在假 —— 2026-10-17 真机 200 ms 复测里 B2 因此一次都没升 ✗。
+// 取 max(2 ms, RTT/16 ≈ 6.25%)：20 ms 链路还是 2 ms（与以前逐字节相同 ✓），200 ms 链路放宽到 12 ms ✓。
+#define FFRDP_PROBE_IDLE_SLACK(floor)  MAX((uint32_t)(floor) / 16u, (uint32_t)FFRDP_PROBE_RTT_DROP_MS)
 #define FFRDP_PROBE_RATE_KEEP_PCT   85  // ... 同时确认速率不低于历史最好值的这个百分比
 #define FFRDP_PROBE_GIVEBACK_IDLE_S 5   // giveback 要先"连续健康"这么多秒（还的速度不快过证明的速度）
 #define FFRDP_CAP_RISE_IDLE_S       5   // B2：闸门"能升"要先连续这么多秒"顶死 + 没队列 + 没浪费" ✓
@@ -1285,6 +1289,27 @@ static int ffrdp_on_frame(FFRDPCONN *c, FFRDP_FRAME_NODE *node, int len, FFRDP_R
     return taken;
 }
 
+// RTT 采样 + 地板维护。抽成函数是为了让 `t_cap` 能直接喂"离群样本"—— 伪造一个 ack 做不到 ✓。
+// 两条保护都来自 2026-10-17 的真机复测（200 ms 链路，见 notes §26.97）：
+//   · `rtt_min` 被一个 60 ms 的假样本钉死后，B2 的"没队列"`rtts <= rtt_min + slack` 恒假 ⇒ 一次都不升 ✗
+//   · 同时探测的"排队"`rtts > 3 × rtt_min` 恒真 ⇒ 一路 revert，把 cap 从 64 砍到 40 ✗
+static void ffrdp_rtt_sample(FFRDPCONN *c, uint32_t sample)
+{
+    c->rttm = (int32_t)sample;
+    if (c->rtt_min == 0 || sample < c->rtt_min) {
+        // 只允许"与平滑值同量级"的新低下调地板：单次离群样本（差 2 倍以上）只当噪声 ✓。
+        // 真变快时 rtts 会跟着掉，之后同量级的样本照样能下调 ⇒ 最多滞后几秒，不会被永久钉死 ✓。
+        if (c->rtt_min == 0 || c->rtts == (uint32_t)-1 || sample * 2u >= c->rtts) c->rtt_min = sample;
+    }
+    if (c->rtts == (uint32_t)-1) {
+        c->rtts = sample;
+        c->rttd = sample / 2;
+    } else {
+        c->rtts = (7 * c->rtts + 1 * sample) / 8;
+        c->rttd = (3 * c->rttd + 1 * (uint32_t)abs((int)sample - (int)c->rtts)) / 4;
+    }
+}
+
 // 处理完一段接收之后要做的：把收到的 ack 应用到发送表 —— 释放已确认的帧、更新 rtt/rto 下限、
 // 触发快速重传，并在收到数据帧时回一个 ack。旧写法是"整批一次"，RECV 回调里是"一帧一次"。
 static void ffrdp_apply_acks(FFRDPCONN *c, FFRDP_RX_BATCH *b)
@@ -1307,18 +1332,11 @@ static void ffrdp_apply_acks(FFRDPCONN *c, FFRDP_RX_BATCH *b)
                 FFRDP_CNT_ADD(c, counter_send_bytes, frame_payload_size(p)); c->wait_snd--;
                 c->tx_stalled = 0;   // ①-41e：ack 来了 ⇒ 槽位/信用可能腾出来了 ⇒ 值得一试 ✓
                 ffrdp_congestion_control(c, CEVENT_ACK_OK);
-                if (!(p->flags & FLAG_TIMEOUT_RESEND)) {
-                    c->rttm = (int32_t)NOW_MS() - (int32_t)p->tick_send;
-                    // rttm above is only the latest sample despite its name; this is the one that says how
-                    // quick the path can be at all, and the one a queue on the path would show up in.
-                    if (c->rtt_min == 0 || c->rttm < c->rtt_min) c->rtt_min = c->rttm;
-                    if (c->rtts == (uint32_t)-1) {
-                        c->rtts = c->rttm;
-                        c->rttd = c->rttm / 2;
-                    } else {
-                        c->rtts = (7 * c->rtts + 1 * c->rttm) / 8;
-                        c->rttd = (3 * c->rttd + 1 * abs((int)c->rttm - (int)c->rtts)) / 4;
-                    }
+                // ⚠️ 条件里的 `tick_send == tick_1sts`：RTO 触顶那条路径会刷新 `tick_send` 并**清掉**
+                // `FLAG_TIMEOUT_RESEND` ⇒ 只看标志挡不住，ack 回来会测出"重传→ack"的假小值 ✗。
+                // 采样一律从**首次**发送算起（`tick_1sts` 不再被改写）⇒ 最坏偏大（保守），绝不把地板钉低 ✓。
+                if (!(p->flags & FLAG_TIMEOUT_RESEND) && p->tick_send == p->tick_1sts) {
+                    ffrdp_rtt_sample(c, (uint32_t)((int32_t)NOW_MS() - (int32_t)p->tick_1sts));
                     {   // The peer's duplicate reports are the one piece of evidence on this path that our own
                         // 对端说"这些重传我早就有"的占比高 ⇒ RTO 还在往返分布里，白花的钱在线上 ⇒ 把地板顶上去；地板从当前 RTO 起步，一步即生效。
                         if (c->win_need >= FFRDP_RTO_WIN ||
@@ -1698,7 +1716,7 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             // 每秒结算一次"这一秒健不健康"：waste 与"没有队列"都要满足 ✓
             {
                 uint32_t idle_now = (c->rtt_min && c->rtts != (uint32_t)-1 &&
-                                     c->rtts < c->rtt_min + FFRDP_PROBE_RTT_DROP_MS) ? 1u : 0u;
+                                     c->rtts < c->rtt_min + FFRDP_PROBE_IDLE_SLACK(c->rtt_min)) ? 1u : 0u;
                 if (c->probe_waste < FFRDP_PROBE_HEALTHY_PCT && idle_now) c->giveback_idle++;
                 else                                                      c->giveback_idle = 0;
             }
@@ -1744,7 +1762,7 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                 if (next > FFRDP_INFLIGHT_CEIL) next = FFRDP_INFLIGHT_CEIL;
                 if (c->probe_state == 0 && c->inflight_max < FFRDP_INFLIGHT_CEIL && out >= c->inflight_max &&
                     c->rtt_min && c->rtts != (uint32_t)-1 &&
-                    c->rtts <= c->rtt_min + FFRDP_PROBE_RTT_DROP_MS &&
+                    c->rtts <= c->rtt_min + FFRDP_PROBE_IDLE_SLACK(c->rtt_min) &&
                     c->probe_waste < FFRDP_PROBE_HEALTHY_PCT &&
                     c->swnd >= next &&                     // 对端窗口吃不下 ⇒ 升了也发不出去 ✗
                     (int32_t)now - (int32_t)c->tick_cap_revert >= (int32_t)FFRDP_PROBE_GAP_MS &&
@@ -1775,7 +1793,7 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                 holding = (c->rtt_min && c->rtts != (uint32_t)-1 &&
                            c->rtts > FFRDP_PROBE_QUEUE_RATIO * c->rtt_min) ? 1u : 0u;
                 idle    = (c->rtt_min && c->rtts != (uint32_t)-1 &&
-                           c->rtts < c->rtt_min + FFRDP_PROBE_RTT_DROP_MS) ? 1u : 0u;
+                           c->rtts < c->rtt_min + FFRDP_PROBE_IDLE_SLACK(c->rtt_min)) ? 1u : 0u;
                 // ①-39：**内存视角的触发** ✓ —— 上限比"这一圈真正在线上"高一倍以上就值得试 ✓
                 uint32_t mem_want = (FFRDP_MEMPROBE_ENABLE && c->rate_best > 0 && out >= FFRDP_MEMPROBE_MIN_OUT &&
                                      cap_want < c->inflight_max) ? 1u : 0u;
