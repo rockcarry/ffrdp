@@ -19,6 +19,29 @@
 // ffrdp_recv 是有序字节流（没有消息边界）⇒ 必须自带定长头；ffrdp_send 是原子的 ⇒ 只有 ret == len 时才 seq+1。
 #define TEST_MSG_OVERHEAD       12
 
+// ── A1：真机逐消息延迟量具（notes §26.93）────────────────────────────────────
+// 为什么要它 ✗：这一层原来只有"字节数 / 重传率"，而延迟相关的判据（pacing / 截止时间 / 重传等待）
+// 全是**分位数** ⇒ 以前只能靠吞吐侧面猜 ✓（仿真那一半已在 notes §26.92 落地 ✓）。
+//
+// 为什么做成开关 ✗✓：它改的是**消息格式**（尾部多 4 字节发送时刻），而 v1 互通矩阵用的是 dist 里
+// 另一份旧格式的 `test_ffrdp_v11_*` ⇒ 默认关 = 与改造前**逐字节相同** ✓；两端都要 `TEST_STAMP=1` ✓。
+//
+// 时间戳放在 **crc 之后**（`[len][seq][payload][crc][stamp]`）⇒ crc 的覆盖范围与改造前逐字相同
+// ⇒ "每次重发前刷新时间戳"不必重算 crc ✓（16 KB 的 crc 在 60 MB/s 下不是免费的 ✗）。
+// 分桶用 **100 µs** 一档（不是 1 ms ✗）：lo 上 p50 落在 0~1 ms，毫秒档会把整条分布压成一个 0 ✓
+// ⇒ 覆盖 0..1024 ms 共 10240 档（约 40 KB/连接，只在栈上、随线程退出即消失 ✓）。
+#define TEST_LAT_UNIT_US 100
+#define TEST_LAT_MAX_MS  1024
+#define TEST_LAT_BUCKETS ((TEST_LAT_MAX_MS) * (1000 / TEST_LAT_UNIT_US))
+
+static int g_stamp = -1;                 // -1 = 还没读环境变量
+static int stamp_on(void)
+{
+    if (g_stamp < 0) { const char *e = getenv("TEST_STAMP"); g_stamp = (e && *e) ? (atoi(e) != 0) : 0; }
+    return g_stamp;
+}
+static int msg_oh(void) { return TEST_MSG_OVERHEAD + (stamp_on() ? 4 : 0); }   // 一条消息的固定开销
+
 // 退出只有一条路：输入 quit/exit（或 stdin 结束）⇒ 收尾 + verify 汇总 + ffrdp_free；Ctrl+C 直接结束、看不到汇总（接受的代价）。
 static volatile int g_exit = 0;
 static char server_bind_ip[32]   = "0.0.0.0";
@@ -181,11 +204,11 @@ static uint32_t get32(const uint8_t *p)   { return (uint32_t)p[0] | ((uint32_t)p
 // 生成 seq 号消息到 buf，返回整条长度（≤ buf_max）；失败返回 -1
 static int msg_build(uint8_t *buf, int buf_max, uint32_t seq, int max_payload, uint32_t *rnd)
 {
-    int paylen, total, i;
-    if (buf_max <= TEST_MSG_OVERHEAD || max_payload < 1) return -1;
-    if (max_payload > buf_max - TEST_MSG_OVERHEAD) max_payload = buf_max - TEST_MSG_OVERHEAD;
+    int paylen, total, i, oh = msg_oh();
+    if (buf_max <= oh || max_payload < 1) return -1;
+    if (max_payload > buf_max - oh) max_payload = buf_max - oh;
     paylen = 1 + (int)(xs32(rnd) % (uint32_t)max_payload);
-    total  = TEST_MSG_OVERHEAD + paylen;
+    total  = oh + paylen;
     put32(buf + 0, (uint32_t)total);
     put32(buf + 4, seq);
     for (i = 0; i < paylen; i += 4) {
@@ -193,8 +216,16 @@ static int msg_build(uint8_t *buf, int buf_max, uint32_t seq, int max_payload, u
         if (left >= 4) { buf[8+i]=(uint8_t)r; buf[9+i]=(uint8_t)(r>>8); buf[10+i]=(uint8_t)(r>>16); buf[11+i]=(uint8_t)(r>>24); }
         else memcpy(buf + 8 + i, &r, (size_t)left);
     }
-    put32(buf + 8 + paylen, crc32(buf, 8 + paylen));
+    put32(buf + 8 + paylen, crc32(buf, 8 + paylen));   // crc 覆盖 len+seq+payload（与改造前逐字相同 ✓）
+    if (stamp_on()) put32(buf + 8 + paylen + 4, app_us());   // 占位；真正发送前由 msg_stamp() 刷新 ✓
     return total;
+}
+
+// 每次 ffrdp_send **之前**调一次（含重试）⇒ 延迟从"交给协议"算起，不含应用侧被拒的等待 ✓
+static void msg_stamp(uint8_t *buf, int len)
+{
+    if (!stamp_on() || len < TEST_MSG_OVERHEAD + 4) return;
+    put32(buf + len - 4, app_us());
 }
 
 // 校验状态（每个线程一份）
@@ -212,6 +243,13 @@ typedef struct {
     uint32_t send_wait_msgs;    // 等过（被拒 >= 1 次）的消息条数 ✓
     uint32_t send_wait_ms;      // 等待时长之和（ms ✓）
     uint32_t send_wait_max_ms;  // 单条最长等待（ms ✓）
+    // ── A1：逐消息延迟（TEST_STAMP=1 时才有样本 ✓）──────────────────────────────
+    uint32_t lat_n;             // 有效样本数（= 校验通过且时间戳合理 ✓）
+    uint32_t lat_bad;           // 时间戳明显不合理 ⇒ 多半是**对端没开** TEST_STAMP ✓（要显式报，别静默 ✗）
+    uint32_t lat_over;          // > TEST_LAT_MAX_MS 的样本
+    uint32_t lat_max_us;
+    uint64_t lat_sum_us;
+    uint32_t lat_hist[TEST_LAT_BUCKETS];   // 100 µs 一档（AV 判据在 ms 尺度，但 lo 上要看亚毫秒 ✓）
 } TEST_VERIFY;
 
 static void verify_log(const char *name, const char *peer, const char *what,
@@ -228,17 +266,18 @@ static void verify_log(const char *name, const char *peer, const char *what,
 // 从流里尽量多地解析出完整消息，返回消耗掉的字节数
 static int msg_parse(TEST_VERIFY *v, const char *name, const char *peer, const uint8_t *s, int n)
 {
-    int off = 0;
-    while (n - off >= TEST_MSG_OVERHEAD) {
+    int off = 0, oh = msg_oh(), st = stamp_on() ? 4 : 0;
+    while (n - off >= oh) {
         uint32_t len = get32(s + off), seq = get32(s + off + 4);
-        if (len < TEST_MSG_OVERHEAD || len > TEST_STREAM_MAX) {
+        if (len < (uint32_t)oh || len > TEST_STREAM_MAX) {
             // 长度不合法 ⇒ 流已经失步，无法可靠恢复，报一次并停止解析（正常时不该出现）
             verify_log(name, peer, "bad length, stream lost sync", len, (uint32_t)TEST_STREAM_MAX, &v->log_len);
             v->len_err++;
             break;
         }
         if ((uint32_t)(n - off) < len) break;      // 这一条还没收齐，等下一轮
-        if (crc32(s + off, (int)len - 4) != get32(s + off + len - 4)) {
+        // crc 的覆盖范围与改造前**逐字相同**（len-4-st 就是"len+seq+payload"，时间戳不在里面 ✓）
+        if (crc32(s + off, (int)len - 4 - st) != get32(s + off + len - 4 - st)) {
             // 长度可信 ⇒ 边界还是对齐的，跳过这一条继续（不放弃整条流）
             verify_log(name, peer, "crc mismatch", seq, len, &v->log_crc);
             v->crc_err++;
@@ -252,10 +291,53 @@ static int msg_parse(TEST_VERIFY *v, const char *name, const char *peer, const u
             verify_log(name, peer, "seq gap", v->seq_last, seq, &v->log_seq);
             v->seq_last = seq;
         } else v->seq_last = seq;
+        if (st) {   // A1：这一条从"交给协议"到"校验通过"用了多久 ✓
+            uint32_t d = app_us() - get32(s + off + len - 4);   // 32 位 µs 回绕 ⇒ 减法仍然对（延迟远小于 71 分钟 ✓）
+            // 对端没开 TEST_STAMP 时，这 4 字节是载荷 ⇒ 读出来是垃圾（一般极大）⇒ 显式记一笔，
+            // 不留"看起来正常的假样本" ✗。
+            if (d > 60000000u) v->lat_bad++;
+            else {
+                uint32_t b = d / TEST_LAT_UNIT_US;
+                v->lat_n++; v->lat_sum_us += d;
+                if (d > v->lat_max_us) v->lat_max_us = d;
+                if (b >= TEST_LAT_BUCKETS) v->lat_over++; else v->lat_hist[b]++;
+            }
+        }
         v->recv_msgs++; v->recv_bytes += len;
         off += (int)len;
     }
     return off;
+}
+
+// 分位数：按累加计数找"第 pct% 个样本落在哪个毫秒桶" ✓（向上取整，样本少时不会返回空桶 ✓）
+static uint32_t lat_pct(const TEST_VERIFY *v, uint32_t pct)
+{
+    uint32_t total = v->lat_n, want, acc = 0, i;
+    if (!total) return 0;
+    want = (uint32_t)(((uint64_t)total * pct + 99) / 100);
+    if (!want) want = 1;
+    for (i = 0; i < TEST_LAT_BUCKETS; i++) { acc += v->lat_hist[i]; if (acc >= want) return i; }
+    return TEST_LAT_BUCKETS;                     // 落进 over 桶 ✓
+}
+
+// 退出时打一次（不动判据：量具先只给人看 ✓；等真机基线出来再决定要不要立判据）
+static void lat_print(const TEST_VERIFY *v, const char *name)
+{
+    if (!stamp_on()) return;
+    if (!v->lat_n) {
+        printf("[%s] latency: no samples (%s)\n", name,
+               v->lat_bad ? "timestamp looked wrong on every message -> did the PEER also set TEST_STAMP=1 ?"
+                          : "no message was verified");
+        return;
+    }
+    printf("[%s] latency ms: n=%u p50=%.1f p95=%.1f p99=%.1f max=%.1f mean=%.2f | >%dms %u, bad_stamp %u%s\n",
+           name, v->lat_n,
+           lat_pct(v, 50) * (double)TEST_LAT_UNIT_US / 1000.0,
+           lat_pct(v, 95) * (double)TEST_LAT_UNIT_US / 1000.0,
+           lat_pct(v, 99) * (double)TEST_LAT_UNIT_US / 1000.0,
+           v->lat_max_us / 1000.0, (double)v->lat_sum_us / (double)v->lat_n / 1000.0,
+           TEST_LAT_MAX_MS, v->lat_over, v->lat_bad,
+           v->lat_bad ? "  <- peer is probably missing TEST_STAMP=1 (both sides must set it)" : "");
 }
 
 // 对端是否已失联（两侧同一判据：协议自己这么判，或我们已经很久没收到它的任何数据 ✓）。
@@ -292,7 +374,8 @@ static int link_loop(struct link_arg *a)
     TEST_VERIFY v;
 
     memset(&v, 0, sizeof(v));
-    if (send_max < TEST_MSG_OVERHEAD + 1) send_max = TEST_MSG_OVERHEAD + 1; // 至少装得下一条最小消息
+    const int oh = msg_oh();                                        // A1：TEST_STAMP=1 时 16，否则 12 ✓
+    if (send_max < oh + 1) send_max = oh + 1;                       // 至少装得下一条最小消息
     sendbuf = malloc((size_t)send_max);
     stream  = malloc(TEST_STREAM_MAX);
     if (!sendbuf || !stream) {
@@ -321,14 +404,15 @@ static int link_loop(struct link_arg *a)
         if (!g_idle_sec && g_app_burst > 1) {
             int k;
             for (k = 1; k < g_app_burst && !g_exit && msg_len == 0; k++) {
-                int room = 1, maxp = send_max - TEST_MSG_OVERHEAD;
+                int room = 1, maxp = send_max - oh;
                 if (quota) {
-                    if (tokens <= TEST_MSG_OVERHEAD) room = 0;
-                    else if (tokens - TEST_MSG_OVERHEAD < (uint32_t)maxp) maxp = (int)(tokens - TEST_MSG_OVERHEAD);
+                    if (tokens <= (uint32_t)oh) room = 0;
+                    else if (tokens - (uint32_t)oh < (uint32_t)maxp) maxp = (int)(tokens - (uint32_t)oh);
                 }
                 if (room) msg_len = msg_build(sendbuf, send_max, seq, maxp, &rnd);
                 if (msg_len <= 0) { msg_len = 0; break; }
                 tick_msg_first = get_timestamp32_ms(); msg_retries = 0;
+                msg_stamp(sendbuf, msg_len);                    // A1：延迟从"交给协议"算起 ✓
                 ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, app_sendwait_get());
                 {   int t = app_sendretry_get();   // ①-41 实验：被拒立刻重试（0 = 关 ✓）
                     while (ret < 0 && t-- > 0) ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, app_sendwait_get());
@@ -347,10 +431,10 @@ static int link_loop(struct link_arg *a)
         if (!g_idle_sec && msg_len == 0) {   // 上一条已经发出去了，生成下一条（失败重试时必须原样重发，不能重新生成）
             // FFRDP_IDLE>0 ⇒ 压根不生成 ✓：应用层一个字节都不发，专门看协议自己会不会把连接判死 ✓
             int room = 1;
-            max_payload = send_max - TEST_MSG_OVERHEAD;
+            max_payload = send_max - oh;
             if (quota) {
-                if (tokens <= TEST_MSG_OVERHEAD) room = 0; // 本周期额度装不下最小一条 ⇒ 这轮不发
-                else if (tokens - TEST_MSG_OVERHEAD < (uint32_t)max_payload) max_payload = (int)(tokens - TEST_MSG_OVERHEAD);
+                if (tokens <= (uint32_t)oh) room = 0; // 本周期额度装不下最小一条 ⇒ 这轮不发
+                else if (tokens - (uint32_t)oh < (uint32_t)max_payload) max_payload = (int)(tokens - (uint32_t)oh);
             }
             if (room) msg_len = msg_build(sendbuf, send_max, seq, max_payload, &rnd);
             if (msg_len < 0) msg_len = 0;   // 不该发生；当作"这轮不发"，下一轮重来（绝不能留成负数）
@@ -359,6 +443,7 @@ static int link_loop(struct link_arg *a)
 
         if (msg_len > 0) {
             // 传 0（不等待）：这个测试的背压方式是"被拒就下一轮原样重试"，节拍由那次带超时的 recv 提供 ✓。
+            msg_stamp(sendbuf, msg_len);                    // A1：每次尝试前刷新 ⇒ 不含"被拒后干等"的那段 ✓
             ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, app_sendwait_get());
             {   int t = app_sendretry_get();   // ①-41 实验：被拒立刻重试（0 = 关 ✓）
                 while (ret < 0 && t-- > 0) ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, app_sendwait_get());
@@ -457,6 +542,7 @@ done:
                peer->name, loop_iters, tot / 1000, rd_n, rd_us / 1000, re_n, re_us / 1000, rf_n, rf_us / 1000,
                tot ? (unsigned)((uint64_t)(rd_us + re_us + rf_us) * 100 / tot) : 0, loop_iters ? tot / loop_iters : 0);
     }
+    lat_print(&v, peer->name);   // A1：TEST_STAMP=1 才打（默认关 ⇒ 与改造前逐字相同 ✓）
     if (v.crc_err || v.len_err || v.partial_err || v.seq_gap) {
         printf("[%s] verify: *** CHECK FAILED ***\n", peer->name);
     } else if (v.recv_msgs) {

@@ -108,6 +108,86 @@ static unsigned hash(unsigned k, unsigned salt)
     return h;
 }
 
+// ── 逐消息延迟量具（docs/ffrdp-optimization.md §8 的 #1 ✓）──────────────────
+// 为什么需要它 ✗：这套夹具一直只有"字节数 / 重传率"，而延迟、pacing、按截止时间丢弃这些
+// 候选的判据都是**分位数**（P95 / 最大），拿吞吐与重传率根本看不出来 ⇒ 之前几次
+// "判据说没有收益，其实没测到"（notes §11.5）就是这么来的 ✓。
+//
+// 做法 ✓：每条应用消息前加 8 字节头 [tick][payload len]，收侧按消息边界解析 ⇒ 得到
+// "交给协议 → 应用取走"的完整延迟（含协议排队 + 链路时延/抖动 + 重传等待 ✓）。
+// 时间用**虚拟钟** sim_tick()（1 step = 1 ms ✓）⇒ 分辨率 1 ms，与延迟文档同尺度 ✓；
+// 亚毫秒的差别这里看不到（要看那个得回真机 ✗）。
+#define E2E_HDR       8
+#define E2E_LAT_MAX   1024          // 直方图覆盖 0..1024 ms，超出进 over 桶 ✓
+// 缓冲要**大于一次 recv 能返回的字节数**（下面按剩余空间给 recv 限长 ✓）：一条消息最多
+// 16 KB、而 recv 一次可以给满 64 KB ⇒ 留够"满块 + 一条半条"就不会出现"截断 ⇒ 之后全错位" ✗
+#define E2E_RXBUF     (128 * 1024)
+
+typedef struct {
+    unsigned char buf[E2E_RXBUF];   // 还没齐的那条消息（流式 recv ⇒ 一条可能分两次到 ✓）
+    int      n;
+    unsigned msgs;                  // 解析出的完整消息数（= 延迟样本数 ✓）
+    unsigned hist[E2E_LAT_MAX + 1];
+    unsigned over;                  // > E2E_LAT_MAX ms 的样本
+    unsigned sum, max, bad;         // 均值 / 最大 / 头坏掉重来的次数（应恒为 0 ✓）
+} E2E_LAT;
+
+static E2E_LAT g_lat01, g_lat10;
+
+static void e2e_put32(unsigned char *p, unsigned v)
+{ p[0]=(unsigned char)v; p[1]=(unsigned char)(v>>8); p[2]=(unsigned char)(v>>16); p[3]=(unsigned char)(v>>24); }
+static unsigned e2e_get32(const unsigned char *p)
+{ return (unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24); }
+
+// 发送：写头 + 交给协议。ffrdp_send 是原子的（整条接受或一个字节都不接受 ✓）⇒ 被拒的消息
+// 不会在流里留下半个头 ⇒ 收侧解析永远不会错位 ✓（这也是这里敢用"应用消息"当边界的原因 ✓）。
+static void e2e_send(void *c, int h, unsigned char *buf, int len, unsigned now)
+{
+    e2e_put32(buf, now); e2e_put32(buf + 4, (unsigned)len);
+    (void)TEST_SEND_H(c, h, (char*)buf, len + E2E_HDR);
+}
+
+// 接收：把拿到的字节喂进流解析器，凑齐一条就记一个延迟样本 ✓
+static void e2e_feed(E2E_LAT *r, const unsigned char *p, int n, unsigned now)
+{
+    if (n <= 0) return;
+    // 收不下就是量具自己出了问题（调用方按剩余空间给 recv 限长 ⇒ 走不到这里 ✓）：
+    // 宁可记一次 bad 让判定抓到，也不要截断 —— 截断会**静默丢字节**、之后整条流全错位 ✗。
+    if (r->n + n > E2E_RXBUF) { r->bad++; r->n = 0; return; }
+    memcpy(r->buf + r->n, p, (size_t)n); r->n += n;
+    for (;;) {
+        unsigned len, lat;
+        if (r->n < E2E_HDR) break;
+        len = e2e_get32(r->buf + 4);
+        if (len > E2E_RXBUF - E2E_HDR) { r->n = 0; r->bad++; break; }   // 头坏了：丢掉重来 ✓
+        if ((unsigned)r->n < E2E_HDR + len) break;                       // 半条：等下一次 ✓
+        lat = now - e2e_get32(r->buf);                                  // 虚拟钟，uint 回绕要 49 天才碰到 ✓
+        r->msgs++; r->sum += lat;
+        if (lat > r->max) r->max = lat;
+        if (lat > E2E_LAT_MAX) r->over++; else r->hist[lat]++;
+        r->n -= (int)(E2E_HDR + len);
+        memmove(r->buf, r->buf + E2E_HDR + len, (size_t)r->n);
+    }
+}
+
+// 分位数：按累加计数找"第 pct% 个样本落在哪个毫秒桶" ✓（样本少时向上取整，不会返回 0 号空桶 ✓）
+static unsigned e2e_pct(const E2E_LAT *r, unsigned pct)
+{
+    unsigned total = r->msgs, want, acc = 0, i;
+    if (!total) return 0;
+    want = (unsigned)(((unsigned long long)total * pct + 99) / 100);
+    if (!want) want = 1;
+    for (i = 0; i <= E2E_LAT_MAX; i++) { acc += r->hist[i]; if (acc >= want) return i; }
+    return E2E_LAT_MAX + 1;                                  // 落进 over 桶 ✓
+}
+
+static void e2e_lat_print(const char *tag, const E2E_LAT *r)
+{
+    printf("       latency %s ms: n=%u p50=%u p95=%u p99=%u max=%u mean=%u | >%dms %u bad_hdr %u\n",
+           tag, r->msgs, e2e_pct(r, 50), e2e_pct(r, 95), e2e_pct(r, 99), r->max,
+           r->msgs ? r->sum / r->msgs : 0, E2E_LAT_MAX, r->over, r->bad);
+}
+
 int main(int argc, char *argv[])
 {
     double loss  = argc > 1 ? atof(argv[1]) : 0.0;
@@ -152,10 +232,19 @@ int main(int argc, char *argv[])
         h0 = app0.conn; h1 = app1.conn;   // 服务端：ACCEPT 之前是 0（那时 send 会被拒 ✓）
         sim_setstep(i);
         // same shape as test.c: a random chunk of 1..sndsz bytes every iteration
-        sim_begin(0); TEST_SEND_H(c0, h0, (char*)sbuf, 1 + (int)(hash(i, 11) % (unsigned)sndsz)); TEST_RUN(c0, 0);
-        sim_begin(1); TEST_SEND_H(c1, h1, (char*)sbuf, 1 + (int)(hash(i, 12) % (unsigned)sndsz)); TEST_RUN(c1, 1);
-        sim_begin(1); while ((ret = TEST_RECV_H(c1, h1, (char*)rbuf, sizeof(rbuf))) > 0) r1 += ret;
-        sim_begin(0); while ((ret = TEST_RECV_H(c0, h0, (char*)rbuf, sizeof(rbuf))) > 0) r0 += ret;
+        sim_begin(0); e2e_send(c0, h0, sbuf, 1 + (int)(hash(i, 11) % (unsigned)sndsz), sim_tick()); TEST_RUN(c0, 0);
+        sim_begin(1); e2e_send(c1, h1, sbuf, 1 + (int)(hash(i, 12) % (unsigned)sndsz), sim_tick()); TEST_RUN(c1, 1);
+        // ⚠️ 每次 recv 的长度**按解析器剩余空间**给（不是 sizeof(rbuf)）✗：一条消息可能横跨两次
+        // recv，解析器里还压着半条 ⇒ 再要满 64 KB 就会溢出缓冲、丢字节、之后整条流错位 ✗
+        // （实测：丢包/整形场景里 c1->c0 的 bad_hdr 会到 165 —— 就是这么来的 ✓）。
+        sim_begin(1); while ((ret = TEST_RECV_H(c1, h1, (char*)rbuf,
+                                               MIN((int)sizeof(rbuf), E2E_RXBUF - g_lat01.n))) > 0) {
+            r1 += ret; e2e_feed(&g_lat01, rbuf, ret, sim_tick());
+        }
+        sim_begin(0); while ((ret = TEST_RECV_H(c0, h0, (char*)rbuf,
+                                               MIN((int)sizeof(rbuf), E2E_RXBUF - g_lat10.n))) > 0) {
+            r0 += ret; e2e_feed(&g_lat10, rbuf, ret, sim_tick());
+        }
     }
     s0.rto = APP_CONN(c0, h0)->counter_resend_rto; s0.fast = APP_CONN(c0, h0)->counter_resend_fast; s0.first = APP_CONN(c0, h0)->counter_send_1sttime;
     s0.cwnd = APP_CONN(c0, h0)->cwnd; s0.ssth = APP_CONN(c0, h0)->ssthresh; s0.wait = APP_CONN(c0, h0)->wait_snd; s0.fail = APP_CONN(c0, h0)->counter_send_failed; s0.rttd = APP_CONN(c0, h0)->rttd;
@@ -225,6 +314,14 @@ int main(int argc, char *argv[])
     printf("       delivered loss after repair c0->c1=%.2f%% (%u/%u)  c1->c0=%.2f%% (%u/%u)\n",
            100.0 * (s0.tx - s0.rx) / (s0.tx ? s0.tx : 1), s0.rx, s0.tx,
            100.0 * (s1.tx - s1.rx) / (s1.tx ? s1.tx : 1), s1.rx, s1.tx);
+    // 模型自己的账（不是端侧的 ✓）：offered 含重传 ⇒ 某一侧卡住时它会被重传灌大，
+    // 于是"实际丢包率"这条判据在这类场景里读不出配置值（下面那条判据的样本门槛就为它设 ✓）。
+    printf("       model packets: offered(c0->c1)=%lu dropped=%lu | offered(c1->c0)=%lu dropped=%lu\n",
+           sim_offered(1), sim_dropped(1), sim_offered(0), sim_dropped(0));
+    // 逐消息延迟（§8 #1 的量具 ✓）：D1 / D3 / C1 的判据都是这一组分位数，不是吞吐 ✗。
+    // 注意 n 是本轮**真的收到了**的消息数 ⇒ 彻底丢掉的消息不在这条分布里（上面那行交付丢失率管它 ✓）。
+    e2e_lat_print("c0->c1", &g_lat01);
+    e2e_lat_print("c1->c0", &g_lat10);
 #ifdef HAVE_INFLIGHT
     printf("       c0 inflight=%u\n", s0.inflight);
 #endif
@@ -232,16 +329,27 @@ int main(int argc, char *argv[])
     // ---- 判定（负载无关）----
     // 1) 一切都要还回去：ctx / 帧 / 乱序队列，残留就是泄漏
     check(sim_alloc() == sim_freed(), "leaked bytes (a context or a frame was not returned)");
+    // 1b) 量具自身的不变量：消息流解析没错位 ✓（ffrdp_send 原子 ⇒ 被拒的消息不会留下半个头 ✓）
+    check(g_lat01.bad == 0 && g_lat10.bad == 0, "latency harness lost message framing");
     // 2) 丢包模型：配了丢包率、又没加 shaper/policer 时，模型**自己**该按配置的比率丢。
     //    容差给得宽（10 个百分点）—— 这一条是用来抓"模型坏了"的，不是用来卡统计波动的。
     //    ⚠ 这里量的是**模型**（sim_offered/sim_dropped ✓），不是端侧计数 ✗：协议会重传，
     //    被网丢掉的帧最后还是会到 ⇒ 拿 (counter_txfull - counter_rxfull) 当"空中丢失"是错的 ✗
     //    （那量的是"协议没修好多少"，与模型无关 ⇒ 2026-10-15 之前它恒为假红 ✗）。
-    if (loss > 0.0 && cap == 0 && pcap == 0 && s0.tx > 0 && s1.tx > 0 && sim_offered(1) && sim_offered(0)) {
+    //    ⚠️ **期望值不是 `loss`** ✗：burst 模型一次命中丢整串 ⇒ 实际比率 ≈ 1-(1-loss)^burst
+    //    （0.02 × burst 6 ≈ 11.4%，而 ±10 点的容差相对 2% 只剩 0.6 点余量 ⇒ 帧数一动就假红 ✗；
+    //     加 8 字节消息头就把它推到 14.8% 踩到了 ✓）。所以按 burst 折算期望，仍然只抓"模型坏了" ✓。
+    //    ⚠️ 样本太少时这条判据同样没有意义 ⇒ 先要够样本再判（读数见上面那行 model packets ✓）。
+    if (loss > 0.0 && cap == 0 && pcap == 0 && s0.tx > 0 && s1.tx > 0 &&
+        sim_offered(1) >= 200 && sim_offered(0) >= 200) {
+        double expect = loss, keep = 1.0;
         double l01 = 100.0 * sim_dropped(1) / sim_offered(1);   // 目的 slot 1 = c0 -> c1 方向 ✓
         double l10 = 100.0 * sim_dropped(0) / sim_offered(0);   // 目的 slot 0 = c1 -> c0 方向 ✓
-        check(l01 >= loss * 100.0 - 10.0 && l01 <= loss * 100.0 + 10.0, "model dropped c0->c1 far from the configured rate");
-        check(l10 >= loss * 100.0 - 10.0 && l10 <= loss * 100.0 + 10.0, "model dropped c1->c0 far from the configured rate");
+        int    b;
+        for (b = 0; b < (burst > 0 ? burst : 0); b++) keep *= (1.0 - loss);
+        if (burst > 0) expect = 1.0 - keep;
+        check(l01 >= expect * 100.0 - 10.0 && l01 <= expect * 100.0 + 10.0, "model dropped c0->c1 far from the configured rate");
+        check(l10 >= expect * 100.0 - 10.0 && l10 <= expect * 100.0 + 10.0, "model dropped c1->c0 far from the configured rate");
     }
     // 3) 交付上界：收到的不可能比发出的多（两边都发，所以用各自的对端）
     //    **握上手了**就必须真的传过数据 ✓：判据用"服务端拿到了 accept 句柄"（app1.conn != 0）

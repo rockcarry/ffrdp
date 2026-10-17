@@ -122,6 +122,7 @@ pair_run() {   # $1=标签（只给人看 ✓）$2=env $3=期望(通|空闲) $4=
         默认hs1)  slug=default_hs1 ;;
         老路径)   slug=legacy_hs0 ;;
         空闲挥手) slug=idle_close ;;
+        延迟量具) slug=latency ;;
         *)        slug=pair ;;
     esac
     local tag="$1" envs="${2:-}" want="$3" P="$4" sp rc cs ss
@@ -154,6 +155,17 @@ pair_run "老路径" "FFRDP_HS=0" "通" "$((PORT+1))"
 
 pair_run "空闲挥手" "FFRDP_IDLE=1 FFRDP_CLOSE=1" "空闲" "$((PORT+2))"
 [ "$PAIR_OK" = 1 ] && row "两进程：IDLE+CLOSE（空闲不误杀 + 四次挥手）" PASS "$PAIR_NOTE" || row "两进程：IDLE+CLOSE" FAIL "$PAIR_NOTE（见 $OUT/pair_空闲挥手_*.log）"
+
+# 4b) A1：逐消息延迟量具（notes §26.93）。它给消息尾部加 4 字节发送时刻 ⇒ 只在**两端同开**
+#     TEST_STAMP=1 时才改格式 ✓（v1 互通那一格用的是另一份旧格式的 test_ffrdp_v11_* ✓）。
+#     判据仍是 verify OK（crc/seq 一条不少 ✓）；分位数只打出来给人看，暂不设阈值 ✗。
+pair_run "延迟量具" "TEST_STAMP=1" "通" "$((PORT+4))"
+if [ "$PAIR_OK" = 1 ]; then
+    lat_line=$(grep -h 'latency ms:' "$OUT"/pair_latency_*.log 2>/dev/null | head -1)
+    row "两进程：TEST_STAMP=1（逐消息延迟量具）" PASS "$PAIR_NOTE；${lat_line:-no latency line}"
+else
+    row "两进程：TEST_STAMP=1（逐消息延迟量具）" FAIL "$PAIR_NOTE（见 $OUT/pair_latency_*.log）"
+fi
 
 MC=3; MCP=$((PORT+3)); MC_PIDS=""
 pkill -f "test_ffrdp --server=127.0.0.1:$MCP" 2>/dev/null
