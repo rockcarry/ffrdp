@@ -47,7 +47,9 @@ build_package()
     # -Wextra / -Wunused-macros：多余参数、隐式落空、未用宏都当错（2026-10-16 实测 5 个单元全干净 ✓）
     # -DFFRDP_DIAG=1：dev 构建保留完整诊断（dump/①-xx/计数器）✓；出货构建去掉该宏 ✓
     # -DFFRDP_FEC_ENABLE=1：dev/判据构建要 FEC 全功能（t_fec 那一项 ✓）；出货不传 ⇒ 编译掉 ✓
-    local CFLAGS="-Wall -Werror -Wextra -Wunused-macros -DFFRDP_DIAG=1 -DFFRDP_FEC_ENABLE=1"
+    # -O2：2026-10-17 实测（lo 限速 60MB/s ✓）—— 不加任何 -O 就是 -O0，CPU 白付 ~25 个点 ✗
+    # （150% → ~123%，且吞吐从 ~37k fps 回到满速 48k fps ✓）；v1.1 参照二进制同为 -O0 ✓。
+    local CFLAGS="-Wall -Werror -Wextra -Wunused-macros -O2 -DFFRDP_DIAG=1 -DFFRDP_FEC_ENABLE=1"
     local LDFLAGS="-lpthread"
     case "$CROSS_COMPILE" in
     *mingw*)
