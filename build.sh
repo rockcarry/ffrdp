@@ -3,10 +3,30 @@
 # environment needs:
 # TOOLCHAIN_NAME       - indicate toolchain name
 # BUILD_PACKAGE_OUTDIR - indicate package binary output dir, if empty $PWD/out will be used
+# BUILD                - build tier: dev (default) | ship
+#
+# 用法:
+#   bash build.sh            # = dev：仪表全开（读数/判据/check.sh 都用这一档 ✓）
+#   bash build.sh dev        # 同上
+#   bash build.sh ship       # 出货：仪表编掉 + LTO（**性能数字只认这一档** ✓）
+#   BUILD=ship bash build.sh # 同一个意思（环境变量形式，给不方便传参的脚本用 ✓）
 
 set -e
 
 TOPDIR=$PWD
+
+# 档位：命令行参数优先，其次 BUILD，默认 dev（= 改造前的编译选项 ✓，check.sh / tools/*.sh 都靠它取读数 ✓）
+BUILD_MODE=${BUILD:-dev}
+case "$1" in
+dev|ship) BUILD_MODE="$1" ;;
+esac
+case "$BUILD_MODE" in
+dev|ship) ;;
+*)
+    echo -e "\n\033[31munknown build tier '$BUILD_MODE' (want: dev | ship)\033[0m\n" >&2
+    exit -1
+    ;;
+esac
 
 if [ "$BUILD_PACKAGE_OUTDIR"x = ""x ]; then
     BUILD_PACKAGE_OUTDIR=$PWD/out
@@ -44,13 +64,28 @@ build_package()
         exit -1
     fi
 
-    # -Wextra / -Wunused-macros：多余参数、隐式落空、未用宏都当错（2026-10-16 实测 5 个单元全干净 ✓）
-    # -DFFRDP_DIAG=1：dev 构建保留完整诊断（dump/①-xx/计数器）✓；出货构建去掉该宏 ✓
-    # -DFFRDP_FEC_ENABLE=1：dev/判据构建要 FEC 全功能（t_fec 那一项 ✓）；出货不传 ⇒ 编译掉 ✓
-    # -O2：2026-10-17 实测（lo 限速 60MB/s ✓）—— 不加任何 -O 就是 -O0，CPU 白付 ~25 个点 ✗
-    # （150% → ~123%，且吞吐从 ~37k fps 回到满速 48k fps ✓）；v1.1 参照二进制同为 -O0 ✓。
-    local CFLAGS="-Wall -Werror -Wextra -Wunused-macros -O2 -DFFRDP_DIAG=1 -DFFRDP_FEC_ENABLE=1"
+    # ── 两档的差别只在这里 ───────────────────────────────────────────────────
+    # dev（默认）：-O2 + -g，-DFFRDP_DIAG=1 保留完整仪表（dump/①-xx/计数器），FEC 全功能（t_fec 要它 ✓）。
+    #   ⚠️ 仪表会吃 CPU（printf + 静态计数内存）⇒ **dev 的吞吐/CPU 数字不能当性能结论** ✓。
+    # ship：-O3 + LTO、-DFFRDP_DIAG=0（dump 与只给 dump 用的计数器整段编掉 ⇒ 无 printf、无静态内存）、
+    #   不开 FEC（fec:N 被忽略并提示一次 ✓）、-DNDEBUG。**要报性能就用这一档** ✓。
+    # 两档都保持 -Werror：警告当错是编译期的事，与优化级别无关 ✓。
+    local CFLAGS="-Wall -Werror -Wextra -Wunused-macros"
     local LDFLAGS="-lpthread"
+    local AR="${CROSS_COMPILE}ar"
+    case "$BUILD_MODE" in
+    dev)
+        CFLAGS="$CFLAGS -O2 -g -DFFRDP_DIAG=1 -DFFRDP_FEC_ENABLE=1"
+        ;;
+    ship)
+        # LTO 的 .o 里是 GIMPLE 字节码：binutils 的 ar 要靠 plugin 才认，gcc-ar 是带 plugin 的包装 ✓。
+        if command -v "${CROSS_COMPILE}gcc-ar" > /dev/null 2>&1; then
+            AR="${CROSS_COMPILE}gcc-ar"
+        fi
+        CFLAGS="$CFLAGS -O3 -DNDEBUG -DFFRDP_DIAG=0 -flto"
+        LDFLAGS="$LDFLAGS -flto"
+        ;;
+    esac
     case "$CROSS_COMPILE" in
     *mingw*)
         LDFLAGS="$LDFLAGS -lws2_32"
@@ -62,6 +97,7 @@ build_package()
         ;;
     esac
 
+    echo "build tier: $BUILD_MODE (${CROSS_COMPILE}gcc)"
     gen_libffrdp_pkgconfig_file
     # 协议层依赖传输层：ffrdp.c 现在只认 lowlevel 的接口（send / timer / 回调），实现是 lowlevel-udp.c，
     # 它自己又用 socket.c 与 utils.c（工作线程）。所以这几份一起进库 —— 少一份就是运行期才发现的
@@ -70,7 +106,7 @@ build_package()
     ${CROSS_COMPILE}gcc -c $CFLAGS lowlevel-udp.c
     ${CROSS_COMPILE}gcc -c $CFLAGS socket.c
     ${CROSS_COMPILE}gcc -c $CFLAGS utils.c
-    ${CROSS_COMPILE}ar rcs libffrdp.a ffrdp.o lowlevel-udp.o socket.o utils.o
+    $AR rcs libffrdp.a ffrdp.o lowlevel-udp.o socket.o utils.o
     ${CROSS_COMPILE}gcc $CFLAGS test.c libffrdp.a $LDFLAGS -o test_ffrdp
     mkdir -p $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/include
     mkdir -p $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/lib/pkgconfig
@@ -81,11 +117,15 @@ build_package()
 }
 
 case "$1" in
-"")
+""|dev|ship)
     build_package
     ;;
 clean|distclean)
     rm -rf *.o *.a *.exe *.pc test_ffrdp out/
+    ;;
+*)
+    echo -e "\n\033[31munknown argument '$1' (want: dev | ship | clean | distclean)\033[0m\n" >&2
+    exit -1
     ;;
 esac
 
