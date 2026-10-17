@@ -1036,15 +1036,21 @@ static uint64_t ffrdp_us(void)
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
 }
 
-// ══ ①-25（本轮实验 ✓）：ack 的**时机**旋钮 ═══════════════════════════════════════════
-// 默认 0 = 保持现状：收到帧就在 RECV 回调里**当场回** ack（注释里写明这是为省一整圈 RTT ✓）。
-#define FFRDP_ACK_COALESCE 0       // 0 = 收到帧当场回 ack（默认 ✓）；1 = 一圈一个 ack（v1.1 形状）
+// ══ ack 的**时机**（①-25 起的旋钮；①-41 转正为 1 ✓）═════════════════════════════════
+// 1 = 一批帧只回一个 ack：ACK_DUE 留给同一圈的 TIMER 支发（v1.1 形状 ✓）。
+//     不额外花一圈 —— lowlevel 每圈"先收活、再取时钟"，回调里 arm 的期限在**同一圈**投递 ✓
+//     （lowlevel.h 的约定 ✓），所以 RTT 里不多含一圈。
+// 0 = 收到帧就在 RECV 回调里当场回（旧默认 ✗）：批 3 帧就发 3 个 ack。
+// 转正依据（lo 实测，docs/ffrdp-optimization.md §3.1）：收包 37.1k/s 里 18.3k 是 ack（49% ✗）、
+// 每个 ack 值 2 µs ⇒ 光发 ack 就 3.7% CPU；合并后 ack 数按"圈"收敛（批 3.1 帧 ⇒ −68% ✓）。
+#define FFRDP_ACK_COALESCE 1
 
 static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 {
     FFRDP_FRAME_NODE *p;
     int32_t dist, recv_mack, recv_wnd, size, i, alen;
     uint8_t data[9];
+    uint64_t t_ack0 = ffrdp_us();   // 诊断：回 ack 的**自身**成本（构帧 + 交给内核 ✓）
     while (c->recv_list_head) {
         dist = seq_distance(GET_FRAME_SEQ(c->recv_list_head), c->recv_seq);
         // size > 0 is the second line of defence against a frame whose length arithmetic went negative:
@@ -1088,6 +1094,12 @@ static void ffrdp_recvdata_and_sendack(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     // the network ate -- and the peer pays for both with a timeout. counting it is the whole change: the
     // ack is still attempted, and nothing here acts on the result.
     if (ffrdp->lowlevel->send(ffrdp->lowlevel, c->peer_addr, data, alen) != 0) FFRDP_CNT(c, counter_send_err); // send ack frame
+    // ①：合并之后 ack 改在 TIMER 支里发，原来那段"RECV 回调内"的记账就不存在了 ⇒ 搬到这里 ✓。
+    // 读数含义从"收到帧 → 已交给内核"变成"回一个 ack 的自身成本"，dump 里那行因此仍然有意义 ✓。
+    {   uint64_t dt = ffrdp_us() - t_ack0;
+        c->ack_lat_n++; c->ack_lat_sum_us += dt;
+        if (dt > c->ack_lat_max_us) c->ack_lat_max_us = (uint32_t)dt;
+    }
 }
 
 enum { CEVENT_ACK_OK, CEVENT_ACK_TIMEOUT, CEVENT_ACK_TIMEOUT_MISSED, CEVENT_FAST_RESEND, CEVENT_SEND_FAILED };
@@ -1934,17 +1946,12 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
                         if (fb[0] == FFRDP_FRAME_TYPE_ACK) ffrdp_on_ack(cc, fb, n, &b);
                         else                               b.got_query = 1;
                     } else if (!ffrdp_on_frame(cc, node, n, &b)) free(node);  // 没被乱序队列接管 ⇒ 归我们
-                    uint64_t t_ack0 = ffrdp_us();   // 诊断：从能回 ack 这一刻算起
                     ffrdp_apply_acks(cc, &b);
-                    // 收到帧就当场回 ack，别等下一圈 TIMER（以前那一步要花掉整整一圈，lap 平均 2~3ms），
-                    // 对端看到的 RTT 里就含着我们这一圈。顺带把"收到帧→已交给内核"的耗时记下来：
-                    // 服务端比老架构多等的那 5~7ms 若不在这一段，就一定在内核/驱动出队之后。
-                    if (!FFRDP_ACK_COALESCE && (cc->flags & FLAG_ACK_DUE)) {   // ①-25：关掉就是留到 TIMER 那一支 ✓
+                    // ack 的时机见 FFRDP_ACK_COALESCE（=1 时欠着，留给同一圈的 TIMER 支发一个 ✓）。
+                    // ack 的耗时记账在 ffrdp_recvdata_and_sendack 里 ⇒ 两条时机下都能量到 ✓。
+                    if (!FFRDP_ACK_COALESCE && (cc->flags & FLAG_ACK_DUE)) {
                         cc->flags &= ~FLAG_ACK_DUE;
                         ffrdp_recvdata_and_sendack(ffrdp, cc);
-                        uint64_t dt = ffrdp_us() - t_ack0;
-                        cc->ack_lat_n++; cc->ack_lat_sum_us += dt;
-                        if (dt > cc->ack_lat_max_us) cc->ack_lat_max_us = (uint32_t)dt;
                     }
                 }
             }
