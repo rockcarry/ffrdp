@@ -355,12 +355,14 @@ int main(int argc, char *argv[])
         if (strstr(argv[i], "--server=") == argv[i]) {
             server_en = 1;
             if (strcmp(argv[i] + 9, "") != 0) {
-                strncpy(server_bind_ip, argv[i] + 9, sizeof(server_bind_ip));
+                // snprintf 而不是 strncpy：源串可能比目标长 ⇒ strncpy 会填满 32 字节而不留结尾的 0
+                // （-O2 下 gcc 的 -Wstringop-truncation 就会拦下它）。
+                snprintf(server_bind_ip, sizeof(server_bind_ip), "%s", argv[i] + 9);
             }
         } else if (strstr(argv[i], "--client=") == argv[i]) {
             client_en = 1;
             if (strcmp(argv[i] + 9, "") != 0) {
-                strncpy(client_cnnt_ip, argv[i] + 9, sizeof(client_cnnt_ip));
+                snprintf(client_cnnt_ip, sizeof(client_cnnt_ip), "%s", argv[i] + 9);
             }
         } else if (strcmp(argv[i], "--server") == 0) {
             server_en = 1;

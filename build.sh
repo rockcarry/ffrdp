@@ -44,7 +44,7 @@ build_package()
         exit -1
     fi
 
-    local CFLAGS="-Wall -Werror"
+    local CFLAGS="-Wall -Werror -O2"
     local LDFLAGS="-lpthread"
     case "$CROSS_COMPILE" in
     *mingw*)
