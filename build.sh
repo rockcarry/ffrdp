@@ -47,7 +47,7 @@ build_package()
     # -DFFRDP_DIAG=1：dev/判据构建要完整仪表（dump + 只给 dump 用的计数器）；
     # -DFFRDP_FEC_ENABLE=1：dev/判据构建要 FEC 全功能。
     # 出货**两个都不传** ⇒ dump/计数器/FEC 三块一起编译掉，且门槛仍是 -Wall -Werror -Wextra -Wunused-macros。
-    local CFLAGS="-Wall -Werror -Wextra -Wunused-macros -DFFRDP_DIAG=1 -DFFRDP_FEC_ENABLE=1"
+    local CFLAGS="-Wall -Werror -Wextra -Wunused-macros -O2 -DFFRDP_DIAG=1 -DFFRDP_FEC_ENABLE=1"
     local LDFLAGS="-lpthread"
     case "$CROSS_COMPILE" in
     *mingw*)
