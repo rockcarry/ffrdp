@@ -59,7 +59,12 @@
 #define FFRDP_MAX_RTO        2000
 #define FFRDP_MAX_WAITSND    256  // 受理侧的帧数闸；必须 >= 在途上限与 max_cwnd，否则它比协议闸门更紧
 #define FFRDP_QUERY_CYCLE    500
-#define FFRDP_FLUSH_TIMEOUT  500
+// 半帧（还没攒满 smss 的那个节点）什么时候发走 = **距最后一次追加字节**超过 IDLE ✓。
+// 音视频要的就是这个：一帧的尾巴不该等着被下一帧填满（25 fps ⇒ 白等 40 ms ✗），更不该等半秒 ✗。
+// 判据是"应用停手了"，不是"每 N ms 冲一次" ⇒ 持续供数据的流里这个条件**不会成立** ✓
+// （`cur_new_tick` 每次追加都刷新，notes §26.95）⇒ 对饱和吞吐没有影响 ✓。
+// 想回到改造前的行为（一直等到 500 ms 或被下一条填满）就把 IDLE 设成 500 ✓。
+#define FFRDP_FLUSH_IDLE     2
 #define FFRDP_DEAD_TIMEOUT   5000
 #define FFRDP_MIN_CWND_SIZE  1
 #define FFRDP_DEF_CWND_SIZE  32
@@ -1384,7 +1389,8 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         if (entry < (int)c->cwnd && (!due || (int32_t)(q->tick_timeout - due) < 0)) { due = q->tick_timeout; }
     }
     if (c->cur_new_node) {
-        x = c->cur_new_tick + FFRDP_FLUSH_TIMEOUT;
+        // 与 tick 里那条判据**必须同一个值**（IDLE 更小）⇒ 否则周期算不到，半帧要等别的期限才醒来 ✗
+        x = c->cur_new_tick + FFRDP_FLUSH_IDLE;
         if (!due || (int32_t)(x - due) < 0) { due = x; }
     }
     x = c->rate_tick + 1000;
@@ -1509,10 +1515,12 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         }
     }
 
-    if (c->cur_new_node && ((int32_t)NOW_MS() - (int32_t)c->cur_new_tick > FFRDP_FLUSH_TIMEOUT || c->flags & FLAG_FLUSH)) {
+    // 出口 ② 的判据：**应用停手超过 IDLE**（或应用显式 flush）✓。不是"每 IDLE 冲一次"：
+    // 持续供数据时 `cur_new_tick` 一直被刷新 ⇒ 帧总是攒满走出口 ①，这条不成立 ⇒ 吞吐不受影响 ✓。
+    if (c->cur_new_node && ((int32_t)NOW_MS() - (int32_t)c->cur_new_tick > FFRDP_FLUSH_IDLE || c->flags & FLAG_FLUSH)) {
         c->cur_new_node->data[0] = FFRDP_FRAME_TYPE_SHORT;
         c->cur_new_node->size    = 4 + c->cur_new_size;
-        ffrdp_frame_encrypt(ffrdp, c, c->cur_new_node);   // 出口 ②：超时/flush 的短帧 ✓
+        ffrdp_frame_encrypt(ffrdp, c, c->cur_new_node);   // 出口 ②：空闲/flush 的短帧 ✓
         list_enqueue(&c->send_list_head, &c->send_list_tail, c->cur_new_node);
         c->send_seq++; c->wait_snd++;
         c->cur_new_node = NULL;
@@ -2029,7 +2037,7 @@ void ffrdp_flush(void *ctxt, int conn)
     pthread_mutex_lock(&ffrdp->lock);
     // conn < 0 = 对全部连接生效 ✓；conn >= 0 = **只对那一条** ✓（ffrdp.h 的承诺）。
     // ⚠️ 原来固定取 table[0] ✗：服务端的主连接占 0 号、accept 出来的客户端是 1..N ⇒ 对客户端调
-    //    flush 一个字节都刷不出去，只能等 FFRDP_FLUSH_TIMEOUT（500 ms）⇒ 多连接时这条 API 形同虚设 ✗。
+    //    flush 一个字节都刷不出去，只能等 FFRDP_FLUSH_IDLE 的空闲冲刷兜底 ⇒ 多连接时这条 API 形同虚设 ✗。
     for (i = 0; i < ffrdp->nconn; i++) {
         FFRDPCONN *c;
         if (conn >= 0 && i != conn) continue;
