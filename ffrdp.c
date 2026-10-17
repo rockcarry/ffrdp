@@ -89,6 +89,10 @@
 // ── 在途闸门：真正管住"线上同时有几帧"的量 ───────────────────────────────
 // 对端通告的窗口当不了闸门（每次 ack 都重新发一遍 ⇒ 不约束任何东西）。
 #define FFRDP_INFLIGHT_MAX   64
+// B2（§8 #4）：闸门能"升"的天花板。默认 64 是**没有证据时**的保守值，而"顶死 + 没队列 + 没浪费"
+// 三条都由测量给出时，可以升到这里。再往上是 cwnd（FFRDP_MAX_CWND_SIZE 128）、受理侧 wait_snd
+// 以及对端通告的窗口（swnd）三道别的闸门 —— 过 CEIL 不再有意义。
+#define FFRDP_INFLIGHT_CEIL  128
 #define FFRDP_INFLIGHT_MIN   4    // 探测能下探到的地板
 
 // ── 编译期实验开关（默认即生产值；改这里重编）─────────────────────────────
@@ -117,6 +121,7 @@
 #define FFRDP_PROBE_RTT_DROP_MS     2   // rtts 至少要降这么多 ms 才算赢（绝对值；相对值会被单次采样带偏）
 #define FFRDP_PROBE_RATE_KEEP_PCT   85  // ... 同时确认速率不低于历史最好值的这个百分比
 #define FFRDP_PROBE_GIVEBACK_IDLE_S 5   // giveback 要先"连续健康"这么多秒（还的速度不快过证明的速度）
+#define FFRDP_CAP_RISE_IDLE_S       5   // B2：闸门"能升"要先连续这么多秒"顶死 + 没队列 + 没浪费" ✓
 #define FFRDP_PROBE_QUEUE_RATIO     3   // 排队判据：rtts/rtt_min 超过这个倍数才值得问
 #define FFRDP_PROBE_WASTE_PM        5   // ... 或重传强度（每千次首发）到这个数
 #define FFRDP_PROBE_GAP_MS          10000
@@ -270,6 +275,10 @@ typedef struct {
     uint32_t probe_res_ref;       // 重传总数（rto+fast）在探测开始时的快照：用来量"重传强度变没变" ✓
     uint32_t giveback_idle;       // 连续健康的秒数（giveback 要先攒够 FFRDP_PROBE_GIVEBACK_IDLE_S ✓）
     uint32_t last_giveback;       // 上一次 giveback 的时刻：频率不得高于探测周期 ✓
+    // B2：闸门"能升"的那一套。只有"顶死 + 没队列 + 没浪费"连续成立才升，且升频不高于探测周期 ✓
+    uint32_t cap_idle;            // 上面三条连续成立的秒数 ✓
+    uint32_t tick_cap_rise;       // 上一次升的时刻 ✓
+    uint32_t tick_cap_revert;     // 上一次探测 revert 的时刻（它刚说过"小了没赚" ⇒ 一个周期内不升 ✓）
     uint32_t probe_waste_ref;     // 探测前一刻的 probe_waste（每千首发帧的重传数 ✓）：与之相比
     uint32_t probe_rate_ref;      // frames per second the peer confirmed just before the probe
     uint32_t rate_best;           // best confirmed rate ever seen (decays 1/16 per second): the reference a keep must survive
@@ -355,6 +364,7 @@ typedef struct {
     uint32_t counter_probe, counter_probe_keep, counter_probe_revert;
     uint32_t counter_probe_mem;   // ①-39：其中由"上限定得比实际需要高"触发的次数 ✓
     uint32_t counter_probe_narrow, counter_giveback;
+    uint32_t counter_cap_rise;     // B2：闸门自己升上去的次数 ✓
     uint32_t reserved;            // diag 段到此为止：ffrdp_dump 会把这之前的计数器清零
 #endif
 } FFRDPCONN;
@@ -1706,14 +1716,48 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             if (c->rate_now >= c->rate_best) c->rate_best = c->rate_now;
             else                             c->rate_best -= c->rate_best / 4;
             // 事后修复：被 keep 的闸门把确认速率拖到最好值的某个比例以下，就按秒翻倍还回去。
-            if (c->cap_kept && c->cap_kept < FFRDP_INFLIGHT_MAX && c->rate_best &&
+            if (c->cap_kept && c->cap_kept < FFRDP_INFLIGHT_CEIL && c->rate_best &&
                 c->rate_now * 100 < c->rate_best * FFRDP_PROBE_RATE_KEEP_PCT &&
                 (int32_t)NOW_MS() - (int32_t)c->last_giveback >= (int32_t)FFRDP_PROBE_GAP_MS) {
                 // 原来这里是 *2：从被证明的 4 翻到 32 只要 3 秒 ✗ ⇒ 一步就能追上下探（探测每 10 秒才问一次 ✗），
                 // 于是"刚降下来又被抬回去"。改成 +25%：4→5→6→8→10→13→16→20→25→32 约十秒 = 一个探测周期 ✓
-                c->cap_kept = MIN(c->cap_kept + MAX(c->cap_kept / 4, 1), FFRDP_INFLIGHT_MAX);
+                // ⚠️ 这里的上限必须是 CEIL 而不是 MAX：被 B2 升到 64 以上的 cap_kept 一旦 ≥ MAX，
+                //    原来那条 `cap_kept < FFRDP_INFLIGHT_MAX` 就恒假 ⇒ 事后修复与 giveback 双双失效 ✗
+                c->cap_kept = MIN(c->cap_kept + MAX(c->cap_kept / 4, 1), FFRDP_INFLIGHT_CEIL);
                 c->last_giveback = NOW_MS();   // 记时刻 ⇒ 两处共用同一个"还的预算" ✓
                 FFRDP_CNT(c, counter_giveback);
+            }
+            // ── B2：闸门能升（`ffrdp-optimization.md` §8 的 #4）────────────────────
+            // 上面几条往上走的路都要求 `cap_kept` 非零（= 之前至少赢过一次）⇒ "从没赢过"的连接永远停在
+            // 默认 64 帧。而在**高 BDP 且不排队**的链路上，64 帧就是硬天花板：仿真里干净 200 ms 链路
+            // 把上限从 64 抬到 128，交付量 +102%、重传率反降 ⇒ 这条缺口是真的会限吞吐 ✓。
+            // 升的三条前提必须**都由测量给出**，缺一条就清零重攒：
+            //   · 顶死：在途刚好就是上限（否则升了也用不上）✓
+            //   · 没队列：rtts 贴着 rtt_min（与 giveback 同一个判据、同一个 slack ✓）
+            //   · 没浪费：probe_waste 低于健康线（有浪费说明是链路在丢，不是我们的窗口不够 ✗）
+            // 再加两道频率闸：探测刚 revert 过一个周期内不升（它刚说过"小窗口没赚"✗）；
+            // 每 FFRDP_PROBE_GAP_MS 最多升一次（升得比探测问得还快，就会自己打自己 ✓）。
+            {
+                uint32_t out = 0, next;
+                for (q = c->send_list_head; q; q = q->next) if (q->flags & FLAG_FIRST_SEND) out++;
+                next = c->inflight_max + MAX(c->inflight_max / 4, 1);
+                if (next > FFRDP_INFLIGHT_CEIL) next = FFRDP_INFLIGHT_CEIL;
+                if (c->probe_state == 0 && c->inflight_max < FFRDP_INFLIGHT_CEIL && out >= c->inflight_max &&
+                    c->rtt_min && c->rtts != (uint32_t)-1 &&
+                    c->rtts <= c->rtt_min + FFRDP_PROBE_RTT_DROP_MS &&
+                    c->probe_waste < FFRDP_PROBE_HEALTHY_PCT &&
+                    c->swnd >= next &&                     // 对端窗口吃不下 ⇒ 升了也发不出去 ✗
+                    (int32_t)now - (int32_t)c->tick_cap_revert >= (int32_t)FFRDP_PROBE_GAP_MS &&
+                    (int32_t)now - (int32_t)c->tick_cap_rise   >= (int32_t)FFRDP_PROBE_GAP_MS) {
+                    if (++c->cap_idle >= FFRDP_CAP_RISE_IDLE_S) {
+                        c->cap_kept      = next;
+                        c->cap_idle      = 0;
+                        c->tick_cap_rise = now;
+                        FFRDP_CNT(c, counter_cap_rise);
+                    }
+                } else {
+                    c->cap_idle = 0;
+                }
             }
         }
         if (c->probe_state == 0) {
@@ -1806,6 +1850,8 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                     if (rtt_down) FFRDP_CNT(c, counter_probe_narrow);
                     c->probe_gap  = MIN(c->probe_gap * 2, (uint32_t)FFRDP_PROBE_GAP_MAX_MS);
                     c->probe_next = now + c->probe_gap;
+                    c->tick_cap_revert = now;   // B2：它刚说过"小窗口没赚" ⇒ 一个周期内别升 ✗
+                    c->cap_idle = 0;
                     FFRDP_CNT(c, counter_probe_revert);
                 }
                 c->probe_state = 0;
@@ -2177,9 +2223,9 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     {   // 探测：线上真有多少帧、生效的上限是多少、实验报了什么（看 rtt ref->best）。
         FFRDP_FRAME_NODE *q; uint32_t out = 0;
         for (q = c->send_list_head; q; q = q->next) if (q->flags & FLAG_FIRST_SEND) out++;
-        printf("inflight, cap       : %u, %u (kept %u; probes %u keep %u revert %u too-far %u giveback %u)\n",
+        printf("inflight, cap       : %u, %u (kept %u; probes %u keep %u revert %u too-far %u giveback %u rise %u)\n",
                out, c->cap, c->cap_kept, c->counter_probe, c->counter_probe_keep,
-               c->counter_probe_revert, c->counter_probe_narrow, c->counter_giveback);
+               c->counter_probe_revert, c->counter_probe_narrow, c->counter_giveback, c->counter_cap_rise);
         // 真正管住线上的那道闸：限的是在途帧数，对端信用不参与（它从来没限制住过什么）。
         printf("in-flight limit     : %u frames (default %u; the probe lowers it when it proves a win)\n",
                c->inflight_max ? c->inflight_max : FFRDP_INFLIGHT_MAX,

@@ -100,7 +100,7 @@ gcc -O1 -w $HAVE_B -DSIMLL_BASE -c simll.c -o simll_base.o
 # utils.c lives one level up (run.sh works from tools/sim).
 # -I../..: the copy sits here, so its quoted includes ("utils.h") need the repo root on the path.
 gcc -O1 -w -I../.. -c utils_sim.c -o utils.o
-TESTS="${TESTS:-t_rto t_pseudo t_cwnd t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_flush t_probe t_sweep t_keepalive t_init t_dump t_fec hs-e2e e2e-raw e2e}"
+TESTS="${TESTS:-t_rto t_pseudo t_cwnd t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_flush t_probe t_sweep t_cap t_keepalive t_init t_dump t_fec hs-e2e e2e-raw e2e}"
 
 # 每一侧的输出同时进终端与一份日志：末尾的"判定汇总"从日志里读，免得靠人眼看统计数字。
 # 统计行（resend%、rto_floor、ooo 直方图……）随负载与旋钮变化，不是判据。
@@ -126,6 +126,7 @@ for t in $TESTS; do
         grep -q counter_ooo_d1_24 ffrdp_$v.c && EXTRA="$EXTRA -DOOO_HIST"
         grep -q counter_ooo_d65_128 ffrdp_$v.c && EXTRA="$EXTRA -DOOO_HIST2"
         grep -q counter_tailprobe ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_TAILPROBE"
+        grep -q counter_cap_rise ffrdp_$v.c && EXTRA="$EXTRA -DHAVE_CAPRISE"
         # ffrdp_send/recv gained a timeout argument at some point, and the tests are compiled against both
         # sides, so tell them which shape they are looking at (the tests' TEST_SEND/TEST_RECV wrappers
         # mean "do not wait" on both, which is what HEAD does).
@@ -237,6 +238,12 @@ for t in $TESTS; do
                 printf "  work " | tee -a "$SIMLOG"; run $RUN ./t_sweep_new  $d $s
             done
         done ;;
+    t_cap)
+        # B2：闸门"能升" —— 干净高 RTT 上 cap 64→(>64)；有队列的链路不许升；升过之后探测还能砍回来 ✓
+        echo
+        echo "===== t_cap: 在途闸门「能升」（顶死 + 没队列 + 没浪费 / revert 后不升）====="
+        echo "-- HEAD --" | tee -a "$SIMLOG"; run $RUN ./t_cap_base
+        echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_cap_new ;;
     t_crypto)
         # 加密回调：协议层把帧载荷交给应用（原地改、长度不变 ⇒ 对 send/recv 透明 ✓）
         # 两条出口（攒满 smss / 超时短帧）都必须挂上，否则一种帧明文出去 ✗。
