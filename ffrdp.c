@@ -1150,11 +1150,54 @@ typedef struct {
     int     got_query;  // 本批收到过查询帧 ⇒ 要回 ack
 } FFRDP_RX_BATCH;
 
+// ack 帧：一条 8~9 字节的数据报 ⇒ **就地解析**，别为它分配 1500 字节的节点再拷一遍 ✗（②）。
+// 只读 data[0..len-1]，不持有指针 ✓（传输层的缓冲只在回调期间有效 ✓）。线上格式与语义都没变 ✓。
+static void ffrdp_on_ack(FFRDPCONN *c, const uint8_t *data, int len, FFRDP_RX_BATCH *b)
+{
+    int32_t  una, mack, dist, i, j;
+    uint32_t w0, w1;
+
+    // 短到读不出 una/window 就丢 ✓（以前读的是节点里的未初始化内存 ✗）。
+    // 用 memcpy 取值而不是 `*(uint32_t*)data` ✗：传进来的缓冲不保证 4 字节对齐（栈上 uint8_t[]）。
+    if (len < 8) return;
+    memcpy(&w0, data + 0, 4); una  = (int32_t)(w0 >> 8);
+    memcpy(&w1, data + 4, 4); mack = (int32_t)(w1 & 0xFFFFFFu);
+
+    c->counter_ack_recv++;
+    // the peer's count of our retransmits that it had already accepted. this is the one piece of
+    // evidence our own counters cannot fake, so it is what the rto floor is driven by.
+    if (len >= 9 && data[8]) { FFRDP_CNT_ADD(c, counter_ack_dup, data[8]); c->win_dup += data[8]; }
+    if (c->counter_ack_recv > 1 && (uint32_t)una == c->ack_una) FFRDP_CNT(c, counter_ack_una_dup); // the peer did not move
+    c->ack_una = (uint32_t)una;
+    if (mack) { // the peer reported frames that arrived after a hole
+        FFRDP_CNT(c, counter_ack_mack);
+        // counted in bits, to be compared with counter_mack_bits_tx on the other side: a
+        // report that never arrived and a report that was never made look identical from here.
+        for (j = 0; j < 24; j++) if (mack & (1 << j)) FFRDP_CNT(c, counter_mack_bits_rx);
+        for (i = 23; i >= 0 && !(mack & (1 << i)); i--);
+        for (j = 0; j < i && (mack & (1 << j)); j++);
+        if (j < i) FFRDP_CNT(c, counter_ack_hole); // a gap below the highest acked frame
+    }
+    dist = seq_distance(una, b->send_una);
+    if (dist >= 0) {
+        b->send_una  = una;
+        b->send_mack = (b->send_mack >> dist) | mack;
+        // the peer's window is a buffer size, not a rate: on the measured link it allowed 148
+        // frames where the path carried five, and the rest sat in its buffer as a standing queue
+        // of about 200ms. cap is what a probe has proven, and what is being tested right now.
+        c->swnd = data[7];
+        c->peer_wnd_raw = c->swnd;
+        // 信用不再夹到 cap：探测驱动的是"在途量"这道真闸，再夹一次就是第二道刹车（真机上会把发送饿死）。
+        if (c->swnd > FFRDP_MAX_WAITSND) c->swnd = FFRDP_MAX_WAITSND;
+        c->tick_recv_ack = get_timestamp32_ms();
+    }
+}
+
 // 一帧：解析、记账。node 由调用方分配好（data/size 已就绪），这样"复用同一个节点"的旧写法保持
 // 不变。返回 1 = 已移交给乱序队列（调用方不要再碰它）；返回 0 = 调用方可以复用或释放它。
 static int ffrdp_on_frame(FFRDPCONN *c, FFRDP_FRAME_NODE *node, int len, FFRDP_RX_BATCH *b)
 {
-    int32_t una, mack, dist, i, j;
+    int32_t dist;
     int     taken = 0;
 
     if (node->data[0] <= FFRDP_FRAME_TYPE_FEC32) { // data frame
@@ -1188,36 +1231,7 @@ static int ffrdp_on_frame(FFRDPCONN *c, FFRDP_FRAME_NODE *node, int len, FFRDP_R
             b->got_data = 1;
         }
     } else if (node->data[0] == FFRDP_FRAME_TYPE_ACK) { // ack frame
-        una  = *(uint32_t*)(node->data + 0) >> 8;
-        mack = *(uint32_t*)(node->data + 4) & 0xFFFFFF;
-        c->counter_ack_recv++;
-        // the peer's count of our retransmits that it had already accepted. this is the one piece of
-        // evidence our own counters cannot fake, so it is what the rto floor is driven by.
-        if (len >= 9 && node->data[8]) { FFRDP_CNT_ADD(c, counter_ack_dup, node->data[8]); c->win_dup += node->data[8]; }
-        if (c->counter_ack_recv > 1 && (uint32_t)una == c->ack_una) FFRDP_CNT(c, counter_ack_una_dup); // the peer did not move
-        c->ack_una = (uint32_t)una;
-        if (mack) { // the peer reported frames that arrived after a hole
-            FFRDP_CNT(c, counter_ack_mack);
-            // counted in bits, to be compared with counter_mack_bits_tx on the other side: a
-            // report that never arrived and a report that was never made look identical from here.
-            for (j = 0; j < 24; j++) if (mack & (1 << j)) FFRDP_CNT(c, counter_mack_bits_rx);
-            for (i = 23; i >= 0 && !(mack & (1 << i)); i--);
-            for (j = 0; j < i && (mack & (1 << j)); j++);
-            if (j < i) FFRDP_CNT(c, counter_ack_hole); // a gap below the highest acked frame
-        }
-        dist = seq_distance(una, b->send_una);
-        if (dist >= 0) {
-            b->send_una  = una;
-            b->send_mack = (b->send_mack >> dist) | mack;
-            // the peer's window is a buffer size, not a rate: on the measured link it allowed 148
-            // frames where the path carried five, and the rest sat in its buffer as a standing queue
-            // of about 200ms. cap is what a probe has proven, and what is being tested right now.
-            c->swnd = node->data[7];
-            c->peer_wnd_raw = c->swnd;
-            // 信用不再夹到 cap：探测驱动的是"在途量"这道真闸，再夹一次就是第二道刹车（真机上会把发送饿死）。
-            if (c->swnd > FFRDP_MAX_WAITSND) c->swnd = FFRDP_MAX_WAITSND;
-            c->tick_recv_ack = get_timestamp32_ms();
-        }
+        ffrdp_on_ack(c, node->data, len, b);            // 语义与以前逐行一致，只是搬走了 ✓（就地解析也走它 ✓）
     } else if (node->data[0] == FFRDP_FRAME_TYPE_QUERY) b->got_query = 1;
     return taken;
 }
@@ -1895,17 +1909,31 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
                 FFRDP_CNT(cc, counter_rx_foreign);   // 半开连接上的数据帧：握手没完成 ⇒ 丢
             } else if (!ffrdp->is_server || (cc->flags & FLAG_CONNECTED)) {
                 int n = msg->len;
-                FFRDP_FRAME_NODE *node = frame_node_new(FFRDP_FRAME_TYPE_FEC2, FFRDP_MAX_RX_MSS);
-                if (!node) ret = -1;
-                else {
+                const uint8_t  *fb = (const uint8_t*)msg->buf;
+                FFRDP_FRAME_NODE *node = NULL;
+                // ② ack（8~9 字节）/ query（4 字节）这类小控制帧**就地解析** ✓：
+                //    它是主路径上数量过半的包（实测 lo：收包 37.1k/s 里 18.3k 是 ack ⇒ 49% ✗），
+                //    却要为它 calloc 一个 1500 字节的节点再 memcpy 一遍 ⇒ 纯亏 ✗。
+                //    线上格式、语义、计数一律不变 ✓（ack 的分支逐行搬到 ffrdp_on_ack ✓）。
+                int inplace = (fb[0] == FFRDP_FRAME_TYPE_ACK || fb[0] == FFRDP_FRAME_TYPE_QUERY);
+                if (!inplace) {
+                    node = frame_node_new(FFRDP_FRAME_TYPE_FEC2, FFRDP_MAX_RX_MSS);
+                    if (!node) ret = -1;
+                    else {
+                        // 传输层一帧最大 FFRDP_LOWLEVEL_FRAME_MAX，接收节点按**收** MSS 建：夹一下，别越界。
+                        if (n > (int)node->size) n = (int)node->size;
+                        memcpy(node->data, msg->buf, (size_t)n);
+                    }
+                }
+                if (inplace || node) {
                     FFRDP_RX_BATCH b;
-                    // 传输层一帧最大 FFRDP_LOWLEVEL_FRAME_MAX，接收节点按**收** MSS 建：夹一下，别越界。
-                    if (n > (int)node->size) n = (int)node->size;
-                    memcpy(node->data, msg->buf, (size_t)n);
                     b.recv_una  = cc->recv_seq;
                     b.send_una  = cc->send_list_head ? GET_FRAME_SEQ(cc->send_list_head) : 0;
                     b.send_mack = 0; b.got_data = 0; b.got_query = 0;
-                    if (!ffrdp_on_frame(cc, node, n, &b)) free(node);  // 没被乱序队列接管 ⇒ 归我们
+                    if (inplace) {
+                        if (fb[0] == FFRDP_FRAME_TYPE_ACK) ffrdp_on_ack(cc, fb, n, &b);
+                        else                               b.got_query = 1;
+                    } else if (!ffrdp_on_frame(cc, node, n, &b)) free(node);  // 没被乱序队列接管 ⇒ 归我们
                     uint64_t t_ack0 = ffrdp_us();   // 诊断：从能回 ack 这一刻算起
                     ffrdp_apply_acks(cc, &b);
                     // 收到帧就当场回 ack，别等下一圈 TIMER（以前那一步要花掉整整一圈，lap 平均 2~3ms），
