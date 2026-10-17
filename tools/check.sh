@@ -38,7 +38,7 @@ row() {   # $1=名字 $2=PASS/FAIL/SKIP $3=摘要
 }
 step() { printf '\n\033[1m── %s\033[0m\n' "$*"; }
 
-SIM_FAST="t_rto t_pseudo t_cwnd t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_keepalive t_init t_dump t_fec"
+SIM_FAST="t_rto t_pseudo t_cwnd t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_flush t_keepalive t_init t_dump t_fec"
 SIM_ALL="$SIM_FAST e2e"
 # 已知的基线失败（HEAD 侧一模一样 ⇒ 不是回归 ✓）：丢包容差那条 ✓
 KNOWN_FAIL='observed loss c1->c0 far from the configured rate'

@@ -1518,6 +1518,9 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         c->cur_new_node = NULL;
         c->cur_new_size = 0;
     }
+    // FLAG_FLUSH 是**一次性**请求 ⇒ 这一圈处理完就撤 ✓。原来从不撤销 ✗：调过一次 ffrdp_flush()
+    // 之后每条连接都永久变成"有一点点就立刻发"，等于把短帧自动冲刷常开（帧数/CPU 代价全在这 ✗）。
+    c->flags &= ~FLAG_FLUSH;
 
     {   // count what is really on the wire, fresh every pass, so no counter can drift or leak
         FFRDP_FRAME_NODE *q;
@@ -2021,14 +2024,22 @@ out:
 void ffrdp_flush(void *ctxt, int conn)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
+    int i, n = 0;
     if (!ffrdp) return;
-    // conn < 0 = 对全部连接生效 ✓（现在只有 0 号，逐个都刷一遍 ✓）。
-    if (conn >= ffrdp->nconn || (conn >= 0 && !ffrdp->table[conn])) return;
     pthread_mutex_lock(&ffrdp->lock);
-    FFRDPCONN *c = ffrdp->table[0];   // 第一步只有 0 号（conn < 0 = 全部连接）
-    if (c) c->flags |= FLAG_FLUSH;
-    // 工作线程可能正睡在"下一个期限"上：把它叫醒，这一帧才不用等到那时候。
-    if (ffrdp->lowlevel) ffrdp->lowlevel->timer(ffrdp->lowlevel, NOW_MS());
+    // conn < 0 = 对全部连接生效 ✓；conn >= 0 = **只对那一条** ✓（ffrdp.h 的承诺）。
+    // ⚠️ 原来固定取 table[0] ✗：服务端的主连接占 0 号、accept 出来的客户端是 1..N ⇒ 对客户端调
+    //    flush 一个字节都刷不出去，只能等 FFRDP_FLUSH_TIMEOUT（500 ms）⇒ 多连接时这条 API 形同虚设 ✗。
+    for (i = 0; i < ffrdp->nconn; i++) {
+        FFRDPCONN *c;
+        if (conn >= 0 && i != conn) continue;
+        c = ffrdp->table[i];
+        if (!c) continue;
+        c->flags |= FLAG_FLUSH;
+        n++;
+    }
+    // 工作线程可能正睡在"下一个期限"上：叫醒一次，这些帧才不用等到那时候 ✓
+    if (n && ffrdp->lowlevel) ffrdp->lowlevel->timer(ffrdp->lowlevel, NOW_MS());
     pthread_mutex_unlock(&ffrdp->lock);
 }
 
