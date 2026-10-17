@@ -905,7 +905,7 @@ FFRDP_UDPSBUF_SIZE = FFRDP_UDPRBUF_SIZE = 128 × (MSS + 6)   仅作 socket 选�
 | `FFRDP_MAX_MSS` 的来源 | `ffrdp.c` 里的字面量 `(1500-8)` | `FFRDP_LOWLEVEL_FRAME_MAX - 6`（`lowlevel.h` 派生）| 帧上限从协议层挪到 lowlevel ✓ |
 | `FFRDP_APP_TX_SIZE` | **没有**（队列容量 = `WAITSND × (MSS+4)` ≈374 KiB）| **独立常量 64 KiB** | **解耦** ✓：省 310 KiB 且吞吐中性 ⇒ 见下面 |
 | `FFRDP_UDPSBUF_SIZE` / `FFRDP_UDPRBUF_SIZE` | `128 × (MSS+6)` 的两个字面宏 | `FFRDP_LOWLEVEL_BUFFER_SIZE` | 只是改名与归属 ✓ |
-| 一圈最多收几帧 | 无（应用循环里 `recvfrom` 就绪就收）| `FFRDP_LOWLEVEL_RX_BATCH_MAX = 2` | 新旋钮（吞吐 / 延迟）|
+| 一圈最多收几帧 | 无（应用循环里 `recvfrom` 就绪就收）| `FFRDP_LOWLEVEL_RX_BATCH_MAX = 4` | 新旋钮（吞吐 / 延迟）|
 | `FFRDP_SELECT_SLEEP` / `SELECT_TIMEOUT` / `USLEEP_TIMEOUT` | 1 / 10000 / 1000 | **删除** | 改由工作线程 + `timer()` 期限驱动 |
 | `FFRDP_COND_WAIT_MS` | 无 | **200** | 应用等待 `timedwait` 的间隔 |
 | `ack latency`（仪表）| 无 | **有**（只打印 ✓）| "收帧 → 交给内核"的微秒数 ✓ |
@@ -1042,7 +1042,7 @@ v1.1.0 的"上限"是 bufferbloat 实验的起点；v1.2.0 的"上限"**就是**
 | `FFRDP_RECVBUF_SIZE` | 128 × MSS（别动）| 它决定我们广告的 `rwnd` ⇒ 要动必须**和对端成对**考虑 ✓ |
 | `FFRDP_MIN_RTO` / `rtt_tail` | 16 ms / 学习值（别动）| 直接决定重传率与真丢包的恢复速度 ✓ |
 | `FFRDP_LOWLEVEL_FRAME_MAX` | 1500（按平台）| 嵌入式**第一个该动**的旋钮 ✓ |
-| `FFRDP_LOWLEVEL_RX_BATCH_MAX` | 2 | 一圈最多交给协议几帧（吞吐/延迟旋钮）✓ |
+| `FFRDP_LOWLEVEL_RX_BATCH_MAX` | 4 | 一圈最多交给协议几帧（吞吐/延迟旋钮）✓；2 → 4 是①-33 在"缓冲膝点 + 守卫就位"之后重扫的结论（+6%、零内存 ✓，notes §26.53）✓ |
 | `FFRDP_QUERY_CYCLE` / `FLUSH_TIMEOUT` / `DEAD_TIMEOUT` | 500 / 500 / 5000 ms | 空闲询问 / 未填满帧最长等多久 / 判对端失联 ✓ |
 
 #### 3.2.4.2 四条"别这么改"（都有真机证据）

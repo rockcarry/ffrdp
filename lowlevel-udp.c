@@ -28,8 +28,11 @@
 
 // 唤醒用 UDP socket 而不是 pipe：select() 在 Windows 上只报 socket ⇒ 一条路径更值 ✓（pipe 单次更便宜，但那不是瓶颈 ✓）。
 
-// 一圈最多收几帧（= FFRDP_LOWLEVEL_RX_BATCH_MAX ✓）；取 2 的依据（实测 2 最好、越大越差 ⇒ 主因是 ack 节奏）见 notes ✓。
-#define FFRDP_LOWLEVEL_RX_BATCH_MAX 2
+// 一圈最多收几帧（= FFRDP_LOWLEVEL_RX_BATCH_MAX ✓）；取 4 的依据：①-33 在"缓冲膝点 + 多判守卫都就位"之后**重扫** 2/4/8/16
+// ⇒ 4 最好、吞吐 +6%（相对 2 ✓）、**零内存** ✓（notes §26.53 ✓）。
+// ⚠️ 旧注释"批越大越差、主因是 ack 节奏"已经过期 ✗：那是在**缓冲被夹 + 守卫缺失**的区间里量的，
+//    而"ack 节奏"这一半已被 ①-28（§26.45：攒了 ack 再加大批还是更差 ✓）否掉 ⇒ 别再按它推理 ✓。
+#define FFRDP_LOWLEVEL_RX_BATCH_MAX 4
 // 套接字缓冲请求值（KB ✓；内核翻倍后夹到 rmem_max ✓）；96 KB 是实测膝点（见 notes ✓）。
 #define FFRDP_LOWLEVEL_BUFSIZE_KB 96
 
@@ -69,7 +72,7 @@ typedef struct {
     uint32_t        stat_arm_dnear;      // now+1..4
     uint32_t        stat_arm_dfar;       // > now+4
 #endif
-    // RX 批上限 = FFRDP_LOWLEVEL_RX_BATCH_MAX（文件头那张实测表选出来的 2 ✓）。
+    // RX 批上限 = FFRDP_LOWLEVEL_RX_BATCH_MAX（文件头的重扫选出来的 4 ✓）。
     int             rx_batch;         // 一圈最多收几帧（= FFRDP_LOWLEVEL_RX_BATCH_MAX ✓）
     int             bufsize;          // 套接字缓冲请求值（字节 ✓）= FFRDP_LOWLEVEL_BUFSIZE_KB * 1024
 #if FFRDP_DIAG
