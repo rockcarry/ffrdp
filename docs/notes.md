@@ -1,6 +1,6 @@
 # ffrdp 调试笔记（工作文档）
 
-> **语言** ✓：本文档**只有中文版** ✗（英文版只有仓库根目录的 [`readme.en.md`](../readme.en.md) ✓）。
+> **语言** ✓：本文档**只有中文版** ✗（英文版只有仓库根目录的 [`readme.md`](../readme.md) ✓）。
 > 需要其它语言请**用 AI 自行翻译** ✓ —— 记得让它保留宏名、命令、代码块与 `✓ / ✗` 符号原文 ✓。
 
 本文档记录 ffrdp 传输层的调试过程、已确认的结论、以及实验档案，避免重复踩坑。
@@ -1275,7 +1275,7 @@ REF=/path/to/ffrdp.c TESTS=e2e bash tools/sim/run.sh
 - **两端同步**：远端是 Gerrit 上的 `master`，另一台机器 `git pull` 即可 ✓（不再走"复制 patch"✓）；
   自检看 dump 里的 **`version & build :`** 行（版本号 + 编译期参数 `probe` / `queue ratio` + 编译时刻 ✓）
   以及 `ffrdp.c` 的 md5，比记提交号可靠 ✓；
-- **文档布局**（2026-10 整理）：`readme.zh.md`（概述/编译/测试/目录；另有**英文版** `readme.en.md` ✓）、
+- **文档布局**（2026-10 整理）：`readme.zh.md`（概述/编译/测试/目录；另有**英文版** `readme.md` ✓）、
   `docs/ffrdp-v1.md`（v1 协议与优化）、`docs/ffrdp-v2.md`（v2 接口 / 握手 / 多客户端 ✓）、
   `docs/notes.md`（本文）、`docs/sim-test.md`（仿真用法）、`docs/ffrdp-latency.md`（音视频延迟预算 ✓）；
 - 上机测任何一步前，**先确认工作区是干净的**（曾经被 `git checkout` 清掉未提交的改动）。

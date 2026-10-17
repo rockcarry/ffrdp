@@ -1,9 +1,11 @@
 # ffrdp
 
-> **Language** ✓: this repository keeps its documentation in **Chinese** ✓ — only the `readme` has an English
-> version (this file ✓; [`readme.zh.md`](readme.zh.md) is the Chinese original). Everything under `docs/` is
-> **Chinese only** ✗ — if you need another language, please **translate it with an AI** ✓
-> (hand the document to any LLM; ask it to keep macro names, commands, code blocks and the `✓ / ✗` markers verbatim ✓).
+> **English** ✓ | [中文](readme.zh.md)
+>
+> **Language** ✓: this is the **default (English)** readme ✓ — the Chinese version is
+> [`readme.zh.md`](readme.zh.md) ✓. Everything under `docs/` is **Chinese only** ✗ — if you need another
+> language, please **translate it with an AI** ✓ (hand the document to any LLM; ask it to keep macro names,
+> commands, code blocks and the `✓ / ✗` markers verbatim ✓).
 
 ffrdp is a fast, reliable transport protocol built on **UDP + ARQ + FEC**. Its goals are **low latency** and
 **stable bandwidth on lossy networks**.
@@ -262,8 +264,8 @@ QUICK=1 bash tools/check.sh      # skip ASAN and e2e (about 1 minute) ✓
 ├── test.c                  test program (server/client share one parameterised peer loop + dump every 10 s)
 ├── test.sh                 **real-machine A/B comparison** (upload → remote server → local client → logs → summary; see §4)
 ├── build.sh                build script (static library + test program + pkg-config)
-├── readme.zh.md            the Chinese original of this file: overview, versions, build, tests, layout
-├── readme.en.md            this file, the **English version** (kept in sync with the Chinese one ✓; `docs/` has no English version ✗)
+├── readme.md               this file, the **English version** (shown by default on GitHub ✓; kept in sync with the Chinese one ✓)
+├── readme.zh.md            the Chinese version: overview, versions, build, tests, layout
 ├── LICENSE
 ├── docs/
 │   ├── ffrdp-v1.md   protocol description: v1.0.0 / v1.1.0 / v1.2.0 in three parts (frame format, parameters, changes and rationale)
