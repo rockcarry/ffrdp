@@ -77,14 +77,26 @@
 | 子项 | 依据 | 状态 | 怎么量 |
 |---|---|---|---|
 | **A1 每消息唤醒的账** | notes §26.55 | 已量 ✓，有 +10% 的现成手段 | dump 里"每消息唤醒"那一项 ✓；`udp lowlevel arm-now: <n> from other threads`（这才是"应用催协议"的真实次数 ✓）|
-| **A2 "队列由空变非空才叫醒"** | notes §26.55 | **零内存 ✓ +10%** ✓ ⇒ 应是最先落地的一条 | 同上；对照 `counter_send_wakes` / `send_wake_skip` ✓ |
-| **A3 圈率 / RX 批** | notes §26.42 / §26.53 | 批已重扫（取 **4** ✓，+6% ✓）| `udp lowlevel laps` / `stat_rx_frames`（帧/圈 ✓）、`udp lowlevel lap cost`（pre/mid/tick µs ✓）|
+| **A2 "队列由空变非空才叫醒"** | notes §26.55 | **已落地** ✅（`9579f7f`：`FFRDP_SENDWAKE_COALESCE` 0 → 1 ✓，零内存 +10% ✓）| 同上；对照 `counter_send_wakes` / `send_wake_skip` ✓；dump 里 `send 叫醒合并: ON/off` ✓ |
+| **A3 圈率 / RX 批** | notes §26.42 / §26.53 | **已落地** ✅（`5348df2`：`FFRDP_LOWLEVEL_RX_BATCH_MAX` 2 → 4 ✓，零内存 +6% ✓，同包率下圈率减半 ✓）| `udp lowlevel laps` / `stat_rx_frames`（帧/圈 ✓）、`udp lowlevel lap cost`（pre/mid/tick µs ✓）、`rx cost: laps with 1 frame / >=2 frames` ✓ |
 | **A4 应用侧不动** | notes §26.52 | **已被否** ✗ —— 10 ms → 1 ms → 非阻塞，吞吐全同带 ✓；`recv` 不是瓶颈 ✗（每轮成本在 `ffrdp_send` 那侧 ✓ ~30 µs/条 ✗）| `test.c` 的 `TEST_APP_RECVWAIT_MS` / `TEST_APP_SPIN_US` ✓ |
 | **A5 锁与临界区** | 推论（未正式量 ✗）| **未量** ⚠️ | `ffrdp_send` 每条 ~30 µs（§26.52 反推 ✓）；建议按"持锁时长 × 次数"分项记账 ✓ |
 
 > **这一节的判据**：**同内存口径**下（缓冲请求 188 KB ✓、在途 64 ✓、无 env 旋钮 ✗），
 > v2 的吞吐与**客户端进程 CPU 占比**要一起动 ✓ —— 目标是把 46% 推到 v1.1 的 91% 那侧 ✓，
 > 而不是靠加内存把"等"掩盖掉 ✗（铁律 2 ✓）。
+
+### 3.1 CPU 占用：与 v1.1 的差距（2026-10-17）
+
+| 场景 | master | v1.1 | 差距 |
+|---|---|---|---|
+| **lo，限速 60 MB/s**（`TEST_APP_BURST=2`，复测 ✓）| 56~60 MB/s、CPU **142%** ✗ | 跑满 60 MB/s、CPU **120%** ✓ | 吞吐勉强贴住、CPU 高 ~22 个点 ✗ |
+| 慢 AP（真机）| 5~6% | 3% | 高 2~3 个点 ✗ |
+| 快 AP（真机）| 20% | 9% | 高 ~11 个点 ✗ |
+
+已落地四条：`9579f7f` 叫醒合并、`5348df2` RX 批 2→4、`b4e312c` ② ACK/QUERY 就地解析、
+`00c94b4` ① ACK 合并（lo：收包回调 −46%、环 CPU −25% ✓；**慢 AP 上几乎无感** ✗）。
+结构性归因、逐项实测与下一步排序先记在 notes §26.85，取得阶段性成果后再回填本节 ✓。
 
 ---
 
