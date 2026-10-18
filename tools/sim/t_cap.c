@@ -1,9 +1,12 @@
-// B2：在途闸门"能升"（`ffrdp-optimization.md` §8 的 #4 / notes §11.7 边界 2）。要钉三件事：
-//   A 干净的高 RTT 链路上闸门**能**升过默认的 64 帧 —— 否则 64 就是硬天花板（仿真里 64→128 交付 +102%）。
+// B2：在途闸门"能升"（`ffrdp-optimization.md` §8 的 #4 / notes §11.7 边界 2）。要钉四件事：
+//   A 干净的高 RTT 链路上闸门**能**升（从探测砍下来的 40 帧起步 ✓，见下面的算术说明）。
 //   B 有常驻队列的链路上闸门**不许**升 —— 那正是"把窗口还回去换延迟"要防的形状 ✗。
-//   C 升上去之后，探测仍然能把闸门砍回 64 以下 —— 证明 B2 没有把下降路径关掉。
+//   C 升上去之后，探测仍然能把闸门砍回来 —— 证明 B2 没有把下降路径关掉。
 //     这一条是本次改动最容易踩的坑：原来三处判据都拿 FFRDP_INFLIGHT_MAX 当"最高"，cap_kept 一旦
-//     被升过 64，`cap_kept < FFRDP_INFLIGHT_MAX` 恒假 ⇒ giveback 与事后修复双双失效 ✗。
+//     被升过默认值，`cap_kept < FFRDP_INFLIGHT_MAX` 恒假 ⇒ giveback 与事后修复双双失效 ✗。
+//   E 当前定档（默认 128 = 窗口 128 = 天花板 128）下，**从默认出发升不动** —— 这条 2026-10 才成立：
+//     默认值已经抬到与窗口/天花板对齐，B2 的"顶死 + 窗口吃得下"两条同时满足需要的窗口 ≥ 2.25×cap，
+//     默认档不满足 ⇒ 没得升（不是坏了 ✓）。原来 A 断言"从 64 升过 128"是旧定档的快照 ✗。
 //
 // HEAD 侧（没有 counter_cap_rise、也没有上升路径）用 HAVE_CAPRISE 探测 ⇒ A 直接判红 ✓。
 #include <stdio.h>
@@ -17,8 +20,10 @@
 #define A_SRV MKADDR(8001)
 #define A_C1  MKADDR(40001)
 
-#define CAP_DEFAULT 64u     // FFRDP_INFLIGHT_MAX
-#define CAP_CEIL    128u    // FFRDP_INFLIGHT_CEIL
+// ⚠️ 这两个常量原来硬编码成 64/128（当时的定档）✗。现在直接用实现里的宏 —— 定档是 128/128，
+//    硬编码的那对数字会让本用例整体失真（A 以为还有 64→128 的余地，B 拿 64 当"默认值"比）✓。
+#define CAP_DEFAULT ((uint32_t)FFRDP_INFLIGHT_MAX)
+#define CAP_CEIL    ((uint32_t)FFRDP_INFLIGHT_CEIL)
 
 #ifdef HAVE_CAPRISE
 static uint32_t rise_cnt(FFRDPCONN *c) { return c->counter_cap_rise; }
@@ -92,40 +97,50 @@ static void pair_down(void)
     p_c1 = p_srv = NULL;
 }
 
-// A：干净的高 RTT 链路（RTT 200 ms），闸门应当自己升过 64
+// A：干净的高 RTT 链路（RTT 200 ms），闸门**能**往上升 —— 从"探测已经砍下来的 40 帧"起步 ✓
+// 为什么不从默认起步 ✗：B2 同时要求"顶死"(out >= inflight_max) 与"窗口吃得下"(swnd >= next)，
+// 而顶死时 swnd = 窗口 − 在途 ⇒ 要升得动必须 **窗口 ≥ 2.25 × inflight_max**。默认档是
+// inflight_max 128 = 窗口 128 ⇒ 结构上不可能升（这就是"默认已经贴着天花板"的算术表达 ✓，见 E 段）。
+// 真实会升的场景是"探测把闸门砍到 40 之后、链路证明没队列" ⇒ 从这里起步才测得到机制本身 ✓。
 static void case_a(void)
 {
     int i;
-    uint32_t firsts, resends;
-    printf("A 干净 200ms 链路上闸门能升（默认 %u，天花板 %u）\n", CAP_DEFAULT, CAP_CEIL);
+    uint32_t firsts, resends, start = 40;
+    FFRDPCONN *c;
+    printf("A 干净 200ms 链路上闸门能升（从 %u 帧起步；默认 %u／窗口 %u）\n",
+           start, CAP_DEFAULT, (uint32_t)FFRDP_RX_WINDOW_FRAMES);
     check(pair_up(100, 0, 0), "握手完成");
     if (!up()) return;
 
-    for (i = 0; i < 60000 && conn0()->cap_kept <= CAP_DEFAULT; i++) pump(1);
-    check(conn0()->cap_kept > CAP_DEFAULT, "闸门升过了默认值（cap_kept > 64）");
-    check(rise_cnt(conn0()) > 0, "确实走的是 B2 的上升路径（counter_cap_rise > 0）");
-    firsts  = conn0()->counter_send_1sttime;
-    resends = conn0()->counter_resend_rto + conn0()->counter_resend_fast;
+    c = conn0();
+    c->cap_kept = start; c->inflight_max = start; c->cap = start; c->cap_idle = 0;  // 假装探测刚砍到这里 ✓
+    for (i = 0; i < 60000 && rise_cnt(c) == 0; i++) pump(1);
+    check(rise_cnt(c) > 0, "顶死 + 没队列 + 没浪费 ⇒ 走上升路径（counter_cap_rise > 0）");
+    check(c->cap_kept > start, "cap_kept 从 40 升上去了");
+    firsts  = c->counter_send_1sttime;
+    resends = c->counter_resend_rto + c->counter_resend_fast;
     printf("       升到 %u 帧（%d 步）：首发 %u / 重传 %u（%.2f%%）\n",
-           conn0()->cap_kept, i, firsts, resends, firsts ? 100.0 * resends / firsts : 0.0);
+           c->cap_kept, i, firsts, resends, firsts ? 100.0 * resends / firsts : 0.0);
     check(!firsts || resends * 100 < firsts * 5, "升的过程中重传率没有抬头（< 5%）");
 }
 
-// C：升上去之后，探测仍要能把它砍回 64 以下（下降路径没被 cap_kept 与上限的耦合卡死）
+// C：升上去之后，探测仍要能把它砍回来（下降路径没被 cap_kept 与上限的耦合卡死）
 static void case_c(void)
 {
     int i, cut = 0;
-    printf("C 升上去之后探测仍能把闸门砍回来\n");
-    if (conn0()->cap_kept <= CAP_DEFAULT) { check(0, "前提不成立：A 没升上去 ⇒ 这一条测不到"); return; }
+    FFRDPCONN *c = conn0();
+    uint32_t before = c->cap_kept;
+    printf("C 升上去之后探测仍能把闸门砍回来（升到 %u 帧）\n", before);
+    if (before <= 40) { check(0, "前提不成立：A 没升上去 ⇒ 这一条测不到"); return; }
     // 突然给它一个瓶颈（600 KB/s、200 KB 队列）⇒ 探测应当发现"窗口里有队列"并把上限砍下来
     sim_shaper(600 * 1024.0 / 1000.0, 200 * 1024);
     for (i = 0; i < 60000 && !cut; i++) {
         pump(1);
-        if (conn0()->probe_state != 0 && conn0()->inflight_max < CAP_DEFAULT) cut = 1;
+        if (c->probe_state != 0 && c->inflight_max < before) cut = 1;
     }
-    check(cut, "探测把上限砍到了 64 帧以下（下降路径还活着）");
+    check(cut, "探测把上限砍到 A 那个值以下（下降路径还活着）");
     printf("       当前 cap_kept=%u inflight_max=%u probes=%u\n",
-           conn0()->cap_kept, conn0()->inflight_max, conn0()->counter_probe);
+           c->cap_kept, c->inflight_max, c->counter_probe);
 }
 
 // D：RTT 地板的离群保护（真机 §26.97 复测踩到：200 ms 链路上一个 60 ms 的假样本把 rtt_min 钉死，
@@ -168,10 +183,27 @@ static void case_b(void)
     if (!up()) return;
     for (i = 0; i < 60000; i++) pump(1);
     check(rise_cnt(conn0()) == 0, "一次都没升（counter_cap_rise == 0）");
-    check(conn0()->cap_kept <= CAP_DEFAULT, "cap_kept 没有越过默认值（队列还在就不该还窗口）");
+    check(conn0()->cap_kept <= CAP_DEFAULT, "cap_kept 没有越过 FFRDP_INFLIGHT_MAX（队列还在就不该还窗口）");
     printf("       60 秒后 cap_kept=%u cap=%u inflight_max=%u rtt_min=%u rtts=%u\n",
            conn0()->cap_kept, conn0()->cap, conn0()->inflight_max,
            conn0()->rtt_min, conn0()->rtts);
+}
+
+// E：当前定档的自证 —— 默认 = 窗口 = 天花板 ⇒ 从默认出发**结构上**升不动 ✓
+//（这是 B2 在 2026-10 定档后的真实状态：没有可升的空间；能升的只有"被探测砍下来之后"那段 ✓）
+static void case_e(void)
+{
+    int i;
+    FFRDPCONN *c;
+    printf("E 当前定档（默认 %u／窗口 %u／天花板 %u）⇒ 从默认出发升不动\n",
+           CAP_DEFAULT, (uint32_t)FFRDP_RX_WINDOW_FRAMES, CAP_CEIL);
+    check(pair_up(100, 0, 0), "握手完成");
+    if (!up()) return;
+    c = conn0();
+    for (i = 0; i < 30000; i++) pump(1);
+    check(rise_cnt(c) == 0, "一次都没升（已经贴着天花板 ⇒ 没有可升的空间 ✓）");
+    check(c->inflight_max <= CAP_DEFAULT, "上限没有越过 FFRDP_INFLIGHT_MAX ✓");
+    check(c->cap_kept <= CAP_DEFAULT, "cap_kept 也没有越过 FFRDP_INFLIGHT_MAX ✓");
 }
 
 int main(void)
@@ -187,7 +219,10 @@ int main(void)
     case_b();
     pair_down();
 
+    case_e();
+    pair_down();
+
     check(sim_alloc() == sim_freed(), "没有泄漏 ✓");
-    printf(g_fail ? "*** CHECK FAILED: %d 项不通过 ***\n" : "=== CHECK OK: 闸门的升/降三条都对 ===\n", g_fail);
+    printf(g_fail ? "*** CHECK FAILED: %d 项不通过 ***\n" : "=== CHECK OK: 闸门的升/降/定档四条都对 ===\n", g_fail);
     return g_fail ? 1 : 0;
 }

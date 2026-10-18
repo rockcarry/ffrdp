@@ -366,6 +366,7 @@ struct link_arg {
     const TEST_PEER *peer;
     int             is_server;
     int             owns_ctx;
+    int             slot;        // 在服务端的 links[] 里占的名额（跑完要还 ✓）；栈上的那两条不用 ✓
 };
 
 static int link_loop(struct link_arg *a)
@@ -605,12 +606,31 @@ done:
 }
 
 // 服务端：一条被 accept 的连接 = 一个 link 线程 ✓（这样服务端天然能同时服务 N 个客户端 ✓）
+// ⚠️ 跑完必须把名额**还回去** ✗→✓：原来只在 pthread_create 成功时 nlink++，线程退出不还 ⇒ 一个服务端进程
+//    累计最多起 TEST_MAX_LINK(16) 条 link 线程，之后即便连接槽位已经回收、协议照常接得上，测试程序也
+//    不再给新连接起线程 ⇒ 客户端"握上手但收不到回显"（notes §26.101 四）。
+static volatile int g_link_done[TEST_MAX_LINK];   // 1 = 这条线程已经跑完、等主线程收尸 ✓
+
 static void* link_thread(void *param)
 {
     struct link_arg *a = (struct link_arg*)param;
     link_loop(a);
+    g_link_done[a->slot] = 1;      // 先置位再退出 ⇒ 主线程 join 得到"确实跑完了" ✓
     free(a);
     return NULL;
+}
+
+// 收掉已经跑完的 link 线程，把名额（links[] 的槽）还回去 ✓。只在 peer_thread 里调用（单线程访问 ✓）。
+static void link_reap(pthread_t *links, int *nlink)
+{
+    int i = 0;
+    while (i < *nlink) {
+        if (g_link_done[i]) {
+            pthread_join(links[i], NULL);
+            for (int j = i + 1; j < *nlink; j++) { links[j - 1] = links[j]; g_link_done[j - 1] = g_link_done[j]; }
+            (*nlink)--;                       // 名额当场归还 ⇒ 后续连接照常起线程 ✓
+        } else i++;
+    }
 }
 
 // 角色入口：客户端 ⇒ 建上下文 + 跑唯一那条主连接（handle 0 ✓），丢了就重建 ✓；
@@ -664,15 +684,19 @@ static void* peer_thread(void *param)
         // 服务端：取一个 accept 句柄 ⇒ 起一条 link 线程 ✓
         {   int h = accept_pop();
             if (h < 0) { usleep(5 * 1000); continue; }
+            link_reap(links, &nlink);                 // 先收掉跑完的 ⇒ 名额还回来 ✓
             if (nlink < TEST_MAX_LINK) {
                 struct link_arg *a = (struct link_arg*)malloc(sizeof(*a));
                 if (a) {
                     a->ffrdp = ffrdp; a->handle = h; a->peer = peer; a->is_server = 1; a->owns_ctx = 0;
+                    a->slot = nlink; g_link_done[nlink] = 0;
                     if (pthread_create(&links[nlink], NULL, link_thread, a) == 0) nlink++;
                     else free(a);
                 }
             } else {
-                printf("%s: too many links, handle %d dropped\n", peer->name, h); fflush(stdout);
+                // 真的同时 16 条在跑（不是名额泄漏 ✓）⇒ 这条只能放弃；**关掉**它，别让对端干等 ✗
+                printf("%s: too many live links (%d), closing handle %d\n", peer->name, nlink, h); fflush(stdout);
+                ffrdp_close(ffrdp, h);
             }
         }
     }

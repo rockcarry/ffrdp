@@ -1982,6 +1982,11 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             // 每 FFRDP_PROBE_GAP_MS 最多升一次（升得比探测问得还快，就会自己打自己 ✓）。
             {
                 uint32_t out = 0, next;
+                // ⚠️ 算术前提（2026-10 定档之后值得写下来 ✓）：要升，必须**同时**满足"顶死"
+                //    out >= inflight_max 与"窗口吃得下" swnd >= next = 1.25 × inflight_max；
+                //    而顶死时 swnd = 窗口 − 在途 ⇒ 只有 **窗口 ≥ 2.25 × inflight_max** 才可能升 ✓。
+                //    所以默认档（inflight_max = 窗口 = FFRDP_INFLIGHT_MAX = 128）下这段永远进不去 ——
+                //    不是坏了，是"已经没有可升的空间" ✓（`tools/sim/t_cap.c` 的 A/E 两段把这件事钉住 ✓）。
                 for (q = c->send_list_head; q; q = q->next) if (q->flags & FLAG_FIRST_SEND) out++;
                 next = c->inflight_max + MAX(c->inflight_max / 4, 1);
                 if (next > FFRDP_INFLIGHT_CEIL) next = FFRDP_INFLIGHT_CEIL;
