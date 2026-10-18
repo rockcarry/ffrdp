@@ -263,9 +263,9 @@ typedef struct tagFFRDP_FRAME_NODE {
 } FFRDP_FRAME_NODE;
 
 // ── 标志位 ───────────────────────────────────────────────────────────────
-#define FLAG_CONNECTED (1 << 1)
-#define FLAG_FLUSH     (1 << 2)
-#define FLAG_ACK_DUE   (1 << 3) // 收到过需要应答的帧、还没回；由 tick 在这一段结束时统一回一个
+#define FLAG_CONNECTED   (1 << 1)
+#define FLAG_FLUSH       (1 << 2)
+#define FLAG_ACK_DUE     (1 << 3) // 收到过需要应答的帧、还没回；由 tick 在这一段结束时统一回一个
 #define FLAG_QUERY_PROBE (1 << 4) // A′：尾部探测已发出、还在等它那个 ack（见 tick 里那段）
 
 // ── 每连接状态 ───────────────────────────────────────────────────────────
@@ -439,7 +439,7 @@ typedef struct {
     uint32_t counter_probe, counter_probe_keep, counter_probe_revert;
     uint32_t counter_probe_mem;   // ①-39：其中由"上限定得比实际需要高"触发的次数 ✓
     uint32_t counter_probe_narrow, counter_giveback;
-    uint32_t counter_cap_rise;     // B2：闸门自己升上去的次数 ✓
+    uint32_t counter_cap_rise;    // B2：闸门自己升上去的次数 ✓
     uint32_t reserved;            // diag 段到此为止：ffrdp_dump 会把这之前的计数器清零
 #endif
     // 本连接被创建的时刻（ms）。用途只有一个：给 dump 的 `total_send/total_recv` 配一个**同源**的分母 ✓
@@ -1608,10 +1608,10 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         x = c->tick_send_query + FFRDP_QUERY_CYCLE;
         if ((int32_t)(x - now) > 0 && (!due || (int32_t)(x - due) < 0)) { due = x; }
     }
-    if (c->probe_next)      { x = c->probe_next;                          if (!due || (int32_t)(x - due) < 0) { due = x; } }
+    if (c->probe_next) { x = c->probe_next; if (!due || (int32_t)(x - due) < 0) { due = x; } }
 #if FFRDP_PACE_ENABLE
     // C1：被令牌挡住时，下一次叫醒就是"补令牌"那一刻（ms 粒度 ✓）—— 不能报"现在"，否则整圈空转 ✗
-    if (c->pace_due)        { x = c->pace_due;                            if (!due || (int32_t)(x - due) < 0) { due = x; } }
+    if (c->pace_due)   { x = c->pace_due;   if (!due || (int32_t)(x - due) < 0) { due = x; } }
 #endif
     // 还差一条最容易漏、也最贵的：**现在就有发得出去的东西**（应用排了队，或者发送表里有还没首发的帧），
     // 而且发得出去（有信用、在途数没到限）⇒ 立刻叫一次。
@@ -2447,21 +2447,21 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     // "发不出去"的另一半：ffrdp_send 记库的拒绝，这里记内核的（sendto 没接下）。非 0 ⇒ 套接字缓冲对突发不够；受影响的帧被重试过，代价只在这里可见。
     printf("counter_send_err    : %u\n"  , c->counter_send_err    );
     printf("counter_send_query  : %u\n"  , c->counter_send_query  );
-    printf("counter_tailprobe       : %u\n"  , c->counter_tailprobe       );
-    printf("counter_tailprobe_lost  : %u\n"  , c->counter_tailprobe_lost  );
+    printf("counter_tailprobe     : %u\n", c->counter_tailprobe       );
+    printf("counter_tailprobe_lost: %u\n", c->counter_tailprobe_lost  );
     printf("counter_resend_rto  : %u\n"  , c->counter_resend_rto  );
     printf("counter_resend_fast : %u\n"  , c->counter_resend_fast );
     // 下面三个比值各自的分母都可能合理地是 0（还没发过东西的发送方 / 只收的方向 / 全是短帧的稀疏发送方）。
     {   uint32_t resend = c->counter_resend_rto + c->counter_resend_fast;
         // 比值后面都跟着 (分子 / 分母)：分母小的时候一眼看出这个百分比不能当稳态读（如限速时 6/20 会印成 30%）。
         if (c->counter_send_1sttime) printf("counter_resend_ratio: %.2f%% (%u / %u)\n",
-                                                100.0 * resend / c->counter_send_1sttime, resend, c->counter_send_1sttime);
-        else                             printf("counter_resend_ratio: n/a\n");
-        if (resend)                      printf("counter_resend_waste: %.2f%% (%u / %u)\n",
-                                                100.0 * c->counter_ack_dup / resend, c->counter_ack_dup, resend);
-        else                             printf("counter_resend_waste: n/a\n");
+                                            100.0 * resend / c->counter_send_1sttime, resend, c->counter_send_1sttime);
+        else                         printf("counter_resend_ratio: n/a\n");
+        if (resend)                  printf("counter_resend_waste: %.2f%% (%u / %u)\n",
+                                            100.0 * c->counter_ack_dup / resend, c->counter_ack_dup, resend);
+        else                         printf("counter_resend_waste: n/a\n");
         if (c->counter_send_bytes)   printf("counter_resend_perMB: %.1f\n"  , resend * 1048576.0 / c->counter_send_bytes);
-        else                             printf("counter_resend_perMB: n/a\n");
+        else                         printf("counter_resend_perMB: n/a\n");
     }
     printf("counter_reach_maxrto: %u\n"  , c->counter_reach_maxrto);
     printf("counter_ack_recv    : %u\n"  , c->counter_ack_recv    );
