@@ -220,10 +220,9 @@ QUICK=1 bash tools/check.sh      # 跳过 ASAN 与 e2e（约 1 分钟）✓
 ├── LICENSE
 ├── docs/
 │   ├── ffrdp-v1.md   协议说明：v1.0.0 / v1.1.0 / v1.2.0 三部分（帧格式、参数、改动与依据）
-│   ├── ffrdp-v2.md    v2.0.0 说明：接口（params / 句柄 / 事件）、握手与四次挥手、多客户端、加密回调、keepalive
+│   ├── ffrdp-v2.md    v2.0.0 说明：接口（params / 句柄 / 事件）、握手与四次挥手、多客户端、加密回调、keepalive；§九 v2.x 相对 v1.1.x 的协议改进
 │   ├── sim-test.md         差分仿真工具（tools/sim）使用说明
 │   ├── ffrdp-latency.md 音视频延迟预算与调优：公式、慢/快 AP 的数字、丢包代价、MTU/分片、怎么量
-│   ├── ffrdp-optimization.md 优化方向候选池：状态 / 依据 / 重评判据（ACK 与 mack、pacing、可靠性模型）
 │   └── notes.md            开发与调试记录（按时间顺序，含每次上机的原始 log）
 └── tools/                  辅助工具（不逐个列 ✓：**一条命令跑完判据** `tools/check.sh`、**编译期内存账** `tools/size.sh`、差分仿真 `tools/sim/`、敌意输入、在途上限扫描、lowlevel 契约测试、日志提取 —— 以目录实际内容为准 ✓）
 ```
@@ -285,7 +284,7 @@ void  ffrdp_dump  (void *ctxt, int clearhistory);     // 打印诊断
 | v2.0.0 的接口（params / 句柄 / 事件 / 加密回调 / 握手与挥手 / keepalive）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |
 | v2.0.0 的设计取舍与边界条件（连接表 / 句柄不复用 / 半开上限 / 加密约定）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |
 | **音视频（H.265 / VBR）延迟预算与调优**：延迟公式、慢/快 AP 的数字、丢包代价、MTU 与 IP 分片、怎么量 | [`docs/ffrdp-latency.md`](docs/ffrdp-latency.md) |
-| **下一步优化方向**（候选池）：每条的状态 / 依据 / 重评判据 —— ACK 与 mack、事件驱动 ACK、pacing、不可靠报文模式 | [`docs/ffrdp-optimization.md`](docs/ffrdp-optimization.md) |
+| **v2.x 相对 v1.1.x 的协议改进**（含验收口径、已知边界、已否路线与仍开放方向）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) §九 |
 
 ---
 

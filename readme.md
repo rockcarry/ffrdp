@@ -269,10 +269,9 @@ QUICK=1 bash tools/check.sh      # skip ASAN and e2e (about 1 minute) ✓
 ├── LICENSE
 ├── docs/
 │   ├── ffrdp-v1.md   protocol description: v1.0.0 / v1.1.0 / v1.2.0 in three parts (frame format, parameters, changes and rationale)
-│   ├── ffrdp-v2.md    the v2.0.0 description: interface (params / handles / events), handshake and teardown, multi-client, encryption callbacks, keepalive
+│   ├── ffrdp-v2.md    the v2.0.0 description: interface (params / handles / events), handshake and teardown, multi-client, encryption callbacks, keepalive; §9 covers the v2.x improvements over v1.1.x
 │   ├── sim-test.md         how to use the differential simulation harness (tools/sim)
 │   ├── ffrdp-latency.md audio/video latency budget and tuning: the formula, numbers for slow/fast APs, the cost of loss, MTU and fragmentation, how to measure
-│   ├── ffrdp-optimization.md pool of optimisation directions: status / evidence / re-evaluation criteria (ACK and mack, pacing, reliability model)
 │   └── notes.md            development and debugging record (chronological, including the raw logs of every run)
 └── tools/                  helper tools (not listed one by one ✓: **one command for every criterion** `tools/check.sh`, **compile-time memory account** `tools/size.sh`, differential simulation `tools/sim/`, hostile input, in-flight sweep, lowlevel contract test, log extraction — the directory contents are authoritative ✓)
 ```
@@ -343,7 +342,7 @@ void  ffrdp_dump  (void *ctxt, int clearhistory);     // print diagnostics
 | The v2.0.0 interface (params / handles / events / encryption callbacks / handshake and teardown / keepalive) | [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) (Chinese) |
 | v2.0.0's design trade-offs and boundary conditions (connection table / handles not reused / half-open ceiling / encryption contract) | [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) (Chinese) |
 | **A/V (H.265 / VBR) latency budget and tuning**: the formula, numbers for slow/fast APs, the cost of a loss, MTU and IP fragmentation, how to measure | [`docs/ffrdp-latency.md`](docs/ffrdp-latency.md) (Chinese) |
-| **Where to invest next** (pool of directions): status / evidence / re-evaluation criteria for each — ACK and mack, event-driven ACK, pacing, unreliable datagram mode | [`docs/ffrdp-optimization.md`](docs/ffrdp-optimization.md) (Chinese) |
+| **v2.x improvements over v1.1.x** (with acceptance criteria, known limits, rejected routes and still-open directions) | [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) §9 (Chinese) |
 
 > Everything under `docs/` is written in Chinese ✗. If you need English (or any other language) versions, please
 > **translate them with an AI** ✓ — see the note at the top of this file.
