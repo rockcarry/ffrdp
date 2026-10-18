@@ -126,6 +126,41 @@ int main(void)
     check(ffrdp_recv(c1, 0, b, sizeof(b), 0) == 0, "客户端 recv 报 CLOSED（0 ✓ —— 应用看得出来 ✓）");
     ffrdp_exit(p_c1); ffrdp_exit(p_srv);
 
+    // ── C：判死口径的两条修正（状态层面的钉子 ✓）────────────────────────────
+    // 1) 首帧久等 ≠ 连接已死：只要**还在听得到对端**，就交给重传 / 接收窗口去修 ✗→✓
+    //    （6 客户端那轮：`rtts 2298 ms`、`rto 2000` ⇒ 老口径 5 s 只够两次 RTO，先误判死了 ✓）
+    // 2) 静默上限跟着 RTT 放大（≥ 4 RTT）：RTT 到秒级时，固定 5 s 只够一个来回 ⇒ 会反复重连 ✓
+    printf("── C 判死口径：首帧久等要对端也静默；静默上限跟着 RTT 放大\n");
+    sim_reset(); sim_config(0.0, 0, 4, 0);
+    g_step = 0;
+    if (make_pair(&p_srv, &p_c1, &a_srv, &a_c1) != 0) { printf("  建上下文失败 ✗\n"); return 1; }
+    srv = (FFRDPCONTEXT*)p_srv; c1 = (FFRDPCONTEXT*)p_c1;
+    drive(IDLE_MS * 2, p_c1, p_srv);                   // 先握上手 ✓
+    conn0 = a_srv.conn;
+    {   FFRDPCONN *c;
+        {   static char big[1300];                       // > smss(1024) ⇒ 只有攒满的帧才进 send_list ✓
+            ffrdp_send(p_srv, conn0, big, (int)sizeof(big), 0);
+        }
+        c = ffrdp_conn_lookup(srv, conn0);              // 句柄带代号 ⇒ 用查表入口 ✓
+        check(c && c->send_list_head != NULL, "服务端有一条待确认的帧（钉判死口径用 ✓）");
+        if (c && c->send_list_head) {
+            c->send_list_head->flags   |= FLAG_FIRST_SEND;   // 假装它已经上过线 ✓
+            c->send_list_head->tick_1sts = NOW_MS() - 6000;  // 首帧 6 s 没被确认 ✓
+            c->tick_last_recv            = NOW_MS();         // 但刚刚听到对端 ✓
+            check(ffrdp_isdead_locked(srv, c) == 0, "首帧 6s 未确认、但仍在听说对端 ⇒ **不判死** ✓");
+            c->tick_last_recv            = NOW_MS() - 6000;  // 对端也静默了 ✓
+            check(ffrdp_isdead_locked(srv, c) == 1, "对端也静默 6s ⇒ 判死 ✓（真断的时候照样收 ✓）");
+
+            c->tick_last_recv = NOW_MS() - 1000;             // 静默 1 s（> idle_ms 300 ✓）
+            c->rtts           = 2000;                        // RTT 2 s ⇒ 上限 = 4×RTT = 8 s
+            check(ffrdp_isdead_locked(srv, c) == 0,
+                  "RTT 2s 的链路上静默 1s ⇒ **不判死**（上限跟着 RTT 放大 ✓）");
+            c->rtts = 10;                                    // RTT 10 ms ⇒ 用配置的 300 ms
+            check(ffrdp_isdead_locked(srv, c) == 1, "RTT 10ms 的链路上静默 1s ⇒ 判死（配置值生效 ✓）");
+        }
+    }
+    ffrdp_exit(p_c1); ffrdp_exit(p_srv);
+
     printf("       verdict -> %s\n", g_fail ? "FAIL" : "OK");
     return g_fail ? 1 : 0;
 }

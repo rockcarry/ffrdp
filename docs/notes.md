@@ -6281,4 +6281,93 @@ HEAD 逐字相同；空闲连接没有在途帧 ⇒ 连探针期限都不会被�
 （74.9 / 86.8 / 49.0 / 67.6 对 89.7 / 86.8 / 38.1 / 85.5）。所以这一条改动的判据是"**代码路径等价 + dump
 读数 + 仿真/验收全绿**"，不是 lo 上的 MB/s ✓。要量吞吐请回真机（§26.97 那套）。
 
+### 26.100 6 客户端那轮：槽位用满 / 谁判的死 / 卡住后空转 + 两条诊断与测试修正（2026-10-18）✔
+
+**现象** ✓：`CLIENTS=6 ./test.sh` 跑 120 s，摘要里 client4 / client6 是 `0.00/0.00 MB/s`、`rtts —`，
+但它们的 `verify: OK` 明明写着收了 **1394 / 8258** 条 ⇒ 摘要把"最后一次连接"的 dump 当成了整轮。
+
+**发现 1（真因：服务端连接槽用满）** ✗：
+- `ffrdp.h` 的既定边界是"句柄**永不复用**（代价：用满就不再接新连接）"⇒ `next_slot` 只增不减，
+  槽 0 是内嵌主连接 ⇒ **一个服务端进程一生只接 maxconn−1 = 15 条** ✓。
+- 本轮 6 个客户端的连接次数 `1+3+2+4+2+3 = 15`，服务端日志里出现过的槽号正好 `1..15` ⇒ 第 16、17 次 SYN
+  被 `ffrdp_conn_new` 丢掉，只累加 `counter_hs_refused`，而**这个计数器原来 dump 里没有出口** ⇒ 日志一片干净 ✗
+  ⇒ c4/c6 的握手等满 `handshake_ms`（10 s）→ `HS_FAILED`。
+
+**发现 2（谁判的死：是测试程序，不是协议）** ✓：c4 第一次 `server lost` 那一份 dump 的块头是
+`---- conn 0 ... established (connected) ----`，**协议侧仍认为连着** ⇒ 判死的是 `test.c` 的应用侧判据
+`TEST_PEER_SILENCE_MS = 2000`（2 s 没收到字节就重连），协议 keepalive（`idle_ms` 5 s）没参与 ✓。
+那 2 s 为什么没字节：同一条连接 `cwnd 1 / ssthresh 1`、`cwnd back 482 (rto/fast)`、
+`timeout diag max wait 3674 ms`、`resend 4.40% / 白费 37%` ⇒ **吞吐塌了**，不是连接断了 ✗。
+⇒ 回答"连接保持应优先于数据收发"：协议侧本来就是"听到任何帧就算活"（keepalive 只看帧，不看业务字节）；
+要把"数据断了也保持"贯彻到测试里，把 `TEST_PEER_SILENCE_MS` 调大即可（它只是判据，不改协议 ✓）。
+
+**发现 3（握手失败后空转）** ✗：c4/c6 在 `HS_FAILED` 上**空转 62 s**，`counter_send_failed 296,401,393`
+（≈480 万次/s）。原因：`test.c` 只在 `connected`（收到过字节）之后才查 `peer_is_lost`，而 `ffrdp_recv` 在
+`HS_FAILED` 时**立即**返回、`ffrdp_send` 也立即被拒 ⇒ 死循环、不睡、也**永远不重连** ✗。
+
+**改法 a** ✓（`ffrdp.c`，纯诊断）：多连接 dump 的头部加一行
+`---- hs refused (no free slot): N | next_slot k of maxconn m ----` —— `next_slot == maxconn` 就是
+"再也接不了新连接"的直接证据 ✓。
+**改法 b** ✓（`test.c`）：断连判据拆成两种 —— 应用侧（`connected` 之后的 2 s 静默）与协议侧
+（`ffrdp_isdead()`，**与 `connected` 无关**：握手超时 / keepalive / 首帧久等）；握手还没成的循环加 1 ms 睡；
+日志把"从未连上"与"连上后断开"分开打 ✓。
+
+**验证** ✓：
+- 18 次连接打同一个服务端 ⇒ dump 打出 `hs refused (no free slot): 16 | next_slot 16 of maxconn 16`，
+  槽号 `1..15` ⇒ 现象与推断逐字对上 ✓；
+- 握不上手的客户端跑 13 s ⇒ **CPU 0.0%**（原来烧满一核）、每 ~10 s 打一行
+  `lost ! (handle 0; never connected) -- 握手超时，重建上下文重试` 并重建 ✓；
+- 仿真全量 work **37/37**；`QUICK=1 check.sh` 全绿（`logs/check-1018-145613`）✓。
+
+**未做（要你决定）** ✗：**连接槽回收** —— 真正解决"一生只接 15 条"要让句柄带**代号**（generation）
+（`handle = gen*16 + slot`，陈旧句柄打到旧代号 ⇒ 返回无效而不是指向新连接 ✓），但这会改动 `ffrdp.h`
+里"句柄永不复用"这条已写的边界 ✓；另外重连风暴本身（`cwnd` 塌到 1 的来源）值得单独立项 ✗。
+（⇒ 槽位回收已经做掉了，见 §26.101 ✓。）
+
+### 26.101 连接槽位回收 + 句柄代号；判死口径两条修正（2026-10-18）✔
+
+**一、槽位回收 ✓（`ffrdp.c` / `ffrdp.h`）**
+
+- 句柄不再等于表下标，而是 **`handle = gen[slot] * FFRDP_MAXCONN + slot`** ✓；`gen[slot]` 在**分配时** +1
+  （不在释放时 ✓）。0 号槽固定给内嵌主连接，句柄 0 ✓。
+- `ffrdp_conn_new()`：扫 1..maxconn-1 取**第一个空槽** ✓（原来是 `next_slot` 单调递增 ✗）；全满才拒，
+  照样计 `counter_hs_refused` ✓。代号用尽（≥ 2^27，句柄要装进 int）⇒ 该槽拒绝分配 ✓。
+- `ffrdp_conn_free()`：表项清 NULL、`live_conn--` ✓ ⇒ 槽位**立刻**可复用 ✓。
+- **新增唯一查表入口 `ffrdp_conn_lookup(ffrdp, handle)`** ✓：`slot = handle % FFRDP_MAXCONN`，
+  再核 `c->handle == handle` ⇒ 代号对不上的陈旧句柄一律当**无效** ✓。`send` / `recv` / `close` / `isdead`
+  / `dump` 全部改走它 ✓（原来直接 `table[conn]`，且用 `conn >= FFRDP_MAXCONN` 判越界 —— 句柄带代号后
+  那条判据会把 17、18… 正常句柄误杀 ✗）。
+- `nconn` 降级为"用过的最大槽 + 1"的水位（只用于遍历 ✓）；`live_conn` 才是活连接数 ✓。
+- dump 的块头改成打**句柄**（不是槽号 ✓），并加 `hs refused (no free slot): N | live conns k of maxconn m` ✓。
+- `ffrdp.h` 的约定改写 ✓：句柄是**不透明 int**、**槽位回收而句柄不复活**（复用时代号 +1 ⇒ 陈旧句柄查表
+  必失败 ⇒ 不会打到新连接上 ✓）；`docs/ffrdp-v2.md` §三、`readme.md` / `readme.zh.md` 同步 ✓。
+
+**二、判死口径的两条 bug ✓（`ffrdp_isdead_locked`）**
+
+1. **首帧 5 s 未确认就判死，哪怕一直在听到对端** ✗：对端还在发帧说明链路是通的，那个"洞"是重传 /
+   接收窗口的事（c4 那轮 `rtts 2298 ms`、`rto 2000` ⇒ 5 s 只够两次 RTO）。改成**必须同时"对端也静默
+   5 s"**才判死 ✓。
+2. **静默上限固定 5 s** ✗：RTT 被队列/CPU 拉到秒级时只够一个来回 ⇒ 偶发丢一个 ACK 就重连。
+   新增 `ffrdp_idle_deadline()` = `max(idle_ms, 4×rtts)`（封顶 60 s ✓），`isdead` 与 tick 里的 keepalive
+   判死**同一个口径** ✓。
+
+**三、验证 ✓**
+
+- `t_handshake`：5b 改成新契约（槽空出后新 SYN **接得上**，句柄 17 = 代号 1 ✓；旧句柄 1 报已死 ✓）；
+  4 阶段"新 SYN 复用 1 号槽"同理 ✓；`isdead(-1) == -1`、`isdead(16) == 1`（陈旧句柄按已断 ✓）。
+- `t_keepalive` 新增 C 段：首帧 6 s 未确认 + 对端刚有帧 ⇒ `isdead == 0` ✓；对端也静默 ⇒ `1` ✓；
+  `rtts 2000` 下静默 1 s ⇒ `0`（上限 8 s ✓）；`rtts 10` 下静默 1 s ⇒ `1`（配置值生效 ✓）。
+- 仿真全量 work **37/37** ✓；`QUICK=1 check.sh` 全绿（`logs/check-1018-151720`，含"多客户端 1×3"、
+  逐消息延迟 `p50 0.2 / p95 0.6 / max 5.9 ms`）✓。
+- e2e（lo，两批各 6 客户端，中间等 keepalive 收割）：12/12 客户端都有数据 ✓，服务端 dump 的句柄是
+  `1 2 3 4 5 6 17 18 19 20 21 22` ⇒ **槽位真的复用了、句柄换了代号** ✓，`hs refused 0` ✓。
+
+**四、遗留（不是协议问题，记一笔）** ✗
+
+- `test.c` 的 `TEST_MAX_LINK = 16` 只在 `pthread_create` 成功时 `nlink++`，**线程退出不还名额** ⇒
+  一个服务端进程最多起 16 条 link 线程（= 累计 16 条连接）。三轮 × 6 客户端的本地复现里第三轮
+  有 2 个客户端"握上手但收不到回显"就是这个原因 ✓（协议侧 `hs refused 0`，句柄也正常复用了）。
+- `tools/sim/t_cap` 在 **HEAD 上就失败**（8 个 ✗，期望"默认 64"，实际默认已 128）—— 预存问题，
+  不是本次改动引入 ✓（用 `git stash` 单跑确认过 ✓）。
+
 

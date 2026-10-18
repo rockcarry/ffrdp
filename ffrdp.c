@@ -341,7 +341,8 @@ typedef struct {
     uint32_t hs_tick;             // 上次发握手帧的时刻（重传计时）
     uint32_t hs_start;            // 本次握手开始（或上次重传）的时刻：与 handshake_ms 比就是超时
     uint32_t hs_retry;            // 已重传次数
-    uint32_t counter_hs_refused;  // 握手 SYN 没能建连接（表满 / 内存不足）—— 与"静默失败"相反
+    uint32_t counter_hs_refused;  // 握手 SYN 没能建连接（表全满 / 内存不足）—— 与"静默失败"相反
+    uint32_t handle;              // 本连接的句柄 = 代号*FFRDP_MAXCONN + 槽号（槽复用后代号变 ⇒ 陈旧句柄失效 ✓）
 
     // ---- 延迟探测：看到的延迟是我们自己的队列，还是链路本身的？----
     // 只能做实验回答：把在途砍半，看延迟跟不跟着降、而确认速率没掉 ⇒ 队列是我们的，保留更小的上限。
@@ -474,7 +475,10 @@ typedef struct {
     int               idle_ms;       // 配置：空闲判死超时（"idle:N"，默认 5000）
     int               hs_enable;     // 配置：是否走三次握手（"hs:1" 开 / "hs:0" 关，默认 1；hs:0 = 与 v1 线上行为一致）
     int               is_server;     // 角色（v1 的 FLAG_SERVER 搬到进程级：它是"这个进程"的属性，不是连接的 ✗）
-    int               next_slot;     // 连接表里下一个可用的下标（**永不复用** ✓，见 ffrdp.h 的设计说明）
+    // 槽位复用（见 ffrdp.h 的句柄约定 ✓）：分配时取表里**第一个空槽**，并把该槽的代号 +1 ⇒
+    // 句柄 = 代号 * FFRDP_MAXCONN + 槽号 ⇒ 同一个槽被复用后句柄不同 ⇒ **陈旧句柄只会查表失败** ✓。
+    uint32_t          gen[FFRDP_MAXCONN];   // 每个槽已分配过几次（0 = 从未用过 ✓；首次分配的句柄 = 槽号 ✓）
+    int               live_conn;     // 当前活着的连接数（含内嵌主连接 ✓；dump / 上限判断用 ✓）
     pthread_mutex_t   lock;          // 保护连接状态（recv_buff/游标、send_list、cur_new_*、peer_addr、flags 等）
     pthread_cond_t    cond;          // 协议侧腾出空间或送来数据时叫醒应用侧
 
@@ -722,35 +726,62 @@ static void ffrdp_conn_init(FFRDPCONN *c, int smss, int sfec)
 #endif
 }
 
-// 按需分配一条新连接（方案 A）。句柄 = 表下标 ✓、**索引永不复用** ✓（见 ffrdp.h 的设计说明）：
-// 所以下标只从 next_slot 往后取，关掉的槽留在表里当 NULL，不再被借走 ✓。
+// 按需分配一条新连接（方案 A）。**槽位回收 ✓**：取表里第一个空槽（0 号是内嵌主连接，不参与 ✓），
+// 并把该槽的代号 +1 ⇒ 句柄 = 代号 * FFRDP_MAXCONN + 槽号。
+// 为什么这样还能保住"陈旧句柄安全"：同一个槽第二次复用时代号变了 ⇒ 旧句柄算出来的 table 槽虽然相同，
+// 但 `c->handle != handle` ⇒ 查表直接失败（见 ffrdp_conn_lookup ✓），不会打到新连接上 ✓。
 static FFRDPCONN *ffrdp_conn_new(FFRDPCONTEXT *ffrdp, uint64_t addr, int *handle)
 {
     FFRDPCONN *c;
-    int        slot = ffrdp->next_slot;
-    if (slot >= ffrdp->maxconn || slot >= FFRDP_MAXCONN) return NULL;
+    int        slot = -1, i;
+    for (i = 1; i < ffrdp->maxconn && i < FFRDP_MAXCONN; i++) {
+        if (!ffrdp->table[i]) { slot = i; break; }
+    }
+    if (slot < 0) return NULL;                                        // 表全满 ⇒ 拒（调用方计数 ✓，不静默 ✓）
+    // 代号上限：句柄要装进 int ⇒ 代号 < 2^27（槽 16 个）；到顶就拒绝分配（每槽 1.3 亿次复用，够用了 ✓）。
+    if (ffrdp->gen[slot] >= 0x08000000u) return NULL;
     if (!(c = calloc(1, sizeof(FFRDPCONN)))) return NULL;
     ffrdp_conn_init(c, ffrdp->conn.smss, ffrdp->conn.fec_txredundancy);
     if (ffrdp_conn_bufs(c) != 0) { ffrdp_conn_bufs_free(c); free(c); return NULL; }   // ①-38：受理的新连接必须有缓冲
     c->peer_addr = addr;
     c->flags    |= FLAG_CONNECTED;  // 服务端：对端就是它（学到即连上 ✓）
+    c->handle    = ffrdp->gen[slot] * (uint32_t)FFRDP_MAXCONN + (uint32_t)slot;
+    ffrdp->gen[slot]++;
     ffrdp->table[slot]  = c;
-    ffrdp->next_slot    = slot + 1;
-    ffrdp->nconn        = slot + 1;
-    if (handle) *handle = slot;
+    if (slot + 1 > ffrdp->nconn) ffrdp->nconn = slot + 1;   // nconn = **用过的最大槽 + 1**（水位，只用于遍历 ✓）
+    ffrdp->live_conn++;
+    if (handle) *handle = (int)c->handle;
     return c;
 }
 
 // 释放一条连接（主连接是内嵌的 ⇒ 只清空它的链表，不 free 结构体本身 ✓）。
+// **槽位回收 ✓**：表项清成 NULL，下一次分配就能再用（代号在分配时 +1 ✓，不在释放时 ✓）。
 static void ffrdp_conn_free(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 {
+    int i, found = 0;
     if (!c) return;
     list_free(&c->send_list_head, &c->send_list_tail);
     list_free(&c->recv_list_head, &c->recv_list_tail);
     if (c->cur_new_node) { free(c->cur_new_node); c->cur_new_node = NULL; }
     ffrdp_conn_bufs_free(c);   // ①-38：大缓冲按需分配 ⇒ 这里归还 ✓（内嵌主连接也一样安全 ✓）
-    for (int i = 0; i < ffrdp->nconn; i++) if (ffrdp->table[i] == c) ffrdp->table[i] = NULL;  // 槽不回收 ✓
+    for (i = 0; i < ffrdp->nconn && i < FFRDP_MAXCONN; i++) {
+        if (ffrdp->table[i] == c) { ffrdp->table[i] = NULL; found = 1; }
+    }
+    if (found && ffrdp->live_conn > 0) ffrdp->live_conn--;
     if (c != &ffrdp->conn) free(c);
+}
+
+// 句柄 ⇒ 连接。**唯一**的查表入口 ⇒ 陈旧句柄（槽已复用、代号对不上）一律当"无效句柄" ✓。
+static FFRDPCONN *ffrdp_conn_lookup(FFRDPCONTEXT *ffrdp, int handle)
+{
+    int        slot;
+    FFRDPCONN *c;
+    if (!ffrdp || handle < 0) return NULL;
+    slot = handle % FFRDP_MAXCONN;          // 句柄 = 代号 * FFRDP_MAXCONN + 槽号 ✓
+    if (slot >= ffrdp->maxconn || slot >= FFRDP_MAXCONN) return NULL;
+    c = ffrdp->table[slot];
+    if (!c || (int)c->handle != handle) return NULL;   // 代号对不上 ⇒ 这条是"上一个用这个槽的连接" ✗
+    return c;
 }
 
 // 配置串解析（v2）："ffrdps://ip[:port][,key:val]..." / "ffrdpc://ip[:port][,key:val]..."。
@@ -806,10 +837,10 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
     ffrdp->handshake_ms = handshake_ms;
     ffrdp->idle_ms      = idle_ms;
     ffrdp->hs_enable    = hs_enable ? 1 : 0;
-    ffrdp->next_slot    = 1;   // 0 号被内嵌的主连接占用 ✓
-    // 连接表：第一步只有 0 号，指向内嵌的主连接 ⇒ 必须在第一次碰 ffrdp->conn 之前设好 ✓。
+    // 连接表：0 号固定给内嵌主连接（句柄 0 = 代号 0 * 16 + 槽 0 ✓）⇒ 服务端可用槽是 1..maxconn-1 ✓。
     ffrdp->table[0]     = &ffrdp->conn;
-    ffrdp->nconn        = 1;
+    ffrdp->nconn        = 1;       // 水位
+    ffrdp->live_conn    = 1;       // 0 号也是活的（客户端的收发全靠它 ✓）
 
     // 主连接（P4）：单连接阶段协议只跑在它上面；多连接按地址分发是下一步。
     FFRDPCONN *c = &ffrdp->conn;
@@ -905,7 +936,7 @@ void ffrdp_exit(void *ctxt)
     for (int i = 0; i < ffrdp->nconn; i++) {
         if (ffrdp->table[i] && ffrdp->table[i] != &ffrdp->conn) {
             ffrdp_conn_free(ffrdp, ffrdp->table[i]);
-            ffrdp->table[i] = NULL;          // 表槽不回收的老规矩不变 ✓（这里只是清指针 ✓）
+            ffrdp->table[i] = NULL;          // conn_free 已经清过；这里只是让循环的语义显式 ✓
         }
     }
     pthread_mutex_unlock(&ffrdp->lock);
@@ -928,17 +959,11 @@ int ffrdp_send(void *ctxt, int conn, char *buf, int len, int timeout_ms)
     uint32_t      t0;
     int           rc = FFRDP_EAGAIN;   // 默认：暂时收不下（队列满/在途满）⇒ 稍后重试
     if (!ffrdp || !buf || len <= 0) { if (ffrdp) ffrdp->stat_ref_noarg++; return FFRDP_EINVAL; }          // ①-24（只读 ✓）
-    if (conn < 0 || conn >= ffrdp->nconn || !ffrdp->table[conn]) { ffrdp->stat_ref_noconn++; return FFRDP_CONN_INVALID; }  // ①-24（只读 ✓）
+    if (!ffrdp_conn_lookup(ffrdp, conn)) { ffrdp->stat_ref_noconn++; return FFRDP_CONN_INVALID; }  // ①-24（只读 ✓）
     pthread_mutex_lock(&ffrdp->lock);
-    FFRDPCONN *c = ffrdp->table[conn]; // 这句就是"句柄 ⇒ 连接"的查表（v2 的分发入口之一）
+    FFRDPCONN *c = ffrdp_conn_lookup(ffrdp, conn);   // 句柄 ⇒ 连接（唯一入口：代号对不上就算无效 ✓）
     // ⚠️ 锁外那次判空**不够** ✗：上面到这里的几行之间没拿锁 ✓，协议线程可能正好在收 FIN /
-    //    keepalive 判死时把这条连接收掉（表槽清空 + free ✓）⇒ 这里再读就是 NULL ✓。
-    if (!c) { ffrdp->stat_ref_noconn++; rc = FFRDP_CONN_INVALID; goto out; }   // ①-24（只读 ✓）
-    // ⚠️ 锁外那次判空**不够** ✗：上面到这里的几行之间没拿锁 ✓，协议线程可能正好在收 FIN /
-    //    keepalive 判死时把这条连接收掉（表槽清空 + free ✓）⇒ 这里再读就是 NULL ✓。
-    if (!c) { ffrdp->stat_ref_noconn++; rc = FFRDP_CONN_INVALID; goto out; }   // ①-24（只读 ✓）
-    // ⚠️ 锁外那次判空**不够** ✗：上面到这里的几行之间没拿锁 ✓，协议线程可能正好在收 FIN /
-    //    keepalive 判死时把这条连接收掉（表槽清空 + free ✓）⇒ 这里再读就是 NULL ✓。
+    //    keepalive 判死时把这条连接收掉（表槽清空 + free ✓）⇒ 这里再查就是 NULL ✓。
     if (!c) { ffrdp->stat_ref_noconn++; rc = FFRDP_CONN_INVALID; goto out; }   // ①-24（只读 ✓）
     // 受理判据：帧数上限（在途 + 这一条要占的帧）算在这里；wait_snd 在同一把锁下直接读 ✓。
     if (ffrdp->closing) { FFRDP_CNT(c, counter_ref_closing); rc = FFRDP_CLOSED; goto out; }    // 正在关：当作已断（①-24 ✓）
@@ -978,7 +1003,7 @@ int ffrdp_send(void *ctxt, int conn, char *buf, int len, int timeout_ms)
             // ⚠️ 等的时候锁是**放开**的 ✓：协议线程可能正在这时把这条连接收掉
             //    （对端 FIN / keepalive 判死 ⇒ 表槽清空 + free ✓）⇒ 醒来必须**重新查表** ✗✓，
             //    不能续用旧指针 ✗（真机上这是 use-after-free ⇒ SIGSEGV：对端关连接时就踩到 ✓）。
-            c = ffrdp->table[conn];
+            c = ffrdp_conn_lookup(ffrdp, conn);
             // 连接没了 ⇒ 直接解锁返回（不能走 out: —— 那里要用 c 记计数 ✓）
             if (!c) { pthread_mutex_unlock(&ffrdp->lock); return FFRDP_CLOSED; }
         }   // ①-41：关闭上面新建的 for (;;)
@@ -1047,15 +1072,35 @@ static int ffrdp_frame_message(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, const uint8_t 
     return len - n; // with the pre-allocation above this is always len: the call is atomic
 }
 
+// 判死用的"静默上限"：配置的 idle_ms，但**不小于 4 个 RTT** ✓。
+// 为什么必须跟着 RTT 走 ✗→✓：RTT 被队列 / CPU 拉到秒级时（6 客户端那轮实测 `rtts 2298 ms`），固定 5 s
+// 只够一个来回 ⇒ 偶发一次 ACK 丢失就把整条连接判死 ⇒ 反复重连（"连接保持"输给了"数据收发" ✗）。
+// 上限 60 s：别让病态 RTT 把连接拖成永远一瘸一拐的僵尸 ✓。
+static uint32_t ffrdp_idle_deadline(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
+{
+    uint32_t idle = (ffrdp->idle_ms > 0) ? (uint32_t)ffrdp->idle_ms : 5000u;
+    if (c->rtts != (uint32_t)-1) {
+        uint64_t m = 4ull * (uint64_t)c->rtts;
+        if (m > 60000ull) m = 60000ull;
+        if (m > (uint64_t)idle) idle = (uint32_t)m;
+    }
+    return idle;
+}
+
 static int ffrdp_isdead_locked(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 {
     if (c->hs_state == HS_FAILED) return 1;   // 握手超时：对端从未连上 ⇒ 就是"已断"
-    // keepalive：UP 且整整 idle_ms 没听到对端 ⇒ 判死（这是 v2 才有的"空闲也能判死" ✓）。
+    // keepalive：UP 且整整一个"静默上限"没听到对端 ⇒ 判死（这是 v2 才有的"空闲也能判死" ✓）。
     if (ffrdp->hs_enable && c->hs_state == HS_UP &&
-        (int32_t)(NOW_MS() - c->tick_last_recv) > ffrdp->idle_ms) return 1;
+        (int32_t)(NOW_MS() - c->tick_last_recv) > (int32_t)ffrdp_idle_deadline(ffrdp, c)) return 1;
     if (!c->send_list_head) return 0;
     if (c->send_list_head->flags & FLAG_FIRST_SEND) {
-        return (int32_t)NOW_MS() - (int32_t)c->send_list_head->tick_1sts > FFRDP_DEAD_TIMEOUT;
+        // 首帧 5 s 没被确认 ⇒ **只有"同时也一直没听到对端"才判死** ✓。
+        // 对端还在发帧就说明链路是通的，那个"洞"是重传 / 接收窗口的事，不该拿整条连接去赌 ✗
+        // （c4 那轮：`rtts 2298 ms`、`rto 2000` ⇒ 5 s 只够两次 RTO，按老口径就先把它判死了 ✓）。
+        uint32_t now = NOW_MS();
+        return (int32_t)(now - c->send_list_head->tick_1sts) > FFRDP_DEAD_TIMEOUT &&
+               (int32_t)(now - c->tick_last_recv)        > FFRDP_DEAD_TIMEOUT;
     } else {
         return (int32_t)c->tick_send_query - (int32_t)c->tick_recv_ack > FFRDP_DEAD_TIMEOUT;
     }
@@ -1068,15 +1113,9 @@ int ffrdp_recv(void *ctxt, int conn, char *buf, int len, int timeout_ms)
     uint32_t      t0;
     int           ret = FFRDP_EAGAIN;
     if (!ffrdp || !buf || len <= 0) return FFRDP_EINVAL;
-    if (conn < 0 || conn >= ffrdp->nconn || !ffrdp->table[conn]) return FFRDP_CONN_INVALID;
+    if (!ffrdp_conn_lookup(ffrdp, conn)) return FFRDP_CONN_INVALID;
     pthread_mutex_lock(&ffrdp->lock);
-    FFRDPCONN *c = ffrdp->table[conn];   // 句柄 ⇒ 连接
-    // ⚠️ 与 ffrdp_send 同一个坑 ✗：锁外判过空，锁内这次查询仍可能是 NULL ✓
-    //    （两次查表之间协议线程收了 FIN / 判了死 ✓）⇒ 必须再判一次，不能直接解引用 ✓。
-    if (!c) { pthread_mutex_unlock(&ffrdp->lock); return FFRDP_CONN_INVALID; }
-    // ⚠️ 与 ffrdp_send 同一个坑 ✗：锁外判过空，锁内这次查询仍可能是 NULL ✓
-    //    （两次查表之间协议线程收了 FIN / 判了死 ✓）⇒ 必须再判一次，不能直接解引用 ✓。
-    if (!c) { pthread_mutex_unlock(&ffrdp->lock); return FFRDP_CONN_INVALID; }
+    FFRDPCONN *c = ffrdp_conn_lookup(ffrdp, conn);   // 句柄 ⇒ 连接
     // ⚠️ 与 ffrdp_send 同一个坑 ✗：锁外判过空，锁内这次查询仍可能是 NULL ✓
     //    （两次查表之间协议线程收了 FIN / 判了死 ✓）⇒ 必须再判一次，不能直接解引用 ✓。
     if (!c) { pthread_mutex_unlock(&ffrdp->lock); return FFRDP_CONN_INVALID; }
@@ -1106,7 +1145,7 @@ int ffrdp_recv(void *ctxt, int conn, char *buf, int len, int timeout_ms)
         // ⚠️ 等的时候锁是**放开**的 ✓：协议线程可能正在这时把这条连接收掉
         //    （对端 FIN / keepalive 判死 ⇒ 表槽清空 + free ✓）⇒ 醒来必须**重新查表** ✗✓，
         //    不能续用旧指针 ✗（真机上这是 use-after-free ⇒ SIGSEGV：对端关连接时就踩到 ✓）。
-        c = ffrdp->table[conn];
+        c = ffrdp_conn_lookup(ffrdp, conn);
         if (!c) { ret = FFRDP_CLOSED; break; }   // 等的时候连接没了 ⇒ 按"已断"报 ✓（与上面判死同一个口径 ✓）
     }
     pthread_mutex_unlock(&ffrdp->lock);
@@ -1118,10 +1157,10 @@ int ffrdp_close(void *ctxt, int conn)
 {
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     FFRDPCONN    *c;
-    if (!ctxt || conn < 0 || conn >= FFRDP_MAXCONN) return -1;
+    if (!ctxt || conn < 0) return -1;
     pthread_mutex_lock(&ffrdp->lock);
-    c = ffrdp->table[conn];
-    if (!c) { pthread_mutex_unlock(&ffrdp->lock); return -1; }      // 已经关掉了 ⇒ 无效句柄 ✓
+    c = ffrdp_conn_lookup(ffrdp, conn);      // 句柄带代号 ⇒ 不能再按"下标 < FFRDP_MAXCONN"判 ✓
+    if (!c) { pthread_mutex_unlock(&ffrdp->lock); return -1; }      // 已经关掉了 / 陈旧句柄 ⇒ 无效 ✓
     if (ffrdp->hs_enable && c->hs_state == HS_UP) {
         // 正常路径：发 FIN，进 FIN_WAIT（重传与超时由 hs_* 那套接管 ✓）；
         // 等对端的 FIN 到了才 DISCONN + 收摊 ✓（那种情况在 ffrdp_hs_rx 里处理 ✓）。
@@ -1143,10 +1182,10 @@ int ffrdp_isdead(void *ctxt, int conn)
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     FFRDPCONN *c;
     int ret;
-    if (!ctxt || conn < 0 || conn >= FFRDP_MAXCONN) return -1;
+    if (!ctxt || conn < 0) return -1;
     pthread_mutex_lock(&ffrdp->lock);
-    c = ffrdp->table[conn];
-    ret = c ? ffrdp_isdead_locked(ffrdp, c) : 1;
+    c = ffrdp_conn_lookup(ffrdp, conn);
+    ret = c ? ffrdp_isdead_locked(ffrdp, c) : 1;      // 陈旧句柄 = 那条连接已经没了 ⇒ 已断 ✓
     pthread_mutex_unlock(&ffrdp->lock);
     return ret;
 }
@@ -1703,13 +1742,14 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
     // 空闲 = 半程没听到对端 ⇒ 主动发一个 QUERY 去敲它（对端的 ack 回来我们就续命 ✓）。
     if (ffrdp->hs_enable && c->hs_state == HS_UP) {
         uint32_t now2 = NOW_MS();
-        if ((int32_t)(now2 - c->tick_last_recv) >= ffrdp->idle_ms) {
+        uint32_t idle = ffrdp_idle_deadline(ffrdp, c);   // 与 isdead 同一个口径：不小于 4 个 RTT ✓
+        if ((int32_t)(now2 - c->tick_last_recv) >= (int32_t)idle) {
             c->hs_state = HS_FAILED;
             ffrdp_emit(ffrdp, FFRDP_DISCONN, ffrdp_conn_handle(ffrdp, c), c->peer_addr, NULL, 0);
             if (c != &ffrdp->conn) ffrdp_conn_free(ffrdp, c);
             return;
         }
-        if ((int32_t)(now2 - c->tick_last_recv) >= ffrdp->idle_ms / 2 &&
+        if ((int32_t)(now2 - c->tick_last_recv) >= (int32_t)(idle / 2) &&
             (c->tick_send_query == 0 || (int32_t)(now2 - c->tick_send_query) >= ffrdp->idle_ms / 2)) {
             uint8_t q[1];
             q[0] = FFRDP_FRAME_TYPE_QUERY;
@@ -2089,11 +2129,11 @@ static long ffrdp_emit(FFRDPCONTEXT *ffrdp, int type, int conn, uint64_t addr, v
     return ffrdp->app_cb(ffrdp->app_cbctx, &ev);
 }
 
-// 一条连接在表里的句柄（= 下标）。-- 都没找到时返回 -1。
+// 一条连接的句柄（= 代号*FFRDP_MAXCONN + 槽号，分配时就定好了 ✓）。c 为空时返回 -1。
 static int ffrdp_conn_handle(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 {
-    for (int i = 0; i < ffrdp->nconn; i++) if (ffrdp->table[i] == c) return i;
-    return -1;
+    (void)ffrdp;
+    return c ? (int)c->handle : -1;
 }
 
 // 发一个握手帧：data[0] = 35，data[1] = 子类型。照 QUERY 的写法：小栈缓冲 + lowlevel->send()
@@ -2276,12 +2316,12 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
                                                 cc->hs_state == HS_SYN_RCVD ? FFRDP_HS_SYN_ACK : FFRDP_HS_FIN);
                 if ((int32_t)(now - cc->hs_start) >= (int32_t)ffrdp->handshake_ms) {
                     if (ffrdp->is_server) {
-                        // 半开连接计时封顶：没人来完成握手就把这条连接放掉（表槽不回收 ✓）。
-                        ffrdp_emit(ffrdp, FFRDP_DISCONN, i, cc->peer_addr, NULL, 0);
+                        // 半开连接计时封顶：没人来完成握手就把这条连接放掉（**槽位随即回收** ✓）。
+                        ffrdp_emit(ffrdp, FFRDP_DISCONN, ffrdp_conn_handle(ffrdp, cc), cc->peer_addr, NULL, 0);
                         ffrdp_conn_free(ffrdp, cc);
                     } else {
                         cc->hs_state = HS_FAILED; // 客户端：此后 send/recv 按"已断"处理
-                        ffrdp_emit(ffrdp, FFRDP_DISCONN, i, cc->peer_addr, NULL, 0);
+                        ffrdp_emit(ffrdp, FFRDP_DISCONN, ffrdp_conn_handle(ffrdp, cc), cc->peer_addr, NULL, 0);
                     }
                     continue;
                 }
@@ -2569,7 +2609,7 @@ static void ffrdp_dump_locked(FFRDPCONTEXT *ffrdp, int conn, int clearhistory)
     int i;
     if (conn >= 0) {
         // 指定连接：只这一条 ✓（空槽 / 越界在 ffrdp_dump 那层已经被拦掉 ✓）。
-        FFRDPCONN *c = ffrdp->table[conn];
+        FFRDPCONN *c = ffrdp_conn_lookup(ffrdp, conn);
         if (c) ffrdp_dump_conn(ffrdp, c, conn, clearhistory);
         return;
     }
@@ -2577,7 +2617,8 @@ static void ffrdp_dump_locked(FFRDPCONTEXT *ffrdp, int conn, int clearhistory)
         FFRDPCONN *c = ffrdp->table[i];
         // ①-38d：服务端那块内嵌 0 号槽在还没有连接时不整表打出来（它每圈被空跑、计数在涨 ⇒ 躲不过"完全空闲"那道门）。
         if (c && ffrdp->is_server && c == &ffrdp->conn && c->peer_addr == 0) continue;
-        if (c) ffrdp_dump_conn(ffrdp, c, i, clearhistory);
+        // 打**句柄**（不是槽号 ✓）：槽位回收之后两者已经不是一个东西 ✗（句柄 17 = 代号 1、槽 1 ✓）
+        if (c) ffrdp_dump_conn(ffrdp, c, (int)c->handle, clearhistory);
     }
     // ①-38：只读读数 —— 那两块"按需分配"的大缓冲**实际分配了多少字节** ✓。
     {
@@ -2597,10 +2638,16 @@ void ffrdp_dump(void *ctxt, int conn, int clearhistory)
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)ctxt;
     if (!ffrdp) return;
     // conn >= 0 ⇒ 只打那一条；conn < 0 ⇒ 表里每条一块。
-    if (conn >= ffrdp->nconn || (conn >= 0 && !ffrdp->table[conn])) return;
+    if (conn >= 0 && !ffrdp_conn_lookup(ffrdp, conn)) return;   // 句柄带代号 ⇒ 只能查表判有效 ✓
     // 打印的全是协议状态，而协议跑在工作线程里：拿住同一把锁再读 ⇒ 打出来的不会是被拆散的一半。
     pthread_mutex_lock(&ffrdp->lock);
     if (conn < 0) printf("%s---- connection table: %d slots, one block each below ----\n", (ffrdp->nconn > 1 ? "\n" : ""), ffrdp->nconn);
+    // 握手被拒：只有服务端会遇到（表满 / 内存不足），而且**原来没有任何出口** ⇒ 出了这事日志一片干净 ✗
+    // （6 客户端那轮：服务端槽位用满后 SYN 全被丢、c4/c6 干等 10 s 握手超时，日志上看不出原因 ✓）。
+    // 槽位是**回收复用**的 ✓ ⇒ 拒连只可能是"此刻一条空槽都没有"（live == maxconn）或是内存不足 ✓。
+    if (conn < 0) printf("---- hs refused (no free slot): %u | live conns %d of maxconn %d ----\n",
+                         ffrdp->table[0] ? ffrdp->table[0]->counter_hs_refused : 0,
+                         ffrdp->live_conn, ffrdp->maxconn);
     // ①-9：入口分档 —— 与低层 fire 对照 ⇒ 多出的回调是哪种类型 / 是否发生在 nconn==0 时 ✓
     if (conn < 0) printf("---- lowlevel callbacks into protocol: timer %u, data %u, other %u | entry nconn==0: %u, sum %u ----\n",
                           ffrdp->cb_timer_calls, ffrdp->cb_data_calls, ffrdp->cb_other_calls,

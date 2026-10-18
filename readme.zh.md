@@ -251,7 +251,7 @@ params（字符串配置，解析失败返回 NULL 并把原因打出来 ✓）�
 ⚠️ 时间类键名**自带单位**（`_ms` ✓）—— 与 `timeout_ms` 同一套风格，不留"配置是秒、内部是毫秒"的换算点 ✗。
 ```
 
-- **句柄式** ✓：`conn` 是连接句柄（服务端在 `FFRDP_ACCEPT` 事件里拿到 ✓）；**句柄永不复用** ✓ ⇒ 陈旧句柄只会指向"已关闭的" ✓，返回 `FFRDP_CONN_INVALID` ✓。
+- **句柄式** ✓：`conn` 是连接句柄（服务端在 `FFRDP_ACCEPT` 事件里拿到 ✓），只当**不透明 int** 用 ✓；**槽位回收、句柄不复活** ✓ ⇒ 陈旧句柄查表失败（`FFRDP_CONN_INVALID` / `isdead` = 1 ✓），不会打到新连接上 ✓。
 - **事件回调** ✓：`FFRDP_ACCEPT` / `CONNECT` / `DISCONN` / `ENCRYPT` / `DECRYPT` / `RECVDATA` —— 语义、回调返回值（`FFRDP_CONSUMED` / `NOT_CONSUMED`）与加密约定见 [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) ✓。
 - **返回码** ✓：`> 0` = 字节数 ✓、`FFRDP_CLOSED(0)` = 对端已断 ✓、`FFRDP_EAGAIN(-2)` = 暂时没有 / 等不到 ✓、`FFRDP_CONN_INVALID(-1)` = 句柄无效（含**已关掉的**句柄 ✓）。
 - **`timeout_ms`** ✓：`0` = 不等待（旧行为 ✓）、`> 0` = 最多等这么多毫秒 ✓、`< 0` = 一直等到能收 / 能发为止 ✓。
@@ -282,7 +282,7 @@ void  ffrdp_dump  (void *ctxt, int clearhistory);     // 打印诊断
 | **一条命令跑完所有判据**（编译 / 仿真 / ASAN / 本机两进程四条路径 / v1 互通）| `tools/check.sh`（用法见 §四）|
 | 传输层（收发包 / 定时器 / 唤醒）的契约测试 | `tools/test-lowlevel-udp.sh`（用法见 §四）|
 | v2.0.0 的接口（params / 句柄 / 事件 / 加密回调 / 握手与挥手 / keepalive）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |
-| v2.0.0 的设计取舍与边界条件（连接表 / 句柄不复用 / 半开上限 / 加密约定）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |
+| v2.0.0 的设计取舍与边界条件（连接表 / 句柄代号与槽位回收 / 半开上限 / 加密约定）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |
 | **音视频（H.265 / VBR）延迟预算与调优**：延迟公式、慢/快 AP 的数字、丢包代价、MTU 与 IP 分片、怎么量 | [`docs/ffrdp-latency.md`](docs/ffrdp-latency.md) |
 | **v2.x 相对 v1.1.x 的协议改进**（含验收口径、已知边界、已否路线与仍开放方向）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) §九 |
 

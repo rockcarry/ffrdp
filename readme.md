@@ -300,9 +300,9 @@ params (string configuration; a parse failure returns NULL and prints the reason
 ⚠️ Time keys **carry their unit** (`_ms` ✓) — the same style as `timeout_ms`, leaving no "config in seconds, internals in milliseconds" conversion point ✗.
 ```
 
-- **Handle-based** ✓: `conn` is a connection handle (the server obtains it from the `FFRDP_ACCEPT` event ✓);
-  **handles are never reused** ✓ ⇒ a stale handle can only refer to an "already closed" connection ✓ and yields
-  `FFRDP_CONN_INVALID` ✓.
+- **Handle-based** ✓: `conn` is a connection handle (the server obtains it from the `FFRDP_ACCEPT` event ✓) and is
+  an **opaque int** ✓; **slots are recycled, handles are not revived** ✓ ⇒ a stale handle fails the table lookup
+  (`FFRDP_CONN_INVALID`, `isdead` = 1 ✓) and can never address a newer connection ✓.
 - **Event callbacks** ✓: `FFRDP_ACCEPT` / `CONNECT` / `DISCONN` / `ENCRYPT` / `DECRYPT` / `RECVDATA` — semantics,
   callback return values (`FFRDP_CONSUMED` / `NOT_CONSUMED`) and the encryption contract are in
   [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) ✓.
@@ -340,7 +340,7 @@ void  ffrdp_dump  (void *ctxt, int clearhistory);     // print diagnostics
 | **One command that runs every criterion** (build / simulation / ASAN / local two-process four paths / v1 interop) | `tools/check.sh` (usage in §4) |
 | Contract test for the transport layer (packets / timers / wakeup) | `tools/test-lowlevel-udp.sh` (usage in §4) |
 | The v2.0.0 interface (params / handles / events / encryption callbacks / handshake and teardown / keepalive) | [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) (Chinese) |
-| v2.0.0's design trade-offs and boundary conditions (connection table / handles not reused / half-open ceiling / encryption contract) | [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) (Chinese) |
+| v2.0.0's design trade-offs and boundary conditions (connection table / handle generation / half-open ceiling / encryption contract) | [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) (Chinese) |
 | **A/V (H.265 / VBR) latency budget and tuning**: the formula, numbers for slow/fast APs, the cost of a loss, MTU and IP fragmentation, how to measure | [`docs/ffrdp-latency.md`](docs/ffrdp-latency.md) (Chinese) |
 | **v2.x improvements over v1.1.x** (with acceptance criteria, known limits, rejected routes and still-open directions) | [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) §9 (Chinese) |
 

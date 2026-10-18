@@ -532,11 +532,20 @@ static int link_loop(struct link_arg *a)
                     pthread_mutex_lock(&g_mutex); ffrdp_dump(ffrdp, -1, 0)   /* ①-8：打全表 —— 服务端 0 号内嵌槽的计数原来完全不可见 ✗ */; pthread_mutex_unlock(&g_mutex);
                 }
             }
-        } else if (connected && peer_is_lost(ffrdp, handle, tick_recv)) {
-            printf("%s lost ! (handle %d)\n", peer->peer, handle);
+        // 断连判据分两种（原来只有 connected 那条 ⇒ **握手没完成的连接永远不判死** ✗：6 客户端那轮
+        // c4/c6 卡在 HS_FAILED 后各空转 62 s、296,401,393 次 send 被拒，而且永远不会重连 ✓）：
+        //   ① 应用侧：connected 之后多久没字节（TEST_PEER_SILENCE_MS）✓
+        //   ② 协议侧：握手超时(HS_FAILED) / keepalive / 首帧久等 ⇒ ffrdp_isdead ✓（与 connected 无关 ✓）
+        } else if ((connected && peer_is_lost(ffrdp, handle, tick_recv)) || ffrdp_isdead(ffrdp, handle)) {
+            if (connected) printf("%s lost ! (handle %d)\n", peer->peer, handle);
+            else           printf("%s lost ! (handle %d; never connected) -- 握手超时，重建上下文重试\n", peer->peer, handle);
             if (ffrdp) { printf("%s --- dump ---\n", peer->name); fflush(stdout); ffrdp_dump(ffrdp, -1, 0)   /* ①-8：打全表 —— 服务端 0 号内嵌槽的计数原来完全不可见 ✗ */; }
             lost = 1;
             break;                        // 这条连接完了；要不要重建由调用方决定 ✓
+        } else if (!connected) {
+            // 握手还没成（hs 进行中 / 已失败但上面还没轮到）：ffrdp_recv 在 HS_FAILED 时**立即**返回、
+            // send 也立即被拒 ⇒ 这里不睡，整个循环就是一个死转的 CPU 核 ✗（实测 480 万次/s ✓）
+            usleep(1000);
         }
     }
 

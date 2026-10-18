@@ -95,7 +95,10 @@ int main(void)
     check(sent1 > 0 && sent2 > 0, "两个客户端都确实发出去了数据");
     // isdead 现在按句柄问（v2 ✓）：失联是**每连接**的状态 ✓
     check(ffrdp_isdead(srv, g_h1) == 0 && ffrdp_isdead(srv, g_h2) == 0, "按句柄问：两条连接都活着（0）");
-    check(ffrdp_isdead(srv, FFRDP_MAXCONN) == -1, "句柄越界 ⇒ -1（参数错）");
+    // 句柄现在是"代号*16 + 槽" ⇒ 只有负数算参数错 ✓；像 FFRDP_MAXCONN(16) 这种"某个旧代号"的句柄
+    // 查表对不上 ⇒ 按"那条连接已经没了"报已断(1 ✓)，绝不会误打到新连接上 ✓（槽位回收的前提 ✓）。
+    check(ffrdp_isdead(srv, -1) == -1, "负句柄 ⇒ -1（参数错）");
+    check(ffrdp_isdead(srv, FFRDP_MAXCONN) == 1, "未知/陈旧句柄 ⇒ 已断(1)，不报参数错 ✓");
 
     /* ── 阶段 1b：FIN ⇒ DISCONN + 释放那条连接 ──────────────────────────── */
     printf("── 阶段 1b：客户端 1 那一侧发 FIN\n");
@@ -184,13 +187,16 @@ int main(void)
 
     for (i = 1; i < 1400; i++) { sim_setstep(i); sim_begin(0); sim_ll_run(0, p_sc); }
     check(sc->table[1] == NULL, "超过 handshake_ms ⇒ 半开放掉（表槽清空）");
-    check(sc->nconn == 2, "水位不回收");
+    check(sc->nconn == 2, "水位不回收（nconn 只是遍历上界 ✓）");
     check(g_disconn == 1 && g_accept == 0, "报了 DISCONN、且始终没有 ACCEPT");
 
     sim_setstep(2000);
     sim_begin(0); sim_send_from(0, A_Y, hsbuf, hs_frame(hsbuf, FFRDP_HS_SYN));
     sim_begin(0); sim_ll_run(0, p_sc);
-    check(sc->table[2] && sc->table[2]->peer_addr == A_Y, "新 SYN 拿 2 号（1 号没被回收 ✓ 索引永不复用）");
+    // **槽位回收 ✓**：1 号空出来了 ⇒ 新 SYN 重新拿 1 号，但代号 +1 ⇒ 句柄 = 1*16+1 = 17 ✓
+    check(sc->table[1] && sc->table[1]->peer_addr == A_Y, "新 SYN 复用 1 号槽（槽位回收 ✓）");
+    check(sc->table[1] && sc->table[1]->handle == 17, "复用槽的句柄换了代号（17 = 1*16+1 ✓ 陈旧句柄不会撞上 ✓）");
+    check(ffrdp_isdead(sc, 1) == 1, "旧句柄 1 现在算无效/已死（代号对不上 ✓）");
     ffrdp_exit(p_sc);
 
     /* ── 阶段 5：maxconn 满了就不再接（设计稿接受的取舍）────────────────── */
@@ -211,16 +217,20 @@ int main(void)
     check(sc->table[0]->counter_hs_refused == 1, "第二个 SYN 被拒、并计入 counter_hs_refused（不静默 ✓）");
     check(sc->nconn == 2 && sc->table[2] == NULL, "没有建出第三条连接");
 
-    // 5b：那个半开连接过了 handshake_ms 会被放掉 ⇒ **槽空着、但新 SYN 照样进不来** ✓
-    //（索引永不复用 ⇒ 水位已经到 maxconn ✓ —— 这是设计里明确的取舍，这里把它钉住 ✓）
+    // 5b：那个半开连接过了 handshake_ms 会被放掉 ⇒ **槽位回收 ✓**：新 SYN 立刻能进来（句柄换代号 ✓）。
+    // 这正是 6 客户端那轮"服务端一生只接 15 条"的病根（notes §26.100 ✓）。
     {   int k;
+        int refused = sc->table[0]->counter_hs_refused;
         for (k = 1; k < 1200; k++) { sim_setstep(k); sim_begin(0); sim_ll_run(0, p_sc); }
         check(sc->table[1] == NULL, "半开连接超时被放掉（1 号槽空了 ✓）");
         check(sc->nconn == 2, "水位不回收（仍是 2 ✓）");
         sim_begin(0); sim_send_from(0, A_Y, hsbuf, hs_frame(hsbuf, FFRDP_HS_SYN));
         sim_begin(0); sim_ll_run(0, p_sc);
-        check(sc->table[0]->counter_hs_refused == 2, "槽空着，新 SYN **仍然被拒**（索引不复用 ✓）并计数 ✓");
-        check(sc->nconn == 2 && sc->table[1] == NULL, "依然没建出连接（同一取舍 ✓）");
+        check(sc->table[1] != NULL, "槽空出来了 ⇒ 新 SYN **接得上**（槽位回收 ✓，不再「一生只接 maxconn-1 条」✗）");
+        check(sc->table[1] && sc->table[1]->peer_addr == A_Y, "确实是新对端占了这个槽 ✓");
+        check(sc->table[1] && sc->table[1]->handle == 17, "句柄 = 17（代号 1 ⇒ 与旧句柄 1 不撞 ✓）");
+        check(sc->table[0]->counter_hs_refused == (uint32_t)refused, "没再记「拒连」（这次是接上了 ✓）");
+        check(sc->nconn == 2, "水位没变（复用同一个槽 ✓）");
     }
     ffrdp_exit(p_sc);
 
