@@ -406,6 +406,7 @@ QUIC 的传输层大量借鉴 TCP ⇒ §10.3 的多数条目对它同样成立 �
 | RTO | `FFRDP_MIN_RTO 16`、`FFRDP_MAX_RTO 2000`、`rto = max(rtts + 4·rttd, rto_floor)`、`rtt_tail` 学习 |
 | 快重传等待 | `hole_wait` = 0 / 1·rtt / min(3·rtt, 300)（按对端"白费率"证据自调）|
 | ACK | `FFRDP_ACK_COALESCE 0`（收到帧当场回）|
+| pacing（削峰） | `FFRDP_PACE_ENABLE 1`、`FFRDP_PACE_MS 1`、`FFRDP_PACE_RATE_PCT 125`、`FFRDP_PACE_BURST_MS 2`、`FFRDP_PACE_MIN_RTT 5`（`rtts` 低于它就**不整形**：回环/本机上那个锯齿不存在，只剩"一桶 ÷ 唤醒周期"的代价）|
 | 在途闸门 | `FFRDP_INFLIGHT_MAX 64`、`FFRDP_INFLIGHT_MIN 4`；探测 `FFRDP_PROBE_ENABLE 1`、判据 `FFRDP_PROBE_QUEUE_RATIO 3` |
 | 受理闸 / 未发预算 | `FFRDP_MAX_WAITSND 256`、`FFRDP_UNSENT_MAX 24` |
 | 接收窗口 | `FFRDP_RX_WINDOW_FRAMES 96`（单位是**帧**，同时就是通告窗口）|

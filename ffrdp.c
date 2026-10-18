@@ -164,6 +164,11 @@
 #ifndef FFRDP_PACE_MIN_FPS
 #define FFRDP_PACE_MIN_FPS    64    // RTT 还没采样到时的下限（≈82KB/s）—— 只在最初几毫秒起作用 ✓
 #endif
+#ifndef FFRDP_PACE_MIN_RTT
+#define FFRDP_PACE_MIN_RTT    5     // rtts 低于这个值（ms）⇒ **不整形**（锯齿的周期就是 RTT，几百微秒的
+                                    // 尺度上它不构成问题；而整形的兑现靠 ms 级期限，平台唤醒是几毫秒
+                                    // ⇒ 只剩代价。lo 实测 47.3 → 35.9 MB/s，见 notes §26.99 ✓）
+#endif
 #endif /* FFRDP_PACE_ENABLE */
 // 关掉时也要能写进同一行判据 ⇒ 用一个恒假宏（免得满屏 #if ✓）。
 #if FFRDP_PACE_ENABLE
@@ -451,6 +456,7 @@ typedef struct {
     uint32_t pace_tok16;      // 当前令牌（1/16 帧 ✓）
     uint32_t pace_tick;       // 上次补充时刻（ms ✓）
     uint32_t pace_due;        // 有帧在等令牌 ⇒ 下一次该醒的时刻（ms；0 = 没被令牌挡住 ✓）
+    uint32_t pace_fps;        // 本圈算出来的整形速率（0 = **不整形**：RTT 太小 / 还没采样 ✓）
 #endif
 } FFRDPCONN;
 
@@ -712,6 +718,7 @@ static void ffrdp_conn_init(FFRDPCONN *c, int smss, int sfec)
     c->pace_tick  = c->tick_conn_init;
     c->pace_tok16 = 16u * (uint32_t)FFRDP_PACE_BURST_MS;   // 起步先给一桶 ⇒ 不额外拖慢启动 ✓
     c->pace_due   = 0;
+    c->pace_fps   = 0;                                     // 还没采样到 RTT ⇒ 先不整形 ✓
 #endif
 }
 
@@ -1522,10 +1529,15 @@ static void ffrdp_apply_acks(FFRDPCONN *c, FFRDP_RX_BATCH *b)
 //   用 rate_now 会掉进反馈陷阱 —— 整形一压，rate_now 跟着降，令牌就更少 ⇒ 变成限速器 ✗（实测 lo 上
 //   从 56 MB/s 掉到 0.47 MB/s）。窗口/RTT 是物理量，不受整形影响 ✓。
 // 再乘 FFRDP_PACE_RATE_PCT 留余量 ⇒ 只在**形状**上摊平，不砍均值速率 ✓。
+// 返回 0 = **不整形**（回环 / RTT 还没采样 / RTT 太小 ✓）。三件事一起做掉：
+//   ① 锯齿的周期就是 RTT：rtts 只有几百微秒时，"打一梭子 + 静默"在这个尺度上根本不成问题 ✗；
+//   ② 整形的兑现靠 ms 级期限，而平台的**实际唤醒**是几毫秒（WSL/lo 上实测）⇒ 每次唤醒只推一桶
+//      （2 ms 的量）⇒ 均值被"桶 ÷ 唤醒周期"限住（lo：47.3 → 35.9 MB/s，−24%，notes §26.99 ✓）；
+//   ③ 早期 rtts 未采样（-1）时也不该限速 ⇒ 启动不被拖慢 ✓。
 static uint32_t ffrdp_pace_fps(FFRDPCONN *c)
 {
     uint32_t rtt = c->rtts, lim = c->inflight_max ? c->inflight_max : (uint32_t)FFRDP_INFLIGHT_MAX, fps;
-    if (rtt == (uint32_t)-1 || (int32_t)rtt < 1) rtt = 1;      // 回环（rtt≈0）⇒ 上限极大 ⇒ 不整形 ✓
+    if (rtt == (uint32_t)-1 || (int32_t)rtt < (int32_t)FFRDP_PACE_MIN_RTT) return 0;
     fps = (uint32_t)(((uint64_t)lim * 1000u) / rtt);
     fps = fps * FFRDP_PACE_RATE_PCT / 100u;
     if (fps < (uint32_t)FFRDP_PACE_MIN_FPS) fps = (uint32_t)FFRDP_PACE_MIN_FPS;
@@ -1534,9 +1546,16 @@ static uint32_t ffrdp_pace_fps(FFRDPCONN *c)
 
 static void ffrdp_pace_refill(FFRDPCONN *c, uint32_t now)
 {
-    uint32_t dt = now - c->pace_tick, per16, burst16;
+    uint32_t dt = now - c->pace_tick, per16, burst16, fps = ffrdp_pace_fps(c);
+    c->pace_fps = fps;
+    if (fps == 0) {                         // 不整形：桶恒满、不设期限 ⇒ 发送循环与 next_due 都当它不存在 ✓
+        c->pace_tok16 = 2u * 16u;
+        c->pace_tick  = now;
+        c->pace_due   = 0;
+        return;
+    }
     if ((int32_t)dt < (int32_t)FFRDP_PACE_MS) return;
-    per16   = (ffrdp_pace_fps(c) * FFRDP_PACE_MS * 16u) / 1000u;   // 每个周期补的 1/16 帧
+    per16   = (fps * FFRDP_PACE_MS * 16u) / 1000u;                 // 每个周期补的 1/16 帧
     if (per16 < 1) per16 = 1;
     burst16 = per16 * FFRDP_PACE_BURST_MS;
     // 桶深下限 = **2 帧**（32 个 1/16）。少了就是死锁，不是"慢一点"：
@@ -1756,7 +1775,8 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
 #if FFRDP_PACE_ENABLE
             // C1：令牌不够 ⇒ 这一帧这圈不发，并记下"补令牌"那一刻（1 ms 后）✓。
             // **不 break**：后面"到点该重传"的帧不吃令牌，必须照走（与 swnd0 那条同理 ✓）。
-            if (c->pace_tok16 < 16) {
+            // pace_fps == 0（RTT 太小 / 未采样）= 不整形 ⇒ 这条判据整条不生效 ✓
+            if (c->pace_fps && c->pace_tok16 < 16) {
                 if (c->pace_due == 0) c->pace_due = NOW_MS() + FFRDP_PACE_MS;
                 FFRDP_CNT(c, counter_pace_wait);
                 continue;
@@ -2393,8 +2413,9 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     printf("rmss, smss          : %u, %u\n"    , c->rmss, c->smss);
     printf("swnd, cwnd, ssthresh: %u, %u, %u\n", c->swnd, c->cwnd, c->ssthresh);
 #if FFRDP_PACE_ENABLE
-    printf("pace (ms bucket)    : tok %u (1/16 frame), burst %d ms, waited %u frames, rate_now %u fps\n",
-           c->pace_tok16, FFRDP_PACE_BURST_MS, c->counter_pace_wait, c->rate_now);
+    printf("pace (ms bucket)    : tok %u (1/16 frame), burst %d ms, waited %u frames, shaping %u fps%s\n",
+           c->pace_tok16, FFRDP_PACE_BURST_MS, c->counter_pace_wait, c->pace_fps,
+           c->pace_fps ? "" : " (off: rtts < FFRDP_PACE_MIN_RTT)");
 #endif
     // 三个判据一行打完（drain 早退 / cwnd 被乱序误判打回 / 被内核丢包打回）；计数是累计的 ⇒ 看增量。
     printf("ssthresh floor hits : %u (cwnd already at the floor, still recomputed => +1/ACK from here)\n", c->counter_ssth_floor);
