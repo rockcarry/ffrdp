@@ -66,6 +66,17 @@ static int  app_sendretry_get(void)
     return v;
 }
 
+// 应用层"多久没收到字节就判对端失联"。默认 = 老行为 2000 ms ✓。
+// ⚠️ 高 RTT 链路（200 ms 起）上这个阈值太紧：协议自己的 keepalive 是 5 s，而应用层 2 s 就 break+重连 ⇒
+//    一次正常的长静默会把长跑实验切成两段，两端的分母随之错位（pace1/pace2 实测）⇒ 用 env 抬上去 ✓。
+static int  peer_silence_get(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TEST_PEER_SILENCE_MS"); v = (e && *e) ? atoi(e) : TEST_PEER_SILENCE_MS; }
+    if (v < 100) v = 100;   // 别让它被写成 0（那等于"立刻判死"✗）
+    return v;
+}
+
 static int  server_max_send_size = 16 * 1024;
 static int  client_max_send_size = 16 * 1024;
 static int  send_speed           = 0;   // 本进程的发送限速，单位 KB/s（1024 B）；0 = 不限速
@@ -344,7 +355,7 @@ static void lat_print(const TEST_VERIFY *v, const char *name)
 static int peer_is_lost(void *ffrdp, int handle, uint32_t tick_recv)
 {
     if (ffrdp_isdead(ffrdp, handle)) return 1;       // 按句柄问（v2：一个上下文 → N 条连接 ✓）
-    return (int32_t)get_timestamp32_ms() - (int32_t)tick_recv > TEST_PEER_SILENCE_MS;
+    return (int32_t)get_timestamp32_ms() - (int32_t)tick_recv > peer_silence_get();
 }
 
 // 一条连接上的应用循环：ffrdp/handle/peer 由调用方给（服务端一个上下文要同时跑 N 条 ✓）；
@@ -743,6 +754,11 @@ int main(int argc, char *argv[])
         {   const char *sb = getenv("TEST_APP_BURST");   // ①-22：应用侧突发上限（0/不设 = 旧行为 ✓）
             if (sb && *sb) { g_app_burst = atoi(sb); if (g_app_burst < 0) g_app_burst = 0; }
             if (g_app_burst > 1) printf("app burst           : %d messages per recv tick (diagnostic; default 1 = old behaviour)\n", g_app_burst);
+        }
+        {   int ps = peer_silence_get();
+            if (ps != TEST_PEER_SILENCE_MS)
+                printf("app peer silence    : %d ms without a byte => treat the peer as lost and reconnect (diagnostic; default %d ms)\n",
+                       ps, TEST_PEER_SILENCE_MS);
         }
         if (g_idle_sec > 0) printf("idle mode           : on (no application data; only checks that keepalive does not misfire)\n");
         if (g_do_close)     printf("close on exit       : on (calls ffrdp_close before exit; checks the four-way handshake)\n");

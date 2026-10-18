@@ -112,8 +112,25 @@ typedef struct {
     uint32_t        stat_arm_us_loop;   // 它们花掉的微秒 ✓
     uint32_t        stat_arm_n_other;   // 跨线程 arm 的次数（应用 send 后催一下 ✓）
     uint32_t        stat_arm_us_other;
+    // ①-40 pacing 量具（§5.3 前提 3：固定窗口的 sweep 量不到"突发峰值" ⇒ 单独量）：
+    // 三张直方图 —— 一圈发几帧 / 相邻 sendto 隔多久 / 连着成串多长 ✓。全是只读，只影响 dump ✓。
+    uint32_t        stat_tx_lap[8];     // 一圈发出 0 / 1 / 2 / 3-4 / 5-8 / 9-16 / 17-32 / >32 帧 ✓
+    uint32_t        stat_lap_tx_n;      // 计入上面那张表的圈数（分母 ✓；= 总圈数 ✓）
+    uint32_t        stat_lap_tx;        // 本圈累计发出的帧数（圈末清 ✓）
+    uint32_t        stat_tx_gap[6];     // 相邻 sendto 间隔 <50 / 50-99 / 100-249 / 250-499 / 500-999 / >=1000 us ✓
+    uint32_t        stat_tx_run[7];     // 成串长度 1 / 2 / 3-4 / 5-8 / 9-16 / 17-32 / >32 帧 ✓
+    uint32_t        stat_tx_run_len;    // 当前串长（间隔 < 200 us 算同一串 ✓；dump 时收尾 flush ✓）
+    uint32_t        stat_tx_run_max;    // 最长一串 ✓
+    uint32_t        stat_tx_have_last;  // 有没有"上一次 send"的时刻可用来算间隔 ✓
+    uint64_t        stat_tx_last_us;    // 上一次 send 的时刻（微秒 ✓）
 #endif
 } UDP_LOWLEVEL;
+
+#if FFRDP_DIAG
+// ①-40：两次 sendto 间隔小于这个值就算"同一串"（发侧突发的定义 ✓；200 us ≈ 一个满帧在 6.5 Gbps 上的空口时长，宽到不会把正常帧间隔切开 ✓）。
+#define FFRDP_LOWLEVEL_RUN_GAP_US 200
+static void ffrdp_udp_stat_run(UDP_LOWLEVEL *udp);   // ①-40：先声明 —— dump 在 send 之前就要用它 ✓
+#endif
 
 // 跨 API 的 addr 是 uint64（两条层的共同约定，见 utils.h）⇒ 这里只剩 sockaddr_in ↔ (ip,port) 的胶水 ✓。
 static uint64_t ffrdp_udp_addr_pack(const struct sockaddr_in *sin)
@@ -400,6 +417,14 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
                 udp->stat_cost_slow_us += (uint32_t)(t_c3 - t_c0);
             }
         }
+        // ①-40：本圈发出去的帧数进直方图（不分档计时 ⇒ 每圈两次自增，量不出代价 ✓）。
+        {
+            uint32_t n = udp->stat_lap_tx;
+            int b = (n == 0) ? 0 : (n == 1) ? 1 : (n == 2) ? 2 : (n <= 4) ? 3 : (n <= 8) ? 4 : (n <= 16) ? 5 : (n <= 32) ? 6 : 7;
+            udp->stat_tx_lap[b]++;
+            udp->stat_lap_tx_n++;
+            udp->stat_lap_tx = 0;
+        }
 #endif
     }
 
@@ -440,6 +465,18 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
     }
     printf("udp lowlevel tx      : sendto %u calls, %u bytes (per frame = calls / frames in the ffrdp block)\n",
            udp->stat_tx_calls, udp->stat_tx_bytes);
+    // ①-40 pacing 量具：发侧到底"成串到什么程度" —— 三张直方图，判据见 docs/ffrdp-optimization.md §5.3 ✓
+    ffrdp_udp_stat_run(udp);   // 收尾：最后那一串也要算（否则最长串会漏掉正在走的那一条 ✗）
+    printf("udp lowlevel tx burst: laps %u, frames per lap 0:%u 1:%u 2:%u 3-4:%u 5-8:%u 9-16:%u 17-32:%u >32:%u\n",
+           udp->stat_lap_tx_n, udp->stat_tx_lap[0], udp->stat_tx_lap[1], udp->stat_tx_lap[2], udp->stat_tx_lap[3],
+           udp->stat_tx_lap[4], udp->stat_tx_lap[5], udp->stat_tx_lap[6], udp->stat_tx_lap[7]);
+    printf("udp lowlevel tx gap  : <50 %u, 50-99 %u, 100-249 %u, 250-499 %u, 500-999 %u, >=1000 %u us (between sendto calls)\n",
+           udp->stat_tx_gap[0], udp->stat_tx_gap[1], udp->stat_tx_gap[2],
+           udp->stat_tx_gap[3], udp->stat_tx_gap[4], udp->stat_tx_gap[5]);
+    printf("udp lowlevel tx run  : 1:%u 2:%u 3-4:%u 5-8:%u 9-16:%u 17-32:%u >32:%u, max %u frames (gap < %d us = same run)\n",
+           udp->stat_tx_run[0], udp->stat_tx_run[1], udp->stat_tx_run[2], udp->stat_tx_run[3],
+           udp->stat_tx_run[4], udp->stat_tx_run[5], udp->stat_tx_run[6], udp->stat_tx_run_max,
+           FFRDP_LOWLEVEL_RUN_GAP_US);
     // ④-13（§26.30 第 2 步）：一圈的时间去向（采样 1/64 ✓；三段互斥、和 = 整圈 ✓）—— 除以采样圈数就是每圈 ✓
     printf("udp lowlevel lap cost: %u sampled laps, pre(arm+sleep+select) %u us, mid(book+notify+rx) %u us, tick(deadline+proto) %u us, all %u us, max %u us\n",
            udp->stat_cost_n, udp->stat_cost_pre_us, udp->stat_cost_mid_us, udp->stat_cost_tick_us,
@@ -459,12 +496,51 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
     return NULL;
 }
 
+#if FFRDP_DIAG
+// ①-40：把"当前这一串"的长度记进直方图（间隔 >= FFRDP_LOWLEVEL_RUN_GAP_US 就算串结束了 ✓）。
+static void ffrdp_udp_stat_run(UDP_LOWLEVEL *udp)
+{
+    uint32_t n = udp->stat_tx_run_len;
+    int b;
+    if (!n) return;
+    if      (n == 1)  b = 0;
+    else if (n == 2)  b = 1;
+    else if (n <= 4)  b = 2;
+    else if (n <= 8)  b = 3;
+    else if (n <= 16) b = 4;
+    else if (n <= 32) b = 5;
+    else              b = 6;
+    udp->stat_tx_run[b]++;
+    if (n > udp->stat_tx_run_max) udp->stat_tx_run_max = n;
+    udp->stat_tx_run_len = 0;
+}
+#endif
+
 static int ffrdp_udp_lowlevel_send(void *fl, uint64_t addr, uint8_t *buf, int len)
 {
     UDP_LOWLEVEL *udp = (UDP_LOWLEVEL *)fl;
     struct sockaddr_in to;
     if (!udp || !buf || len <= 0 || udp->sockfd < 0) return -1;
     ffrdp_udp_addr_unpack(addr, &to);
+#if FFRDP_DIAG
+    // ①-40：量"发侧的突发" —— 发送**之前**取时刻（sendto 的耗时属于内核，不该算进帧间隔 ✓）。
+    // 代价：每次 send 一次 clock_gettime（vDSO，~20 ns ✓），只在 dev 构建 ✓；ship 整段编掉 ✓。
+    {
+        uint64_t now = ffrdp_udp_us();
+        if (udp->stat_tx_have_last) {
+            uint32_t gap = (uint32_t)(now - udp->stat_tx_last_us);
+            int g = (gap < 50) ? 0 : (gap < 100) ? 1 : (gap < 250) ? 2 : (gap < 500) ? 3 : (gap < 1000) ? 4 : 5;
+            udp->stat_tx_gap[g]++;
+            if (gap < FFRDP_LOWLEVEL_RUN_GAP_US) udp->stat_tx_run_len++;
+            else { ffrdp_udp_stat_run(udp); udp->stat_tx_run_len = 1; }
+        } else {
+            udp->stat_tx_run_len = 1;
+            udp->stat_tx_have_last = 1;
+        }
+        udp->stat_tx_last_us = now;
+        udp->stat_lap_tx++;
+    }
+#endif
     int ret = (int)sendto(udp->sockfd, (void*)buf, len, 0, (struct sockaddr*)&to, sizeof(to));
     // 每帧 sendto 次数 = 本层调用数 / ffrdp 那块里的帧数 ✓（ack/query 也走这里 ⇒ >= 帧数 ✓）。
     LSTAT(udp, stat_tx_calls);

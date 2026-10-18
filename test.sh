@@ -25,6 +25,11 @@
 #     TEST_STAMP=1   逐消息延迟样本（A1）。**两端都必须开** ⇒ 这里会同时透传给远端服务端 ✓，
 #                    缺一侧的话时间戳会被当载荷读出垃圾（日志里 lat_bad 计数非 0 ✗）。
 #     TEST_APP_BURST=N 应用侧每次 recv 处理 N 条（同上，两端一起透传；默认 0 = 旧行为 ✓）。
+#     TEST_PEER_SILENCE_MS=N 应用层多久收不到字节就判对端失联并重连（同上，两端一起透传；默认 2000）。
+#     SPEED=N        应用侧发送限速 KB/s（两端一起透传 ⇒ 两侧都限；默认 0 = 不限速 ✓）。
+#                    用途：分辨"协议/窗口算法不行"和"应用灌太猛把链路队列顶满"——
+#                    限速后若各档都不再重连，根因就是排队自激，不是拥塞窗口逻辑 ✗。
+#                     ⚠️ 200 ms 级链路建议给 10000：2 s 太紧，一次长静默就会重连，把长跑切成两段（口径随之错位）。
 #     CLIENTS=N      本地起 N 个客户端打同一个服务端（默认 1 ✓；上限 = 服务端 maxconn - 1 ✓）
 #                    日志：第 1 个是 <tag>_client_<stamp>.log ✓、第 2..N 个是它加 _c2.._cN ✓；
 #                    互通自测那几条用 ASCII 名（v1ref_v1srv_v2cli_hs0_* ✓），漂亮的 ①②③ 只在终端 ✓
@@ -132,6 +137,9 @@ fi
 BIN="$(abspath "$BIN")"                                  # ⇒ 裸名字也能跑 ✓（见文件头的说明）
 case "$DUR" in ''|*[!0-9]*) echo "✗ 时长必须是整数秒: $DUR"; exit 2;; esac
 case "$PORT" in ''|*[!0-9]*) echo "✗ 端口必须是数字: $PORT"; exit 2;; esac
+SPEED="${SPEED:-0}"        # 应用侧限速 KB/s（两端一起传 --send_speed；0 = 不限速 ✓）
+case "$SPEED" in ''|*[!0-9]*) echo "✗ SPEED 必须是整数 KB/s（0 = 不限速）: $SPEED"; exit 2;; esac
+SPEED_ARG=""; [ "$SPEED" != 0 ] && SPEED_ARG="--send_speed=$SPEED"
 
 HOST="${TARGET#*@}"
 BASE="$(basename "$BIN")"
@@ -241,7 +249,7 @@ fi
 echo "──────────────────────────────────────────────────────────"
 echo " 本地端 : $BIN   (md5 $(md5sum "$BIN" | awk '{print $1}'))"
 echo " 远端   : $REMOTE_BIN   (md5 $(md5sum "$REMOTE_BIN" | awk '{print $1}'))"
-echo " 标签   : $TAG      时长 ${DUR}s   端口 $PORT"
+echo " 标签   : $TAG      时长 ${DUR}s   端口 $PORT   应用限速 ${SPEED}KB/s$([ "$SPEED" = 0 ] && echo '（不限）')"
 echo " 服务端 : $TARGET:/tmp/$RBASE"
 echo " 客户端 : 本机 → $HOST:$PORT"
 echo " 日志   : $LOGDIR"
@@ -288,7 +296,7 @@ if [ "$DRY" != 1 ]; then
     # 注意 pkill 的写法：模式里的路径写成 [/]tmp 这样带一对方括号。
     # 否则这条 ssh 包装命令自己的命令行里就含 "/tmp/xxx --server" 这个串，pkill -f 会连它一起杀掉，
     # 后面的启动步骤一行都不会执行（实测：ssh.out 是 0 字节、远端日志根本没生成、客户端连了个空端口）。
-    "${SSH[@]}" "$TARGET" "pkill -f '[/]tmp/$RBASE --server' 2>/dev/null; sleep 0.3; rm -f '$SRV_LOG'; ( sleep $((DUR+8)); echo quit ) | timeout $((DUR+25)) env FFRDP_HS='${FFRDP_HS:-}' FFRDP_IDLE='${FFRDP_IDLE:-}' FFRDP_CLOSE='${FFRDP_CLOSE:-}' TEST_STAMP='${TEST_STAMP:-}' TEST_APP_BURST='${TEST_APP_BURST:-}' stdbuf -oL '/tmp/$RBASE' --server=0.0.0.0:$PORT > '$SRV_LOG' 2>&1; echo REMOTE_EXIT=\$?; wc -c < '$SRV_LOG'" \
+    "${SSH[@]}" "$TARGET" "pkill -f '[/]tmp/$RBASE --server' 2>/dev/null; sleep 0.3; rm -f '$SRV_LOG'; ( sleep $((DUR+8)); echo quit ) | timeout $((DUR+25)) env FFRDP_HS='${FFRDP_HS:-}' FFRDP_IDLE='${FFRDP_IDLE:-}' FFRDP_CLOSE='${FFRDP_CLOSE:-}' TEST_STAMP='${TEST_STAMP:-}' TEST_APP_BURST='${TEST_APP_BURST:-}' TEST_PEER_SILENCE_MS='${TEST_PEER_SILENCE_MS:-}' stdbuf -oL '/tmp/$RBASE' --server=0.0.0.0:$PORT $SPEED_ARG > '$SRV_LOG' 2>&1; echo REMOTE_EXIT=\$?; wc -c < '$SRV_LOG'" \
         > "$LOGDIR/${TAG}_server_${STAMP}.ssh.out" 2>&1 &
     SSHPID=$!
     sleep 4
@@ -310,7 +318,7 @@ if [ "$PINGWATCH" = 1 ] && [ "$DRY" != 1 ]; then
     ping_watch "$HOST" "$PINGP" "$((DUR+5))" && say "      PINGWATCH：同时对 $HOST 打 $((DUR+5)) 发（写 $PINGP）"
 fi
 if [ "$DRY" = 1 ]; then
-    say "      (DRY) ( sleep $DUR; echo quit ) | stdbuf -oL $BIN --client=$HOST:$PORT > $LOCAL_LOG   ×${CLIENTS}"
+    say "      (DRY) ( sleep $DUR; echo quit ) | stdbuf -oL $BIN --client=$HOST:$PORT $SPEED_ARG > $LOCAL_LOG   ×${CLIENTS}"
 else
     CPIDS=""
     c=1
@@ -319,7 +327,7 @@ else
         # 注意：这里是**普通脚本行**，必须用双引号 —— 单引号不会展开 ⇒ env 会拿到字面量
         # "${TEST_STAMP:-}"、atoi 得 0 ⇒ 客户端等于没开 TEST_STAMP（症状：crc_err 全量 ✗）。
         # 远端那一行不同：它嵌在 ssh 的双引号命令串里，单引号内的 ${…} 仍由本地展开 ✓。
-        ( sleep "$DUR"; echo quit ) | timeout $((DUR+15)) env TEST_STAMP="${TEST_STAMP:-}" TEST_APP_BURST="${TEST_APP_BURST:-}" stdbuf -oL "$BIN" --client="$HOST:$PORT" > "$LOG_C" 2>&1 &
+        ( sleep "$DUR"; echo quit ) | timeout $((DUR+15)) env TEST_STAMP="${TEST_STAMP:-}" TEST_APP_BURST="${TEST_APP_BURST:-}" TEST_PEER_SILENCE_MS="${TEST_PEER_SILENCE_MS:-}" stdbuf -oL "$BIN" --client="$HOST:$PORT" $SPEED_ARG > "$LOG_C" 2>&1 &
         CPIDS="$CPIDS $!"
         [ "$c" = 1 ] && TPID=$!
         sleep 0.4          # 让它们依次连上（也免得 N 个 SYN 挤在同一毫秒 ✓）
@@ -389,9 +397,12 @@ report() {   # $1=日志 $2=角色
     waste="$(grep -o 'counter_resend_waste *: *[0-9.]*%' "$f" | tail -1 | sed 's/.*: *//' | tr -d '\r')"
     rtts="$(grep -o 'rtts: *[0-9]*' "$f" | tail -1 | sed 's/.*: *//' | tr -d '\r')"
     frf="$(grep -o 'counter_resend_rto *: *[0-9]*' "$f" | tail -1 | sed 's/.*: *//' | tr -d '\r')/$(grep -o 'counter_resend_fast *: *[0-9]*' "$f" | tail -1 | sed 's/.*: *//' | tr -d '\r')"
-    spd="$(awk '/^elapsed/ { el = $3 }
+    # 分母必须与分子同源：total_send/total_recv 是**本连接**累计，所以优先用 dump 的 `conn age` ✓；
+    # 老二进制没有那一行才退回 `elapsed`（上下文级 ⇒ 重连过就会偏差 ✗，见下面的口径告警）。
+    spd="$(awk '/^conn age/ { ca = $4 }
+               /^elapsed/ { el = $3 }
                /^total_send, total_recv:/ { gsub(/MB,/,"",$3); gsub(/MB/,"",$4); s=$3; r=$4 }
-               END { if (el+0 > 0) printf "%.2f/%.2f", s/el, r/el }' "$f")"
+               END { d = (ca+0 > 0) ? ca : el; if (d+0 > 0) printf "%.2f/%.2f", s/d, r/d }' "$f")"
     printf '  %-7s %s\n' "" "重传率 ${res:-—}   白费 ${waste:-—}   rtts ${rtts:-—} ms   发/收 ${spd:-—} MB/s   rto/fast ${frf:-—}"
     if [ -s "$LOGDIR/${TAG}_${role}_${STAMP}.cpu" ]; then
         printf '  %-7s %s\n' "" "CPU: $(tr '\n' ' ' < "$LOGDIR/${TAG}_${role}_${STAMP}.cpu")"
@@ -415,6 +426,19 @@ while [ "$c" -le "$CLIENTS" ]; do
     c=$((c+1))
 done
 report "$LOCAL_SRV_LOG" server
+
+# 口径自检：`conn age` 是随连接重建而重置的 ⇒ 两端差太多就说明**这一轮发生过重连**（或一端先启动），
+# 那时两行的 MB/s 各自归一化在不同的时间窗里，不能横着比 ✗（2026-10-18 pace1/pace2 就是这么被误读的 ✓）。
+CAGE="$(grep -o 'conn age *: *[0-9]*' "$(client_log 1)" 2>/dev/null | tail -1 | sed 's/.*: *//')"
+SAGE="$(grep -o 'conn age *: *[0-9]*' "$LOCAL_SRV_LOG" 2>/dev/null | tail -1 | sed 's/.*: *//')"
+if [ -n "$CAGE" ] && [ -n "$SAGE" ] && [ "$CAGE" -gt 0 ] && [ "$SAGE" -gt 0 ]; then
+    big=$(( CAGE > SAGE ? CAGE : SAGE ))
+    dif=$(( CAGE > SAGE ? CAGE - SAGE : SAGE - CAGE ))
+    if [ $(( dif * 5 )) -gt "$big" ]; then   # 差 > 20%
+        echo "  ⚠ 口径告警：client 连接 ${CAGE}s vs server 连接 ${SAGE}s（差 >20%）"
+        echo "     这一轮多半重连过 ⇒ 两行的 MB/s 归在不同的时间窗里，别横向比；看绝对字节（verify 那两行）"
+    fi
+fi
 
 if command -v column >/dev/null 2>&1; then
     echo

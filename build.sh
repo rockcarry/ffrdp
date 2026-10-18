@@ -72,6 +72,9 @@ build_package()
     # 两档都保持 -Werror：警告当错是编译期的事，与优化级别无关 ✓。
     local CFLAGS="-Wall -Werror -Wextra -Wunused-macros"
     local LDFLAGS="-lpthread"
+    # 额外编译期开关（扫窗口曲线用）：EXTRA_CFLAGS='-DFFRDP_RX_WINDOW_FRAMES=640' bash build.sh ✓
+    # 只影响这一次构建，不改默认值 ✓。
+    [ -n "${EXTRA_CFLAGS:-}" ] && CFLAGS="$CFLAGS $EXTRA_CFLAGS"
     local AR="${CROSS_COMPILE}ar"
     case "$BUILD_MODE" in
     dev)
