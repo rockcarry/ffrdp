@@ -263,6 +263,16 @@ echo "────────────────────────�
 CLIENTS="${CLIENTS:-1}"
 case "$CLIENTS" in *[!0-9]*|"") echo "✗ CLIENTS 必须是正整数（现在是 "$CLIENTS"）"; exit 2;; esac
 [ "$CLIENTS" -ge 1 ] || { echo "✗ CLIENTS 必须 ≥ 1"; exit 2; }
+
+# ── 服务端要活多久：必须**比最后一个客户端晚几秒** ✓ ────────────────────────────
+# 客户端是串行拉起的（间隔 0.4s，见 [4/6] 的 `sleep 0.4`）⇒ 第 N 个客户端结束于
+#     起客户端 + (N-1)×0.4s + DUR
+# 而服务端原来只活 DUR+8 ⇒ CLIENTS ≥ 11 时最后几个客户端会比服务端活得久 ✗：
+# 服务端关机时发的 FIN 就被它们判成 "server lost !"，随后重建一个空上下文（摘要里也多一行
+# "2 个上下文"）。1018-184324 / 185645 / 190533 三连都是这样，每次都恰好是 c12~c15 ——
+# 因为 0.4×11 = 4.4s 已经吃掉了 8s 余量的大半。
+# 所以余量跟着客户端数走：8s + 串行拉起的总时长（0.4s × CLIENTS，向上取整）。
+SRV_HOLD=$(( DUR + 8 + (CLIENTS * 4 + 9) / 10 ))
 client_log()  {   # $1 = 客户端序号 ⇒ 第 1 个保持老日志名 ✓（脚本/习惯都不用改 ✓）
     if [ "$1" = 1 ]; then echo "$LOCAL_LOG"; else echo "${LOCAL_LOG%.log}_c$1.log"; fi
 }
@@ -290,13 +300,13 @@ if [ "$DRY" != 1 ]; then
     say "      一致: $LMD5"
 fi
 
-say "[3/6] 远端起服务端（${DUR}s 后自动 quit，留 8s 余量）"
+say "[3/6] 远端起服务端（${SRV_HOLD}s 后自动 quit = ${DUR}s + 8s 余量 + ${CLIENTS} 个客户端的串行拉起时间）"
 SSHPID=0
 if [ "$DRY" != 1 ]; then
     # 注意 pkill 的写法：模式里的路径写成 [/]tmp 这样带一对方括号。
     # 否则这条 ssh 包装命令自己的命令行里就含 "/tmp/xxx --server" 这个串，pkill -f 会连它一起杀掉，
     # 后面的启动步骤一行都不会执行（实测：ssh.out 是 0 字节、远端日志根本没生成、客户端连了个空端口）。
-    "${SSH[@]}" "$TARGET" "pkill -f '[/]tmp/$RBASE --server' 2>/dev/null; sleep 0.3; rm -f '$SRV_LOG'; ( sleep $((DUR+8)); echo quit ) | timeout $((DUR+25)) env FFRDP_HS='${FFRDP_HS:-}' FFRDP_IDLE='${FFRDP_IDLE:-}' FFRDP_CLOSE='${FFRDP_CLOSE:-}' TEST_STAMP='${TEST_STAMP:-}' TEST_APP_BURST='${TEST_APP_BURST:-}' TEST_PEER_SILENCE_MS='${TEST_PEER_SILENCE_MS:-}' stdbuf -oL '/tmp/$RBASE' --server=0.0.0.0:$PORT $SPEED_ARG > '$SRV_LOG' 2>&1; echo REMOTE_EXIT=\$?; wc -c < '$SRV_LOG'" \
+    "${SSH[@]}" "$TARGET" "pkill -f '[/]tmp/$RBASE --server' 2>/dev/null; sleep 0.3; rm -f '$SRV_LOG'; ( sleep $SRV_HOLD; echo quit ) | timeout $((SRV_HOLD+17)) env FFRDP_HS='${FFRDP_HS:-}' FFRDP_IDLE='${FFRDP_IDLE:-}' FFRDP_CLOSE='${FFRDP_CLOSE:-}' TEST_STAMP='${TEST_STAMP:-}' TEST_APP_BURST='${TEST_APP_BURST:-}' TEST_PEER_SILENCE_MS='${TEST_PEER_SILENCE_MS:-}' stdbuf -oL '/tmp/$RBASE' --server=0.0.0.0:$PORT $SPEED_ARG > '$SRV_LOG' 2>&1; echo REMOTE_EXIT=\$?; wc -c < '$SRV_LOG'" \
         > "$LOGDIR/${TAG}_server_${STAMP}.ssh.out" 2>&1 &
     SSHPID=$!
     sleep 4
@@ -392,18 +402,44 @@ report() {   # $1=日志 $2=角色
         head -4 "$f" | sed 's/^/            /'
     fi
     printf '  %-7s %s\n' "" "$(grep -m1 'in-flight limit' "$f" | sed 's/^ *//' | cut -c1-58)"
-    local res waste rtts spd frf
-    res="$(grep -o 'counter_resend_ratio *: *[0-9.]*%' "$f" | tail -1 | sed 's/.*: *//' | tr -d '\r')"
-    waste="$(grep -o 'counter_resend_waste *: *[0-9.]*%' "$f" | tail -1 | sed 's/.*: *//' | tr -d '\r')"
-    rtts="$(grep -o 'rtts: *[0-9]*' "$f" | tail -1 | sed 's/.*: *//' | tr -d '\r')"
-    frf="$(grep -o 'counter_resend_rto *: *[0-9]*' "$f" | tail -1 | sed 's/.*: *//' | tr -d '\r')/$(grep -o 'counter_resend_fast *: *[0-9]*' "$f" | tail -1 | sed 's/.*: *//' | tr -d '\r')"
+    # ── 取数范围：只取**一个上下文** ────────────────────────────────────────────
+    # 断线后 test 程序会重建上下文（日志里再出现一次 "ffrdp_init:"），新上下文那份 dump 全是 0
+    # （rtts 是 4294967295 哨兵 / total 0.00MB / conn age 0）⇒ 逐指标 `tail -1` 会把它们跟真数据
+    # 混在同一行里：1018-184324 的 c12~c15 就是这样显示成 "rtts —、发/收 —、rto/fast 0/0，可重传率
+    # 却有值" 的（看着像工具坏了 ✗，其实是两份 dump 各取了一部分）。
+    # 规则：按 "ffrdp_init:" 切段，只取 total_send 最大的那一段（= 真跑过数据的那次）✓。
+    # 没重建过（绝大多数情况）⇒ f1 就是原文件，取数口径与以前逐字相同 ✓。
+    local res waste rtts spd frf f1="$f" nctx
+    nctx="$(grep -c 'ffrdp_init: ' "$f" 2>/dev/null)"; nctx="${nctx:-0}"
+    if [ "$nctx" -gt 1 ]; then
+        f1="$(mktemp)"
+        # 日志只在"重建过"时才切（客户端 80 KB 量级；服务端不会走到这里 ✓）
+        awk -v out="$f1" '
+            /ffrdp_init: / { n++ }
+            /^total_send, total_recv:/ { v = $3; sub(/MB,?$/, "", v); t[n] = v + 0 }
+            { buf[n] = buf[n] $0 "\n" }
+            END {
+                pick = 1
+                for (i in t) if (t[i] > t[pick]) pick = i
+                printf "%s", buf[pick] > out
+                close(out)
+            }' "$f"
+    fi
+    res="$(grep -o 'counter_resend_ratio *: *[0-9.]*%' "$f1" | tail -1 | sed 's/.*: *//' | tr -d '\r')"
+    waste="$(grep -o 'counter_resend_waste *: *[0-9.]*%' "$f1" | tail -1 | sed 's/.*: *//' | tr -d '\r')"
+    rtts="$(grep -o 'rtts: *[0-9]*' "$f1" | tail -1 | sed 's/.*: *//' | tr -d '\r')"
+    frf="$(grep -o 'counter_resend_rto *: *[0-9]*' "$f1" | tail -1 | sed 's/.*: *//' | tr -d '\r')/$(grep -o 'counter_resend_fast *: *[0-9]*' "$f1" | tail -1 | sed 's/.*: *//' | tr -d '\r')"
     # 分母必须与分子同源：total_send/total_recv 是**本连接**累计，所以优先用 dump 的 `conn age` ✓；
     # 老二进制没有那一行才退回 `elapsed`（上下文级 ⇒ 重连过就会偏差 ✗，见下面的口径告警）。
     spd="$(awk '/^conn age/ { ca = $4 }
                /^elapsed/ { el = $3 }
                /^total_send, total_recv:/ { gsub(/MB,/,"",$3); gsub(/MB/,"",$4); s=$3; r=$4 }
-               END { d = (ca+0 > 0) ? ca : el; if (d+0 > 0) printf "%.2f/%.2f", s/d, r/d }' "$f")"
+               END { d = (ca+0 > 0) ? ca : el; if (d+0 > 0) printf "%.2f/%.2f", s/d, r/d }' "$f1")"
+    [ "$f1" != "$f" ] && rm -f "$f1"
     printf '  %-7s %s\n' "" "重传率 ${res:-—}   白费 ${waste:-—}   rtts ${rtts:-—} ms   发/收 ${spd:-—} MB/s   rto/fast ${frf:-—}"
+    if [ "$nctx" -gt 1 ]; then
+        printf '  %-7s %s\n' "" "⚠ 日志里有 ${nctx} 个上下文（中途断开重建 $((nctx-1)) 次）—— 上面只统计跑过数据的那一个，别当成丢包/工具坏了"
+    fi
     if [ -s "$LOGDIR/${TAG}_${role}_${STAMP}.cpu" ]; then
         printf '  %-7s %s\n' "" "CPU: $(tr '\n' ' ' < "$LOGDIR/${TAG}_${role}_${STAMP}.cpu")"
     fi

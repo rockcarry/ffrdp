@@ -62,9 +62,20 @@ enum {
 #define FFRDP_CONSUMED      1
 #define FFRDP_NOT_CONSUMED  0
 
+// FFRDP_DISCONN 的 ev->code：断开是**谁**、因为**什么**（其它事件恒为 0）。
+// 为什么需要它 ✗：FIN 正常关闭与 keepalive 判死走的是同一个事件 ⇒ 应用只能靠"另外去读
+// `[hs] FIN rx` 这行日志"猜；而日志被截断/不同进程时根本对不上。有了 code，应用可以在
+// DISCONN 里就把"对端主动关（干净）"与"超时判死（异常）"分开记 ✓。
+#define FFRDP_DISCONN_NONE        0
+#define FFRDP_DISCONN_PEER_FIN    1   // 收到对端 FIN（或本端 FIN 已被确认）⇒ 四次挥手的正常收尾 ✓
+#define FFRDP_DISCONN_TIMEOUT     2   // keepalive 判死：对端静默超过 max(idle_ms, 4×rtts) ✓
+#define FFRDP_DISCONN_HS_TIMEOUT  3   // 握手超时（从未连上 / SYN-ACK 没来）✓
+#define FFRDP_DISCONN_LOCAL       4   // 本端 ffrdp_close 的本地拆除（hs:0 没有 FIN 这条路）✓
+
 typedef struct {
     int      type;   // 上面的 FFRDP_xxx
     int      conn;   // 连接句柄；无效时为 FFRDP_CONN_INVALID
+    int      code;   // FFRDP_DISCONN：FFRDP_DISCONN_xxx（其它事件为 0）；追加在末尾 ⇒ 老应用不受影响 ✓
     uint64_t addr;   // 对端地址（FFRDP_ACCEPT / FFRDP_RECVDATA 有效）—— 布局对协议不透明
     void    *buf;    // FFRDP_RECVDATA：数据；FFRDP_ENCRYPT / FFRDP_DECRYPT：待处理的载荷
     int      len;    // 数据长度
@@ -84,6 +95,8 @@ typedef long (*FFRDP_CALLBACK)(void *cbctx, const FFRDP_EVENT *ev);
 //   "ffrdps://0.0.0.0:8000"                       服务器
 //   "ffrdpc://192.168.0.213:8000"                 客户端
 //   "ffrdps://0.0.0.0:8000,maxconn:10"            最大连接数（默认 16，上限 FFRDP_MAXCONN）
+//        ⚠️ 0 号槽固定给内嵌主连接（见下）⇒ 服务器实际能接纳的**远端**连接数 = maxconn - 1
+//           （默认 maxconn:16 ⇒ 远端 15 条；测试实测 maxconn:16 时 live conns 封顶 16/16 ✓）。
 //   "ffrdps://0.0.0.0:8000,handshake_ms:10000,idle_ms:5000"  握手超时 / 空闲(keepalive)超时
 //        ⚠️ 时间的单位**写进键名**（毫秒 ✓）—— 与 ffrdp_send 的 timeout_ms 同一套风格，
 //           不留"配置是秒、内部是毫秒"的换算点 ✗。

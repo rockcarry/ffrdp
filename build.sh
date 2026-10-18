@@ -97,6 +97,9 @@ build_package()
         # socket.c / utils.c / lowlevel-udp.c 的 Linux 实现被 #ifdef LINUX 挡着：不给这个宏，它们编出来
         # 是空函数（或者干脆编不过），而这三个文件是传输层本身。mingw 那一支不需要它。
         CFLAGS="$CFLAGS -DLINUX"
+        # test.c 的崩溃处理器用 execinfo/backtrace 打栈（偶发段错误没有栈就只能猜）：符号名要靠
+        # -rdynamic 导出。只在 Linux 这一支加，mingw 没有 execinfo.h ✓。
+        LDFLAGS="$LDFLAGS -rdynamic"
         ;;
     esac
 
