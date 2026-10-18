@@ -1879,11 +1879,22 @@ static uint32_t ffrdp_next_due(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
         // ⚠️ 只有 tick 这一圈**看得见**的帧才拿它算期限：tick 的重传分支在
         //     `for (i = 0; ...; i < cwnd ...)` 里 ⇒ 表头 cwnd 个条目之外的帧，这一圈根本动不了 ✗。
         if (entry < (int)c->cwnd && (!due || (int32_t)(q->tick_timeout - due) < 0)) { due = q->tick_timeout; }
-        // A′：探针期限 = 那一帧的 RTO 到期前 1/4（与 tick 里的判据**同一个式子** ✓）。
-        // 不加这一条，静默连接上唯一的叫醒就是 RTO 本身 ⇒ 探针永远晚到 ⇒ 等于没做 ✗。
-        if ((q->flags & FLAG_FIRST_SEND) && !(c->flags & FLAG_QUERY_PROBE) &&
-            c->rtts != (uint32_t)-1 && c->rto >= 4 * (c->rtts + 2)) {
-            x = q->tick_timeout - c->rto / 4;
+    }
+    // A′：探针期限 —— **必须与 tick 里那条判据逐字同源**（tick 只对表头那一帧、且"最近 rto/4 内一个 ack
+    // 都没有"时才发探针）。原来这里是"对每一帧都报 tick_timeout - rto/4"，不看静默条件 ⇒ 只要 ack 在流动、
+    // 而表头帧离自己的 RTO 已不足 rto/4（持续供数据时**恒有**这种帧），这个期限就永远停在过去 ⇒
+    // `next_due` 每次都说"现在" ⇒ 低层圈变成忙等：实测客户端 10.8M 圈/120 s = 90k 圈/秒、`sleep-left 0ms`
+    // 占 99%、每个进程烧满一个核；15 个客户端 = 30 多条线程挤 2 核 ⇒ 调度延迟超过 RTO ⇒ 上行 RTO 风暴
+    // （cwnd 1~2、resend 22~40%、max wait 43 s）⇒ "15 条时上行塌陷"。
+    // 静默钳位：探针最早也只能在"最后一个 ack 之后 rto/4"发 ⇒ 期限取 max(帧的 3/4 RTO, 静默点) ✓。
+    if (!(c->flags & FLAG_QUERY_PROBE) && c->rtts != (uint32_t)-1 && c->rto >= 4 * (c->rtts + 2)) {
+        const FFRDP_FRAME_NODE *u;
+        for (u = c->send_list_head; u; u = u->next) if (u->flags & FLAG_FIRST_SEND) break;
+        if (u) {
+            // 一个 ack 都没收到过 ⇒ tick 那条"静默"判据本来就是成立的，不用钳位 ✓
+            uint32_t quiet_at = c->tick_recv_ack ? c->tick_recv_ack + c->rto / 4 : 0;
+            x = u->tick_timeout - c->rto / 4;
+            if ((int32_t)(x - quiet_at) < 0) x = quiet_at;
             if (!due || (int32_t)(x - due) < 0) { due = x; }
         }
     }
