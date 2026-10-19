@@ -85,6 +85,17 @@ static int  app_sendretry_get(void)
 static int  server_max_send_size = 16 * 1024;
 static int  client_max_send_size = 16 * 1024;
 static int  send_speed           = 0;   // 本进程的发送限速，单位 KB/s（1024 B）；0 = 不限速
+// 单向档（评测用），两端各取一个；不设 ⇒ 双向对称，行为与以前逐字相同 ✓
+//   --send_only  本端只发：**不期待入向应用数据**（连通用 ffrdp_isdead 判，而不是"收到首字节"）
+//   --recv_only  本端只收：**一个应用字节都不生成**
+// ⚠ 不能用 --send_speed=0 当"不发"：quota=0 只是关掉令牌桶 ⇒ 全速发 ✗（见 link_loop 的 quota）
+static int  g_send_only          = 0;
+static int  g_recv_only          = 0;
+// 诊断打印间隔可配（默认 10 s ⇒ 与以前逐字相同）。60 s 的短轮次里要 12 个采样点就得 5 s ✓
+static int  g_dump_ms            = TEST_DUMP_INTERVAL_MS;
+// dump 的节拍必须**全局**（见 link_loop 尾部）：服务端每条连接一个线程，各自计时的话
+// 同一次 dump 会被打 15 遍（实测 120 s/10 s 的日志里有 181 个块），时间序列就没法对齐 ✗。
+static uint32_t g_dump_tick      = 0;
 static int  g_idle_sec           = 0;   // FFRDP_IDLE>0：**不发应用数据**，专门验 keepalive 不误杀 ✓
 static int  g_do_close           = 0;   // FFRDP_CLOSE=1：退出前用 ffrdp_close() 主动关（验四次挥手）✓
 static int  g_use_hs             = 1;   // 本侧是否走握手（FFRDP_HS=0 ⇒ 老路径 ⇒ 服务端句柄就是 0 ✓）
@@ -449,7 +460,10 @@ static int link_loop(struct link_arg *a)
     uint8_t *sendbuf = NULL, *stream = NULL;
     uint32_t tick_dump, tick_recv = 0, tick_speed, tokens, rnd = 0x12345678u, seq = 1;
     uint32_t tick_msg_first = 0, msg_retries = 0;   // 只读（§26.30 ①-①）：这一条消息的首次尝试时刻 / 被拒次数 ✓
-    int      ret, connected = 0, stream_len = 0, msg_len = 0, max_payload, hb = 0, lost = 0;
+    // 单向档的发送端**一个应用字节都收不到** ⇒ 拿"收到首字节"当连通判据会每 5 s 判一次失联
+    // （peer_is_lost_preconnect），而且 `!connected` 那支每轮还 usleep(1ms) ⇒ 吞吐被压到 ~1000 轮/s ✗。
+    // 所以 --send_only 直接认为已连通；活不活只交给协议侧 ffrdp_isdead ✓
+    int      ret, connected = g_send_only ? 1 : 0, stream_len = 0, msg_len = 0, max_payload, hb = 0, lost = 0;
     // ①-23：应用循环的账（只读 ✓）—— dump 里全是协议侧 ⇒ "谁在等"在应用这一格本来是空的 ✗。
     uint32_t loop_iters = 0, t_loop0 = 0, t_loop1 = 0, t_w;
     uint32_t rd_n = 0, rd_us = 0, re_n = 0, re_us = 0, rf_n = 0, rf_us = 0;
@@ -483,7 +497,7 @@ static int link_loop(struct link_arg *a)
         }
 
         // ①-22：这个开关要放在"造消息"**之前** ✓（原来放后面 ⇒ 进循环体时 msg_len 已 >0 ⇒ 一次都不跑 ✗，实测踩过 ✓）。
-        if (!g_idle_sec && g_app_burst > 1) {
+        if (!g_idle_sec && !g_recv_only && g_app_burst > 1) {
             int k;
             for (k = 1; k < g_app_burst && !g_exit && msg_len == 0; k++) {
                 int room = 1, maxp = send_max - oh;
@@ -510,7 +524,7 @@ static int link_loop(struct link_arg *a)
                 }
             }
         }
-        if (!g_idle_sec && msg_len == 0) {   // 上一条已经发出去了，生成下一条（失败重试时必须原样重发，不能重新生成）
+        if (!g_idle_sec && !g_recv_only && msg_len == 0) {   // 上一条已经发出去了，生成下一条（失败重试时必须原样重发，不能重新生成）
             // FFRDP_IDLE>0 ⇒ 压根不生成 ✓：应用层一个字节都不发，专门看协议自己会不会把连接判死 ✓
             int room = 1;
             max_payload = send_max - oh;
@@ -554,8 +568,13 @@ static int link_loop(struct link_arg *a)
         if (stream_len < TEST_STREAM_MAX) {
             // 应用侧唯一的等待点：一有数据立刻返回，没有数据最多等 TEST_RECV_WAIT_MS。
             t_w = app_us();                 // ①-23：应用侧唯一的等待点 ✓
-            ret = ffrdp_recv(ffrdp, handle, (char*)stream + stream_len, TEST_STREAM_MAX - stream_len, g_recv_wait_ms);   // ①-32b
+            // 只发端本来就是"没数据可等"：这里若还按 g_recv_wait_ms(默认 10 ms) 阻塞，应用循环的节拍
+            // 就被压成 100 轮/s ⇒ 16 KB × 100 = 1.6 MB/s 的硬上限（实测 lo 上只有 0.73 MB/s ✗，
+            // 与协议无关，纯粹是量具自己挡住了）。改成非阻塞 + 50 us 短睡 ⇒ 上限 ~320 MB/s ✓
+            ret = ffrdp_recv(ffrdp, handle, (char*)stream + stream_len, TEST_STREAM_MAX - stream_len,
+                             g_send_only ? 0 : g_recv_wait_ms);   // ①-32b
             if (ret <= 0 && g_spin_us > 0) usleep((useconds_t)g_spin_us);   // ①-32b：没数据就短睡，别空转 ✓
+            else if (ret <= 0 && g_send_only) usleep(50);                   // 只发端：自己的节拍别吃掉带宽
             {   uint32_t d = app_us() - t_w;   // ①-23："等到数据"与"空转到超时"分开记 ✓
                 if (ret > 0) { rd_n++; rd_us += d; } else { re_n++; re_us += d; }
             }
@@ -566,12 +585,6 @@ static int link_loop(struct link_arg *a)
                     printf("%s\n", peer->msg_up);
                 }
                 tick_recv = get_timestamp32_ms();
-                if ((int32_t)get_timestamp32_ms() - (int32_t)tick_dump > TEST_DUMP_INTERVAL_MS) {
-                    pthread_mutex_lock(&g_mutex);
-                    ffrdp_dump(ffrdp, -1, 0)   /* ①-8：打全表 —— 服务端 0 号内嵌槽的计数原来完全不可见 ✗ */;
-                    pthread_mutex_unlock(&g_mutex);
-                    tick_dump = get_timestamp32_ms();
-                }
             }
         } else {
             t_w = app_us();                 // ①-23：流满那条路（注释说"正常情况下到不了"✓，量一下 ✓）
@@ -646,6 +659,24 @@ static int link_loop(struct link_arg *a)
             // send 也立即被拒 ⇒ 这里不睡，整个循环就是一个死转的 CPU 核 ✗（实测 480 万次/s ✓）
             usleep(1000);
         }
+
+        // 诊断打印改成**时间驱动**（原来挂在"收到数据"那一支里）：
+        // 单向档的发送端一个应用字节都收不到 ⇒ 挂在那儿就永远不打 dump ⇒ 上行 resend/rtts/吞吐的
+        // 采样点全没了 ✗。双向跑只是"检查时机"从"收到数据时"变成"每轮看表"，间隔与内容不变 ✓。
+        // 而且节拍是**全局**的：ffrdp_dump(ffrdp, -1, 0) 打的是全表，服务端 N 个 link 线程
+        // 各打一次 = N 份重复快照（同一时刻的 age 混在一起，统计脚本只能靠去重硬扛 ✗）。
+        if (!g_idle_sec) {
+            uint32_t nowd = get_timestamp32_ms();
+            int do_dump = 0;
+            pthread_mutex_lock(&g_mutex);
+            if ((int32_t)nowd - (int32_t)g_dump_tick >= g_dump_ms) { g_dump_tick = nowd; do_dump = 1; }
+            pthread_mutex_unlock(&g_mutex);
+            if (do_dump) {
+                pthread_mutex_lock(&g_mutex);
+                ffrdp_dump(ffrdp, -1, 0)   /* ①-8：打全表 —— 服务端 0 号内嵌槽的计数原来完全不可见 ✗ */;
+                pthread_mutex_unlock(&g_mutex);
+            }
+        }
     }
 
 done:
@@ -666,6 +697,10 @@ done:
         printf("[%s] verify: *** CHECK FAILED ***\n", peer->name);
     } else if (v.recv_msgs) {
         printf("[%s] verify: OK -- received %u messages, seq contiguous and crc all correct\n", peer->name, v.recv_msgs);
+    } else if (g_send_only) {
+        // 只发端没有入向数据 ⇒ 无接收可校验。仍打同一前缀，让"verify n/n"的统计不缺格 ✓
+        // （上面那行里的 recv 0 是**预期**值，不是失败 ✓）
+        printf("[%s] verify: OK -- send-only mode (no inbound application data; the peer checks seq/crc)\n", peer->name);
     }
     // ①-16：**退出时**也打一次全表 —— 对端走了之后就没有任何数据 ✗ ⇒ 收尾那一段在协议账上原本不存在（"账被输出时点挡住" ✓）；
     // 放在 verify 之后、close 之前 ⇒ 走 close 的场景也拿得到 ✓。
@@ -851,12 +886,16 @@ int main(int argc, char *argv[])
         printf("usage: %s [--server[=ip:port]] [--client[=ip:port]]\n", prog);
         printf("%*s[--server_max_send_size=N] [--client_max_send_size=N] [--send_speed=N]\n",
                (int)strlen(prog) + 7, ""); // 7 = strlen("usage: ")，让接续行与上面那个括号对齐
+        printf("%*s[--dump_ms=N] [--send_only | --recv_only]\n", (int)strlen(prog) + 7, "");
         printf("\n");
         printf("  --server[=ip:port]            run as server    (default 0.0.0.0:8000)\n");
         printf("  --client[=ip:port]            run as client    (default 127.0.0.1:8000)\n");
         printf("  --server_max_send_size=N      server max bytes per message (default 16384)\n");
         printf("  --client_max_send_size=N      client max bytes per message (default 16384)\n");
         printf("  --send_speed=N                limit this process to N KB/s (default 0 = unlimited)\n");
+        printf("  --dump_ms=N                   print the diagnostic dump every N ms (default 10000)\n");
+        printf("  --send_only                   send only: no inbound application data is expected\n");
+        printf("  --recv_only                   receive only: never send application data\n");
         printf("\n");
         printf("  every message is [len][seq][payload][crc32] and is checked at the receiver:\n");
         printf("  seq continuity + crc + no partial send; a summary is printed at exit.\n");
@@ -890,6 +929,13 @@ int main(int argc, char *argv[])
             client_max_send_size = atoi(argv[i] + 23);
         } else if (strstr(argv[i], "--send_speed=") == argv[i]) {
             send_speed = atoi(argv[i] + 13);
+        } else if (strcmp(argv[i], "--send_only") == 0) {
+            g_send_only = 1;
+        } else if (strcmp(argv[i], "--recv_only") == 0) {
+            g_recv_only = 1;
+        } else if (strstr(argv[i], "--dump_ms=") == argv[i]) {
+            g_dump_ms = atoi(argv[i] + 10);
+            if (g_dump_ms < 100) g_dump_ms = 100;   // 再小就是自残：一次 dump 要遍历全表 ✗
         }
     }
 
@@ -924,6 +970,9 @@ int main(int argc, char *argv[])
         if (g_do_close)     printf("close on exit       : on (calls ffrdp_close before exit; checks the four-way handshake)\n");
     }
     printf("send_speed          : %d KB/s%s\n", send_speed, send_speed ? "" : " (unlimited)");
+    if (g_send_only) printf("direction           : send only (no inbound application data expected)\n");
+    if (g_recv_only) printf("direction           : receive only (this side never sends application data)\n");
+    if (g_dump_ms != TEST_DUMP_INTERVAL_MS) printf("dump interval       : %d ms\n", g_dump_ms);
     if (server_en) {
         printf("server bind ip      : %s\n", server_bind_ip      );
         printf("server bind port    : %d\n", server_bind_port    );

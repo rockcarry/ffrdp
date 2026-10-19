@@ -160,6 +160,23 @@ SPEED_DESC="${SPEED}KB/s/连接"
 [ "$SPEED" = 0 ] && SPEED_DESC="不限"
 if [ "$UP_TOTAL" != 0 ] || [ "$DOWN_TOTAL" != 0 ]; then SPEED_DESC="按总量（见下一行）"; fi
 
+# 方向（评测用）：both = 双向对称（默认，行为与以前逐字相同 ✓）
+#   up   = 只有客户端发 ⇒ 服务端 --recv_only、客户端 --send_only
+#   down = 只有服务端发 ⇒ 客户端 --recv_only、服务端 --send_only
+# 两个参数都要给：--recv_only 那侧不生成应用数据，--send_only 那侧收不到入向数据 ——
+# 少了后者，发送端会按"5 s 没收到字节"判失联、每 5 s 重建一次连接 ✗（实测吞吐掉到 0.3 MB/s）。
+DIR="${DIR:-both}"
+case "$DIR" in up|down|both) ;; *) echo "✗ DIR 只能是 up|down|both: $DIR"; exit 2;; esac
+CLI_DIR_ARG=""; SRV_DIR_ARG=""
+case "$DIR" in
+up)   CLI_DIR_ARG="--send_only"; SRV_DIR_ARG="--recv_only" ;;
+down) CLI_DIR_ARG="--recv_only"; SRV_DIR_ARG="--send_only" ;;
+esac
+# dump 间隔（0 = 用 test.c 的默认 10000 ms）：60 s 的短轮次要 12 个采样点 ⇒ 5000
+DUMP_MS="${DUMP_MS:-0}"
+case "$DUMP_MS" in ''|*[!0-9]*) echo "✗ DUMP_MS 必须是整数毫秒（0 = 程序默认）: $DUMP_MS"; exit 2;; esac
+DUMP_ARG=""; [ "$DUMP_MS" != 0 ] && DUMP_ARG="--dump_ms=$DUMP_MS"
+
 HOST="${TARGET#*@}"
 BASE="$(basename "$BIN")"
 TAG="${BASE#test_ffrdp_}"; [ -n "$TAG" ] || TAG="$BASE"
@@ -271,6 +288,14 @@ echo " 远端   : $REMOTE_BIN   (md5 $(md5sum "$REMOTE_BIN" | awk '{print $1}'))
 echo " 标签   : $TAG      时长 ${DUR}s   端口 $PORT   应用限速 $SPEED_DESC"
 echo " 服务端 : $TARGET:/tmp/$RBASE"
 echo " 客户端 : 本机 → $HOST:$PORT"
+if [ "$DIR" != both ]; then
+    if [ "$DIR" = up ]; then
+        echo " 方向   : 只上行（客户端发 / 服务端只收）"
+    else
+        echo " 方向   : 只下行（服务端发 / 客户端只收）"
+    fi
+fi
+[ "$DUMP_MS" != 0 ] && echo " 采样   : 每 ${DUMP_MS} ms 一次 dump"
 echo " 日志   : $LOGDIR"
 echo " 认证   : $AUTH"
 echo "──────────────────────────────────────────────────────────"
@@ -344,7 +369,7 @@ if [ "$DRY" != 1 ]; then
     # 注意 pkill 的写法：模式里的路径写成 [/]tmp 这样带一对方括号。
     # 否则这条 ssh 包装命令自己的命令行里就含 "/tmp/xxx --server" 这个串，pkill -f 会连它一起杀掉，
     # 后面的启动步骤一行都不会执行（实测：ssh.out 是 0 字节、远端日志根本没生成、客户端连了个空端口）。
-    "${SSH[@]}" "$TARGET" "pkill -f '[/]tmp/$RBASE --server' 2>/dev/null; sleep 0.3; rm -f '$SRV_LOG'; ( sleep $SRV_HOLD; echo quit ) | timeout $((SRV_HOLD+17)) env FFRDP_HS='${FFRDP_HS:-}' FFRDP_IDLE='${FFRDP_IDLE:-}' FFRDP_CLOSE='${FFRDP_CLOSE:-}' TEST_STAMP='${TEST_STAMP:-}' TEST_APP_BURST='${TEST_APP_BURST:-}' TEST_PEER_SILENCE_MS='${TEST_PEER_SILENCE_MS:-}' stdbuf -oL '/tmp/$RBASE' --server=0.0.0.0:$PORT $SRV_SPEED_ARG > '$SRV_LOG' 2>&1; echo REMOTE_EXIT=\$?; wc -c < '$SRV_LOG'" \
+    "${SSH[@]}" "$TARGET" "pkill -f '[/]tmp/$RBASE --server' 2>/dev/null; sleep 0.3; rm -f '$SRV_LOG'; ( sleep $SRV_HOLD; echo quit ) | timeout $((SRV_HOLD+17)) env FFRDP_HS='${FFRDP_HS:-}' FFRDP_IDLE='${FFRDP_IDLE:-}' FFRDP_CLOSE='${FFRDP_CLOSE:-}' TEST_STAMP='${TEST_STAMP:-}' TEST_APP_BURST='${TEST_APP_BURST:-}' TEST_PEER_SILENCE_MS='${TEST_PEER_SILENCE_MS:-}' stdbuf -oL '/tmp/$RBASE' --server=0.0.0.0:$PORT $SRV_SPEED_ARG $SRV_DIR_ARG $DUMP_ARG > '$SRV_LOG' 2>&1; echo REMOTE_EXIT=\$?; wc -c < '$SRV_LOG'" \
         > "$LOGDIR/${TAG}_server_${STAMP}.ssh.out" 2>&1 &
     SSHPID=$!
     sleep 4
@@ -366,7 +391,7 @@ if [ "$PINGWATCH" = 1 ] && [ "$DRY" != 1 ]; then
     ping_watch "$HOST" "$PINGP" "$((DUR+5))" && say "      PINGWATCH：同时对 $HOST 打 $((DUR+5)) 发（写 $PINGP）"
 fi
 if [ "$DRY" = 1 ]; then
-    say "      (DRY) ( sleep $DUR; echo quit ) | stdbuf -oL $BIN --client=$HOST:$PORT $CLI_SPEED_ARG > $LOCAL_LOG   ×${CLIENTS}"
+    say "      (DRY) ( sleep $DUR; echo quit ) | stdbuf -oL $BIN --client=$HOST:$PORT $CLI_SPEED_ARG $CLI_DIR_ARG $DUMP_ARG > $LOCAL_LOG   ×${CLIENTS}"
 else
     CPIDS=""
     c=1
@@ -375,7 +400,7 @@ else
         # 注意：这里是**普通脚本行**，必须用双引号 —— 单引号不会展开 ⇒ env 会拿到字面量
         # "${TEST_STAMP:-}"、atoi 得 0 ⇒ 客户端等于没开 TEST_STAMP（症状：crc_err 全量 ✗）。
         # 远端那一行不同：它嵌在 ssh 的双引号命令串里，单引号内的 ${…} 仍由本地展开 ✓。
-        ( sleep "$DUR"; echo quit ) | timeout $((DUR+15)) env TEST_STAMP="${TEST_STAMP:-}" TEST_APP_BURST="${TEST_APP_BURST:-}" TEST_PEER_SILENCE_MS="${TEST_PEER_SILENCE_MS:-}" stdbuf -oL "$BIN" --client="$HOST:$PORT" $CLI_SPEED_ARG > "$LOG_C" 2>&1 &
+        ( sleep "$DUR"; echo quit ) | timeout $((DUR+15)) env TEST_STAMP="${TEST_STAMP:-}" TEST_APP_BURST="${TEST_APP_BURST:-}" TEST_PEER_SILENCE_MS="${TEST_PEER_SILENCE_MS:-}" stdbuf -oL "$BIN" --client="$HOST:$PORT" $CLI_SPEED_ARG $CLI_DIR_ARG $DUMP_ARG > "$LOG_C" 2>&1 &
         CPIDS="$CPIDS $!"
         [ "$c" = 1 ] && TPID=$!
         sleep 0.4          # 让它们依次连上（也免得 N 个 SYN 挤在同一毫秒 ✓）
