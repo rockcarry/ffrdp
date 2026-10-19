@@ -13,13 +13,15 @@
 #   DRY=1 TARGET=x@y bash tools/window-sweep.sh                                  # 只打印会跑什么
 #
 # 每一档做的事：
-#   1) 用 EXTRA_CFLAGS 把这 6 个常数一起改掉（**不碰源码** ✓，build.sh 支持 EXTRA_CFLAGS）：
+#   1) 用 EXTRA_CFLAGS 把这 8 个常数一起改掉（**不碰源码** ✓，build.sh 支持 EXTRA_CFLAGS）：
 #        FFRDP_RX_WINDOW_FRAMES=W      接收缓冲 = 通告窗口（两者本来就是一个旋钮 ✓）
 #        FFRDP_MAX_WAITSND=W+128       受理侧帧数闸（必须 >= 窗口，否则它比窗口更紧 ✗）
 #        FFRDP_MAX_CWND_SIZE=W         cwnd 上限
 #        FFRDP_INFLIGHT_MAX=W          在途闸门
 #        FFRDP_INFLIGHT_CEIL=W         闸门"能升"的天花板（= W ⇒ 关掉探测的上升空间 ✓）
 #        FFRDP_RECV_QUEUE_MAX=W+128    合法乱序的上限（**必须 >= 窗口**，否则合法乱序会被当谎言丢掉 ✗）
+#        FFRDP_SND_FRAME_RING / FFRDP_RCV_FRAME_RING = 2 的幂 >= W+128
+#                                      两环的槽数（①-46 起各自定容；改了窗口就必须跟着改，否则编译期 #error ✓）
 #   2) 编出来的二进制拷成 dist/test_ffrdp_w<W> ⇒ TAG 里带档位，logs/summary.csv 能按档分组 ✓；
 #   3) 交给 test.sh 跑完整真机对测（上传 / 远端服务端 / 本地客户端 / 取回日志 / 写 summary.csv ✓）；
 #   4) 从两份日志里抽数：速率、resend、重连次数、rto、swnd ⇒ 一行一档。
@@ -53,10 +55,18 @@ usage() { awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; ex
 [ -n "${TARGET:-}" ] || usage
 [ -x ./test.sh ] || { echo "[sweep] ✗ 需要 ./test.sh"; exit 1; }
 
+pow2ge() {      # 最小的 2 的幂且 >= $1（两环的槽数必须是 2 的幂 ✓）
+    local p=2
+    while [ "$p" -lt "$1" ]; do p=$((p << 1)); done
+    echo "$p"
+}
+
 flags_for() {   # $1 = W, $2 = pace（0/1）
-    local w=$1 pc=${2:-$PACE}
+    local w=$1 pc=${2:-$PACE} r
+    r=$(pow2ge $((w + 128)))   # 两环都要装下 RECV_QUEUE_MAX / MAX_WAITSND = W+128
     echo "-DFFRDP_RX_WINDOW_FRAMES=$w -DFFRDP_MAX_WAITSND=$((w + 128)) -DFFRDP_MAX_CWND_SIZE=$w" \
          "-DFFRDP_INFLIGHT_MAX=$w -DFFRDP_INFLIGHT_CEIL=$w -DFFRDP_RECV_QUEUE_MAX=$((w + 128))" \
+         "-DFFRDP_SND_FRAME_RING=$r -DFFRDP_RCV_FRAME_RING=$r" \
          "-DFFRDP_PACE_ENABLE=$pc" ${EXTRA:+$EXTRA}
 }
 

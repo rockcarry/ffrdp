@@ -6405,4 +6405,50 @@ HEAD 逐字相同；空闲连接没有在途帧 ⇒ 连探针期限都不会被�
 - 验证 ✓：`TESTS=t_cap` 两侧 **0 个 ✗**（A 升到 62 帧、C 砍到 29、D 全过、B 不升、E 不升）；仿真全量
   work **37/37**；`QUICK=1 check.sh` 全绿（`logs/check-1018-153939`）✓。
 
+### 26.103 ①-44 环形队列 + ①-45 干掉 `recv_buff`：内存账与三个坑（2026-10-19）✔
+
+**一、①-44：帧存储从"节点池 + 两条链表"换成"发送/接收各一个环"**
+- 槽位 = `seq & 255`，两环各 `FFRDP_FRAME_RING = 256` 槽、**整块懒分配**（该方向第一帧才建 ✓）；
+  槽块按方向定长：发 = `40 + 4 + smss + 2`、收 = `40 + 4 + MAX_RX_MSS + 2`（8 对齐 ✓）。
+- 半帧指针 `cur_new_node` 语义改成"指向发送环里正在填的那一槽"；`snd_head/snd_next/snd_advance/snd_insert/
+  snd_release` 与 `rcv_head/rcv_insert/rcv_release` 取代了 `list_*`；①-43 的池字段整块删掉 ✓。
+- 踩到（必须先记）：**槽是字节块铺的 ⇒ 取第 i 槽不能用 `base[i]`**（那会按 `sizeof(节点)=40` 走一步，
+  把下一个节点写进这一槽的载荷 ✗）。现象：对端收到 `type=4/seq=5`、数据完全不动。改成 `ring_at(base, block, i)` ✓。
+- 另一条：FEC 帧的帧头是**组内异或**出来的 ⇒ 按线上序号落槽会撞上真帧、还会把"补回来的那一帧"丢掉 ✗
+  ⇒ FEC 帧先落临时块（`rx_scratch`）过完 FEC 层，用**恢复后的序号**再落槽 ✓；帧长也要照旧多留 2 字节尾 ✓。
+
+**二、①-45：`recv_buff` 删除（接收侧只剩环）**
+- 删：`recv_buff/recv_cap/recv_size/recv_head/recv_tail`、`FFRDP_RECVBUF_SIZE`、`ringbuf_*` 的收侧用法、
+  `ffrdp_conn_bufs()/_free()`、`counter_ack_appstall`，以及"缓冲满 ⇒ 这一轮位图一个都不报"那套补丁 ✓。
+- 加：`rcv_read_seq / rcv_read_off`（应用侧读游标，支持跨帧填满、一帧分多次读 ✓）、`FLAG_FRAME_READ`
+  （RECVDATA 取走的帧只还槽、不交字节）、`rx_wnd_zero` + 读空时补 ack（窗口 0 → 重开**立刻**通告，
+  不再等对端 RTO ✓）。
+- 窗口口径换成**帧**：`MIN(FFRDP_RX_WINDOW_FRAMES, FFRDP_FRAME_RING − rcv_live)`；`rcv_live` 的含义变成
+  "已收未读"（交付过的帧留到应用读空为止 ✓）。
+
+**三、内存账（`bash tools/size.sh` 现场算，明细见 `docs/ffrdp-v2.md` §9.7 ✓）**
+- 每端点常驻 **≈1 KB**（出货）/ **≈4.6 KB**（dev）—— 里面**没有任何收发缓冲** ✓。
+- 每连接：发送环 `256×1512 = 378 KB` + 接收环 `256×1544 = 386 KB` = **764 KB**（`mss:1280` 时 332+386 = 718 KB）；
+  FEC 临时块再 +1.5 KB，且只有 FEC 帧才付 ✓。**空闲连接/半开连接 = 0 B**（实测 dump：
+  `recv ring ①-45 : 0 bytes actually allocated over 0 conn(s)` ✓）。
+- 和 HEAD 比（lo、双向满速 5 s、`VmRSS`）：新 **2,688 KB** vs HEAD **2,432~2,560 KB** ⇒ **+150~270 KB/端点**。
+  差额远小于 764 KB，因为 HEAD 本来就有 190 KB `recv_buff` + 每帧节点的堆驻留 ⇒ 换掉的是**不可预测的峰值**
+  与每帧 malloc/free，不是凭空多要 700 KB ✓。要缩：`FFRDP_LOWLEVEL_FRAME_MAX` / `FFRDP_FRAME_RING`
+  （必须与 `FFRDP_MAX_WAITSND`、`FFRDP_RECV_QUEUE_MAX`、通告窗一起缩 ✗ 见 §9.7 那张表 ✓）。
+
+**四、三个坑（都不是"重构没跑通"，是**语义**错）**
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 应用不读时数据"收下了又说没收到"，对端把帧从发送环放掉（**真丢** ✓），随后连接**永久卡死** | 位图 `slot(recv_seq+i)` 命中的可能是 `recv_seq+i−256` 那帧（未读帧留在环里 ✓）⇒ **谎报收到** ⇒ 对端 `send_una` 漂到 `una` 前面 ⇒ 连"窗口重开"的 ack 都被当**陈旧 ack** 丢掉 ✗ | 位图命中前核对 `GET_FRAME_SEQ` ✓（同 `rcv_head` ✓）|
+| 2 | 应用不读、环满时旧帧会被**再交付一次** | `slot(recv_seq)` 同样可能与 `recv_seq−256` 混叠 | `rcv_head` 核对 seq ✓ |
+| 3 | 吞吐 **−17%**、ack 数 +19%、空圈 +72% | "每读空一帧就补 ack" ⇒ 每个 read 都叫醒工作线程 ✗ | 只在 `rx_wnd_zero`（上一次通告窗口为 0）时补 ack ✓ |
+
+**五、判据**
+- 新增 `tools/sim/t_readpath`（v2-only，已挂进 `run.sh`）：A 延迟读 + 97 B 分片读（**图案按偏移判序**）+ 读空后槽归零；
+  B 回调 `CONSUMED` 与 `ffrdp_recv` 混读（两条路字节**相加恰好等于发出量**）；C 应用完全不读 ⇒ 环满 256/256、
+  窗口归零、读开后 **60 步内**（<< RTO）对端就送进新数据 ✓。
+- 仿真全量 work 侧 **38/38**（含 `e2e` 17 场景）；回环真跑 `verify: OK`（seq_gap 0 / crc_err 0，20.7k msg/5 s）；
+  与 HEAD 交替 A/B 3 轮：**20,655 vs 20,455 msg** ⇒ 无回退 ✓。
+- `tools/size.sh` 已按新模型重写（旧的还在算 `FFRDP_RECVBUF_SIZE` ⇒ 早就编译不过 ✗）。
+
 

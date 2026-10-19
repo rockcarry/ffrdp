@@ -138,14 +138,14 @@ int main(void)
     drive(IDLE_MS * 2, p_c1, p_srv);                   // 先握上手 ✓
     conn0 = a_srv.conn;
     {   FFRDPCONN *c;
-        {   static char big[1300];                       // > smss(1024) ⇒ 只有攒满的帧才进 send_list ✓
+        {   static char big[1300];                       // > smss(1024) ⇒ 只有攒满的帧才进发送环（①-44）✓
             ffrdp_send(p_srv, conn0, big, (int)sizeof(big), 0);
         }
         c = ffrdp_conn_lookup(srv, conn0);              // 句柄带代号 ⇒ 用查表入口 ✓
-        check(c && c->send_list_head != NULL, "服务端有一条待确认的帧（钉判死口径用 ✓）");
-        if (c && c->send_list_head) {
-            c->send_list_head->flags   |= FLAG_FIRST_SEND;   // 假装它已经上过线 ✓
-            c->send_list_head->tick_1sts = NOW_MS() - 6000;  // 首帧 6 s 没被确认 ✓
+        check(c && snd_head(c) != NULL, "服务端有一条待确认的帧（钉判死口径用 ✓）");
+        if (c && snd_head(c)) {
+            snd_head(c)->flags   |= FLAG_FIRST_SEND;   // 假装它已经上过线 ✓
+            snd_head(c)->tick_1sts = NOW_MS() - 6000;  // 首帧 6 s 没被确认 ✓
             c->tick_last_recv            = NOW_MS();         // 但刚刚听到对端 ✓
             check(ffrdp_isdead_locked(srv, c) == 0, "首帧 6s 未确认、但仍在听说对端 ⇒ **不判死** ✓");
             c->tick_last_recv            = NOW_MS() - 6000;  // 对端也静默了 ✓

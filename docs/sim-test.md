@@ -4,7 +4,7 @@
 > 需要其它语言请**用 AI 自行翻译** ✓ —— 记得让它保留宏名、命令、代码块与 `✓ / ✗` 符号原文 ✓。
 
 工具本体在仓库的 `tools/sim/`：`run.sh`（构建 + A/B 驱动）、`simnet.c`（假网络）、
-`simll.c`（**假 lowlevel** ✓）、`simdefs.h`（两侧共享声明），以及十四个测试 `e2e.c` / `t_rto.c` / `t_pseudo.c` / `t_cwnd.c` / `t_ack.c` / `t_fuzz.c` / `t_peer.c` / `t_handshake.c` / `t_crypto.c` / `t_recvdata.c` / `t_keepalive.c` / `t_init.c` / `t_dump.c` / `t_fec.c` ✓。
+`simll.c`（**假 lowlevel** ✓）、`simdefs.h`（两侧共享声明），以及十五个测试 `e2e.c` / `t_rto.c` / `t_pseudo.c` / `t_cwnd.c` / `t_ack.c` / `t_fuzz.c` / `t_peer.c` / `t_handshake.c` / `t_crypto.c` / `t_recvdata.c` / `t_readpath.c` / `t_keepalive.c` / `t_init.c` / `t_dump.c` / `t_fec.c` ✓。
 本文是它的使用说明。所有命令都在**仓库根目录**执行。
 
 相关文档：[`../readme.zh.md`](../readme.zh.md)（概述/编译）、[`ffrdp-v1.md`](ffrdp-v1.md)（协议与优化）、
@@ -35,7 +35,7 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 
 | 环境变量 | 含义 | 默认 |
 |---|---|---|
-| `TESTS` | 要跑哪些测试 / 场景组（可多选，空格分隔）| `t_rto t_pseudo t_cwnd t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_keepalive t_init t_dump t_fec hs-e2e e2e-raw e2e` |
+| `TESTS` | 要跑哪些测试 / 场景组（可多选，空格分隔）| `t_rto t_pseudo t_cwnd t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_readpath t_keepalive t_init t_dump t_fec hs-e2e e2e-raw e2e` |
 | `REF` | **基线**源码路径 | `git show HEAD:ffrdp.c` |
 | `ASAN=1` | 打开地址消毒器（并自动加上 `halt_on_error=1` 与 `setarch -R` ✓）| 关 |
 | `SIM_LL_DEADLINE=1` | 假 lowlevel 换**忠实模型**（只在"有帧到"或"期限到"时唤醒 ✓）⚠️ 丢包场景下很贵 ✗，见下文的实测 | 关 ⇒ 用旧模型（每步无条件一次 TIMER ✗）|
@@ -86,6 +86,7 @@ REF=/path/to/old_ffrdp.c bash tools/sim/run.sh   # 基线不用 git HEAD，而�
 | `t_handshake` | **握手 + 多连接（v2）**：一个服务端 + 两个客户端，验 CONNECT/ACCEPT、句柄不同、不串台、FIN ⇒ DISCONN ✓（v2-only ✓）**阶段 6/7** 验主动关（`ffrdp_close` ⇒ `FIN_WAIT` ⇒ 收到对端 FIN 才 `DISCONN` ✓） 与客户端侧收 FIN ✓（主连接不摘表 ⇒ `isdead`=1、`send`/`recv` 报 `CLOSED` ✓）**阶段 4b/5b** 验**槽位回收**：半开超时放出槽位后新 SYN 接得上、句柄换代号（17 = 1×16+1 ✓）、旧句柄报已死 ✓；`maxconn` 全满才拒 ✓|
 | `t_crypto` | **加密回调（v2）**：加/解密回调都被调到 ✓；**两条出口**（攒满 mss 的整帧 / 超时或 flush 的短帧）都验到 ✓；逐字节完好 ⇒ 线上确实是密文 ✓；另加"回调不改载荷"的对照段 ✓（v2-only ✓）|
 | `t_recvdata` | **异步交付（v2）**：回调返回 `NOT_CONSUMED` ⇒ 数据留在协议里、`ffrdp_recv` 取得到 ✓；返回 `CONSUMED` ⇒ 回调自己搬走、协议不留（`ffrdp_recv` 空 ✓）**但传输照常**（帧照常确认 ✓）（v2-only ✓）|
+| `t_readpath` | **应用读路径（①-45：接收侧只有环）**：A 延迟读 + 97 B 分片读 ⇒ 逐字节按顺序正确（用偏移图案判 ✓）、读空后槽全部还回去 ✓；B 回调 `CONSUMED` 与 `ffrdp_recv` **混读** ⇒ 两条路字节**相加恰好等于发出量**（无漏无重 ✓）、READ 帧被跳过并还槽 ✓；C 应用完全不读 ⇒ 环满 256/256、通告窗归零（`rx_wnd_zero=1` ✓），读开后 **60 步内**（<< RTO）对端就送进新数据 ✓（v2-only ✓）|
 | `t_keepalive` | **keep-alive（v2：`idle_ms` 接线）**：空闲×活着 ⇒ 跑 5×`idle_ms` 双方都不被误杀 ✓、且探活 QUERY 真的在发（`counter_send_query` 在涨 ✓）；空闲×对端哑掉 ⇒ `idle_ms` 后双方 `DISCONN` ✓、服务端收摊（表槽清空 ✓）、`isdead`=1 ✓、`recv` 报 `CLOSED` ✓（v2-only ✓）**C 段**钉判死口径：首帧久等但仍在听说对端 ⇒ 不判死 ✓；静默上限 = `max(idle_ms, 4×rtts)` ✓|
 | `t_init` | **参数解析（v2）**：`ffrdp_init` 的**全部校验分支**（params 为 NULL / scheme 不认识 / 键缺冒号 / 未知键 / `maxconn` 越界 ✓）与键边界（`maxconn:1` 与 `= FFRDP_MAXCONN` ✓、`mss:8` ✓、`handshake_ms:0` / `idle_ms:0` 这类"没校验但后果大"的键 ✓、`fec` 的 0..32 钳制 ✓）；纯负面用例 ✓（v2-only ✓）|
 | `t_dump` | **`ffrdp_dump` 的边界（v2）**：`conn < 0` / `0` / accept 句柄 / 空槽 / 越界 / **已放掉的槽** / `clearhistory` / **`ctxt == NULL`** ✓ —— 都不许崩 ✓（v2-only ✓）|

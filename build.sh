@@ -72,7 +72,12 @@ build_package()
     # 两档都保持 -Werror：警告当错是编译期的事，与优化级别无关 ✓。
     local CFLAGS="-Wall -Werror -Wextra -Wunused-macros"
     local LDFLAGS="-lpthread"
-    # 额外编译期开关（扫窗口曲线用）：EXTRA_CFLAGS='-DFFRDP_RX_WINDOW_FRAMES=640' bash build.sh ✓
+    # 额外编译期开关：默认已是嵌入式 64 档（窗口/闸门/乱序窗/两环全 64 ⇒ 191 KB/连接），不用给任何 -D ✓。
+    # 要吞吐档就整组覆盖（漏一个就是编译期 #error，完整配方见 docs/ffrdp-v2.md §9.7 ✓）：
+    #   EXTRA_CFLAGS='-DFFRDP_RX_WINDOW_FRAMES=128 -DFFRDP_RECV_QUEUE_MAX=128 -DFFRDP_MAX_WAITSND=128
+    #                  -DFFRDP_MAX_CWND_SIZE=128 -DFFRDP_INFLIGHT_MAX=128 -DFFRDP_INFLIGHT_CEIL=128
+    #                  -DFFRDP_SND_FRAME_RING=256 -DFFRDP_RCV_FRAME_RING=128' bash build.sh ✓
+    # ⚠️ 改了窗口/受理闸/乱序窗就要同步改两个环，否则编译期 #error。
     # 只影响这一次构建，不改默认值 ✓。
     [ -n "${EXTRA_CFLAGS:-}" ] && CFLAGS="$CFLAGS $EXTRA_CFLAGS"
     local AR="${CROSS_COMPILE}ar"

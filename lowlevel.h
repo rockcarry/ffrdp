@@ -10,7 +10,11 @@
 // why the layer above should size its frames from this constant rather than from a number of its own: on
 // UDP it is the Ethernet sized limit this project is built on, and FFRDP_MAX_MSS is 1500 - 8, leaving room
 // for the UDP header on top.
+// 可用 -DFFRDP_LOWLEVEL_FRAME_MAX=... 覆盖（嵌入式小 MTU / 内存紧的时候 ✓）：它是每槽载荷的源头，
+// 缩它 = 两块环同比缩（1500 → 1000 ⇒ 每槽 1512/1544 → 1016/1040 ✓）。
+#ifndef FFRDP_LOWLEVEL_FRAME_MAX
 #define FFRDP_LOWLEVEL_FRAME_MAX 1500
+#endif
 
 // 这个端点给自己开的收发缓冲大小（字节）：按上面的一帧上限算 128 帧，再给每帧留 6 字节余地 —— 协议层
 // 会在一帧外面套几字节（4 字节帧头 + 2 字节 FEC seq），这里不引用它的宏：那是协议的事，传输层只需要

@@ -80,7 +80,7 @@ fi
 CFLAGS="-O1 -w -I../.. -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DFFRDP_DIAG=1 -DFFRDP_FEC_ENABLE=1 -include simdefs.h \
  -D'calloc(n,s)=sim_calloc(n,s)' -D'free(p)=sim_free(p)' \
  -D'sendto(s,b,l,f,d,a)=sim_send(b,l)' -D'recvfrom(s,b,l,f,d,a)=sim_recv(b,l)' -D'select(n,r,w,e,t)=sim_select()' \
- -D'ffrdp_udp_lowlevel_init(p,cb,ctx)=sim_ll_init(p,cb,ctx)'"
+ -D'ffrdp_udp_lowlevel_init(p,cb,ctx)=sim_ll_init(p,cb,ctx)' ${EXTRA_CFLAGS:-}"
 
 gcc -O1 -w -c simnet.c -o simnet.o
 # The working tree no longer owns a socket: ffrdp_init asks lowlevel for a transport, so the fake
@@ -100,7 +100,7 @@ gcc -O1 -w $HAVE_B -DSIMLL_BASE -c simll.c -o simll_base.o
 # utils.c lives one level up (run.sh works from tools/sim).
 # -I../..: the copy sits here, so its quoted includes ("utils.h") need the repo root on the path.
 gcc -O1 -w -I../.. -c utils_sim.c -o utils.o
-TESTS="${TESTS:-t_rto t_pseudo t_cwnd t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_flush t_probe t_sweep t_cap t_keepalive t_init t_dump t_fec hs-e2e e2e-raw e2e}"
+TESTS="${TESTS:-t_rto t_pseudo t_cwnd t_ack t_fuzz t_peer t_handshake t_crypto t_recvdata t_readpath t_flush t_probe t_sweep t_cap t_keepalive t_init t_dump t_fec hs-e2e e2e-raw e2e}"
 
 # 每一侧的输出同时进终端与一份日志：末尾的"判定汇总"从日志里读，免得靠人眼看统计数字。
 # 统计行（resend%、rto_floor、ooo 直方图……）随负载与旋钮变化，不是判据。
@@ -111,7 +111,7 @@ for t in $TESTS; do
     # v2-only 的测试（接口只有工作区那份才有）⇒ 不编 HEAD 那一份 ✗
     # 有的 TESTS 项只是"派发用的场景组"，复用别的测试的二进制（hs-e2e ⇒ e2e ✓）
     BUILD_T=$t; case $t in hs-e2e|e2e-raw) BUILD_T=e2e ;; esac
-    V2ONLY=""; case $BUILD_T in t_handshake|t_crypto|t_recvdata|t_keepalive|t_init|t_dump|t_fec) V2ONLY=1 ;; esac
+    V2ONLY=""; case $BUILD_T in t_handshake|t_crypto|t_recvdata|t_readpath|t_keepalive|t_init|t_dump|t_fec) V2ONLY=1 ;; esac
     for v in base new; do
         if [ -n "$V2ONLY" ] && [ "$v" = base ]; then continue; fi
         sed "s|#include \"../../ffrdp.c\"|#include \"ffrdp_$v.c\"|; s|#include \"../../ffrdp.h\"|#include \"ffrdp_$v.h\"|" ${BUILD_T}.c > ${BUILD_T}_$v.c
@@ -213,6 +213,11 @@ for t in $TESTS; do
         echo
         echo "===== t_recvdata: FFRDP_RECVDATA（NOT_CONSUMED / CONSUMED 两条路）====="
         echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_recvdata_new ;;
+    t_readpath)
+        # ①-45：接收侧只有环（recv_buff 已删）⇒ 读游标 / 分片读 / CONSUMED 混读 / 满环窗口归零与重开
+        echo
+        echo "===== t_readpath: 应用读路径（分片读 / 混着消费 / 满环后窗口重开）====="
+        echo "-- work --" | tee -a "$SIMLOG"; run $RUN ./t_readpath_new ;;
     t_flush)
         # ffrdp_flush（v2）：只刷指定的那条连接（服务端用的是 1 号及以后的 accept 句柄 ✓）
         # + **一次性请求**（调过一次之后不该把"短帧立刻发"永久打开 ✗）
