@@ -469,10 +469,15 @@ report() {   # $1=日志 $2=角色
     frf="$(grep -o 'counter_resend_rto *: *[0-9]*' "$f1" | tail -1 | sed 's/.*: *//' | tr -d '\r')/$(grep -o 'counter_resend_fast *: *[0-9]*' "$f1" | tail -1 | sed 's/.*: *//' | tr -d '\r')"
     # 分母必须与分子同源：total_send/total_recv 是**本连接**累计，所以优先用 dump 的 `conn age` ✓；
     # 老二进制没有那一行才退回 `elapsed`（上下文级 ⇒ 重连过就会偏差 ✗，见下面的口径告警）。
+    # ⚠ 精度：低速档（限速到每连接几 KB/s）用 %.2f 会把 0.005 抹成 0.00，多连接相加后仍是 0.00 ✗
+    #   （实测 slow/f-20：每连接 120 s 发 0.59 MB = 0.005 MB/s，15 条合计 0.075 全被抹平）。
+    #   ⇒ 任一侧 < 0.1 MB/s 时改用三位小数；正常速率仍是两位，`column -t` 与旧解析都照常 ✓。
     spd="$(awk '/^conn age/ { ca = $4 }
                /^elapsed/ { el = $3 }
                /^total_send, total_recv:/ { gsub(/MB,/,"",$3); gsub(/MB/,"",$4); s=$3; r=$4 }
-               END { d = (ca+0 > 0) ? ca : el; if (d+0 > 0) printf "%.2f/%.2f", s/d, r/d }' "$f1")"
+               END { d = (ca+0 > 0) ? ca : el
+                     if (d+0 > 0) { u = s/d; v = r/d
+                         printf ((u < 0.1 || v < 0.1) ? "%.3f/%.3f" : "%.2f/%.2f"), u, v } }' "$f1")"
     [ "$f1" != "$f" ] && rm -f "$f1"
     printf '  %-7s %s\n' "" "重传率 ${res:-—}   白费 ${waste:-—}   rtts ${rtts:-—} ms   发/收 ${spd:-—} MB/s   rto/fast ${frf:-—}"
     if [ "$nctx" -gt 1 ]; then
