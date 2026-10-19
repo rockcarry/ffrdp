@@ -27,11 +27,12 @@
 #   {s|f}-asym-20-80         双向非对称：上行 20% / 下行 80%
 #   比例是**参照容量**的百分比；总带宽 ÷ 连接数后下发（--send_speed 是每连接语义 ✓）。
 #
-# TCP 对照（TCP=1，只有 100% 档）：
-#   base           单连接三方向（iperf3 上行 / -R 下行 / --bidir 双向）+ ping + CPU
-#   tcp-f-{up|down|both}   满连接三方向（iperf3 -P CLIENTS）
-#   ⚠ iperf3 的 -b 只对 UDP 生效（TCP 直接忽略）⇒ 20/80 档**没有**等价的 TCP 能力，
-#     那几档只有 ffrdp，报告里不能拿满速 TCP 去比限速 ffrdp ✗。
+# TCP 对照（TCP=1）：与 ffrdp **同一套 11 档 × 单/满**，档名加 tcp- 前缀（如 tcp-s-up-80）
+#   限速用 iperf3 的 -b（**每流** bit/s）。实测 3.7 对 TCP 生效（pacing 定时器），
+#   每流 = 总量 ÷ 连接数 ⇒ 与 ffrdp 的 --send_speed（每连接令牌桶）同构 ✓；100% 档不限速。
+#   base 档仍单独跑一次（提供参照容量 + 空载 ping + 双向基线）。
+#   ⚠ 非对称档只能起**两个实例**（--bidir 两方向共用一个 -b，做不到一侧 80% 一侧 20%），
+#     那两档是"两条独立流"，与 ffrdp 的单连接双向不同构 —— 报告里要标注。
 #   TCP 侧的 resend 记 ping 丢包率、rtts 记 ping 平均延迟（没有协议层计数器可读）。
 #
 # 输出（logs/perf-<stamp>/）:
@@ -406,9 +407,13 @@ _iperf_server_start() {  # $1=环境 $2=输出前缀 ⇒ 置 IPERF_SP / IPERF_SC
     fi
 }
 
-iperf_one() {  # $1=环境 $2="-R" 或 "" $3=原始输出 $4=并行流数（默认 1）⇒ echo MB/s（单向）
-    local e="$1" rev="$2" out="$3" par="${4:-1}" h; h="$(env_host "$e")"
+iperf_one() {  # $1=环境 $2="-R" 或 "" $3=原始输出 $4=并行流数（默认 1）$5=每流 bit/s（0=不限）⇒ echo MB/s（单向）
+    local e="$1" rev="$2" out="$3" par="${4:-1}" rate="${5:-0}" h; h="$(env_host "$e")"
     local parg=""; [ "$par" -gt 1 ] && parg="-P $par"    # -P 1 就别加了：输出格式会多出 [SUM] 行
+    # iperf3 的 -b 对 **TCP** 同样生效（3.x 起用 pacing 定时器节流，不是只对 UDP ✓）——
+    # 实测 3.7：单流 -b 100M → 99.1 Mbps；-P 15 -b 100M → 1.49 Gbps（-b 是**每流**）。
+    # 这正是和 ffrdp 的 --send_speed（每连接令牌桶）同构的限速手段 ⇒ 两边的 20/80 档可以并排比 ✓
+    local rarg=""; [ "$rate" -gt 0 ] && rarg="-b $rate"
     local IPERF_SP=0 IPERF_SCP=0
     _iperf_server_start "$e" "$out"
     local sp=$IPERF_SP scp=$IPERF_SCP
@@ -420,19 +425,22 @@ iperf_one() {  # $1=环境 $2="-R" 或 "" $3=原始输出 $4=并行流数（默�
     local pp=$!
     host_cpu_loop $((IPERF_TIME + 2)) > "$out.hostcpu" &
     local hcp=$!
-    iperf3 -c "$h" -p "$IPERF_PORT" -t "$IPERF_TIME" -i "$DUMP_S" $parg $rev > "$out" 2>&1 || true
+    iperf3 -c "$h" -p "$IPERF_PORT" -t "$IPERF_TIME" -i "$DUMP_S" $parg $rarg $rev > "$out" 2>&1 || true
     wait $pp 2>/dev/null
     wait $hcp 2>/dev/null
     wait $sp 2>/dev/null; wait $scp 2>/dev/null; wait $ccp 2>/dev/null
     _bitrate_mbps "$(_bitrate_units "$out")"
 }
 
-iperf_bidir() {  # $1=环境 $2=原始输出 $3=并行流数（默认 1）⇒ echo "上行 下行"（MB/s）
+iperf_bidir() {  # $1=环境 $2=原始输出 $3=并行流数（默认 1）$4=每流 bit/s（0=不限）⇒ echo "上行 下行"（MB/s）
     # 为什么要它：`iperf3 -c` 只跑一个方向（-R 也只是"只跑反向"），而 ffrdp/test.c 是**双向同时** ——
     # 回程 ACK 与本端上行会抢同一条发送队列（ffrdp-v2.md §9.1 那条自伤就是它），所以单向 iperf3 当参照
     # 会**高估** ffrdp 的相对表现。--bidir 才是同形状的对照（iperf3 ≥ 3.7 支持）。
-    local e="$1" out="$2" par="${3:-1}" h; h="$(env_host "$e")"
+    local e="$1" out="$2" par="${3:-1}" rate="${4:-0}" h; h="$(env_host "$e")"
     local parg=""; [ "$par" -gt 1 ] && parg="-P $par"
+    # --bidir 时 -b 对**两个方向各自的流**生效（同一个 settings->rate）⇒ 对称档刚好；
+    # 非对称（80/20）做不到，得用两个独立实例（见 tcp_run 的 asym 分支 ✓）
+    local rarg=""; [ "$rate" -gt 0 ] && rarg="-b $rate"
     local IPERF_SP=0 IPERF_SCP=0
     _iperf_server_start "$e" "$out"
     local sp=$IPERF_SP scp=$IPERF_SCP
@@ -443,7 +451,7 @@ iperf_bidir() {  # $1=环境 $2=原始输出 $3=并行流数（默认 1）⇒ ec
     local pp=$!
     host_cpu_loop $((IPERF_TIME + 2)) > "$out.hostcpu" &
     local hcp=$!
-    iperf3 -c "$h" -p "$IPERF_PORT" -t "$IPERF_TIME" -i "$DUMP_S" $parg --bidir > "$out" 2>&1 || true
+    iperf3 -c "$h" -p "$IPERF_PORT" -t "$IPERF_TIME" -i "$DUMP_S" $parg $rarg --bidir > "$out" 2>&1 || true
     wait $pp 2>/dev/null
     wait $hcp 2>/dev/null
     wait $sp 2>/dev/null; wait $scp 2>/dev/null; wait $ccp 2>/dev/null
@@ -546,36 +554,61 @@ run_ap() {  # $1=kind $2=方向 $3=上行% $4=下行% $5=目录 $6=stamp
     wait $cspid 2>/dev/null || true
 }
 
-# ── TCP 对照（满连接）：iperf3 -P CLIENTS ─────────────────────────────────────
-# 只跑 100%：iperf3 的 -b 只对 UDP 生效（TCP 直接忽略）⇒ 20/80 档没有等价的 TCP 能力，
-# 那几档只有 ffrdp（报告里必须写"该档无 TCP 对照"，不能拿满速 TCP 去比限速 ffrdp ✗）。
-# ⚠ CPU 口径：iperf3 是**一个进程 15 条流**，ffrdp 是**15 个进程** ⇒ 客户端 CPU 不可直接比；
+# ── TCP 对照：与 ffrdp **同一套 11 档** ───────────────────────────────────────
+# 限速用 iperf3 的 -b（**每流** bit/s）。实测 3.7 对 TCP 生效（pacing 定时器）：
+# 单流 -b 100M → 99.1 Mbps；-P 15 -b 100M → 1.49 Gbps。它与 ffrdp 的 --send_speed
+# （每连接令牌桶）同属发送端节流 ⇒ 20/80 档两边可以并排比 ✓（不是"TCP 没有限速手段"）。
+# ⚠ 非对称档：`--bidir` 的两个方向共用一个 -b ⇒ 只能起**两个实例**（正向/反向各自限速），
+#   此时是两条独立流，与 ffrdp 的"单连接双向"不同构，报告里要标注 ✓
+# ⚠ CPU 口径：iperf3 是**一个进程 N 条流**，ffrdp 是 **N 个进程** ⇒ 客户端 CPU 不可直接比；
 #   公平的对照看服务端 CPU 与整机 CPU。
-tcp_run() {  # $1=环境 $2=方向 up|down|both $3=目录 $4=场景名
-    local e="$1" dmode="$2" dir="$3" sc="$4" h; h="$(env_host "$e")"
-    local par="$CLIENTS" up="-" dn="-" cli="-" csrv="-" pf=""
+tcp_run() {  # $1=环境 $2=kind $3=方向 $4=上行% $5=下行% $6=目录 $7=场景名
+    local e="$1" kind="$2" dmode="$3" up_pct="$4" dn_pct="$5" dir="$6" sc="$7" h
+    h="$(env_host "$e")"
+    local par=1; [ "$kind" = full ] && par="$CLIENTS"
+    local up="-" dn="-" cli="-" csrv="-" pf="" tag="tcp -P $par"
+    # 每流 bit/s = 总量（REF KB/s × pct%）× 8192 ÷ 连接数；100% 档不限（-b 0 = 不限速）
+    local up_bw=0 dn_bw=0
+    if [ "$up_pct" != 0 ] && [ "$up_pct" != 100 ] && [ "${REF_UP:-0}" != 0 ]; then
+        up_bw=$(( $(_pct "$REF_UP" "$up_pct") * 8192 / par ))
+    fi
+    if [ "$dn_pct" != 0 ] && [ "$dn_pct" != 100 ] && [ "${REF_DN:-0}" != 0 ]; then
+        dn_bw=$(( $(_pct "$REF_DN" "$dn_pct") * 8192 / par ))
+    fi
     mkdir -p "$dir"
     case "$dmode" in
-    up)   up="$(iperf_one "$e" ""     "$dir/iperf-up.txt"    "$par")"
-          pf="$dir/iperf-up.txt.ping";   dn=0 ;;
-    down) dn="$(iperf_one "$e" "-R"   "$dir/iperf-down.txt"  "$par")"
-          pf="$dir/iperf-down.txt.ping"; up=0 ;;
-    *)    local bd; bd="$(iperf_bidir "$e" "$dir/iperf-bidir.txt" "$par")"
-          up="${bd%% *}"; dn="${bd##* }"
-          pf="$dir/iperf-bidir.txt.ping" ;;
+    up)   up="$(iperf_one "$e" "" "$dir/iperf-up.txt" "$par" "$up_bw")"; dn=0
+          pf="$dir/iperf-up.txt.ping" ;;
+    down) dn="$(iperf_one "$e" "-R" "$dir/iperf-down.txt" "$par" "$dn_bw")"; up=0
+          pf="$dir/iperf-down.txt.ping" ;;
+    *)
+        if [ "$up_pct" = "$dn_pct" ]; then
+            local bd; bd="$(iperf_bidir "$e" "$dir/iperf-bidir.txt" "$par" "$up_bw")"
+            up="${bd%% *}"; dn="${bd##* }"; pf="$dir/iperf-bidir.txt.ping"
+        else
+            # 非对称：`--bidir` 两方向共用一个 -b，做不到一侧 80% 一侧 20% ⇒ 只能跑两遍、各自限速。
+            # ⚠ 是**顺序**跑（不是并发）：真机上两个方向会互相抢队列，顺序跑的读数偏乐观。
+            # 也不并发起两个实例的原因：服务端是 `iperf3 -s -1`（只接一条），第二个实例连不上 ✗
+            up="$(iperf_one "$e" "" "$dir/iperf-up.txt" "$par" "$up_bw")"
+            dn="$(iperf_one "$e" "-R" "$dir/iperf-down.txt" "$par" "$dn_bw")"
+            pf="$dir/iperf-up.txt.ping"
+            tag="tcp -P $par; 非对称=顺序跑两遍（各自限速，非并发）"
+        fi ;;
     esac
-    # CPU 文件与 ping 同前缀（iperf_one/iperf_bidir 都写 <out>.cli.cpu / .srv.cpu）
-    local b="${pf%.ping}"
-    cli="$(cpu_get "$b.cli.cpu" avg)"; csrv="$(cpu_get "$b.srv.cpu" avg)"
-    CU["$e/$sc/client"]="$(cpu_fmt "$b.cli.cpu")"; CU["$e/$sc/server"]="$(cpu_fmt "$b.srv.cpu")"
+    if [ -n "$pf" ]; then
+        local b="${pf%.ping}"
+        # CPU 文件与 ping 同前缀（iperf_one/iperf_bidir 都写 <out>.cli.cpu / .srv.cpu）
+        cli="$(cpu_get "$b.cli.cpu" avg)"; csrv="$(cpu_get "$b.srv.cpu" avg)"
+        CU["$e/$sc/client"]="$(cpu_fmt "$b.cli.cpu")"; CU["$e/$sc/server"]="$(cpu_fmt "$b.srv.cpu")"
+    fi
     # TCP 侧没有协议层 resend/rtt 可读 ⇒ resend 列用 ping 丢包率、rtts 列用 ping 平均延迟 ✓
     local loss rt
     loss="$(grep -o '[0-9.]*% packet loss' "$pf" 2>/dev/null | tail -1 | cut -d% -f1)"
     rt="$(grep -o 'rtt min/avg/max[^=]*= *[0-9./]*' "$pf" 2>/dev/null | tail -1 | sed 's/.*= *//' | cut -d/ -f2)"
     say "  [tcp] $sc → 发/收 ${up}/${dn} MB/s  ping 丢包 ${loss:--}%  rtt ${rt:--} ms  CPU ${cli}/${csrv}%"
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$e" "$sc" "${loss:--}%" "${rt:--}" "$up" "$dn" "$cli" "$csrv" \
-        "tcp -P $par; resend=ping 丢包 / rtts=ping 平均" >> "$OUT/results.csv"
-    record "$e" "$sc" "${loss:--}%" "${rt:--}" "$up" "$dn" "$cli" "$csrv" "tcp -P $par"
+        "$tag; resend=ping 丢包 / rtts=ping 平均" >> "$OUT/results.csv"
+    record "$e" "$sc" "${loss:--}%" "${rt:--}" "$up" "$dn" "$cli" "$csrv" "$tag"
 }
 
 # ── 汇总：从 summary.csv 取一格场景的四个数 ──────────────────────────────────
@@ -614,10 +647,8 @@ scen_name() {  # $1=方向 $2=上行% $3=下行% ⇒ 场景名（single/full 由
 scen_title() {  # $1=场景名 ⇒ 人类可读的标题（summary.md 用）
     local sc="$1" kp who rest a
     case "$sc" in
-    base)      echo "基准（ping 丢包/延时 + iperf3 TCP 100%，单连接）"; return ;;
-    tcp-f-up)  echo "TCP 对照 · 满连接 · 只上行 · 100%"; return ;;
-    tcp-f-down) echo "TCP 对照 · 满连接 · 只下行 · 100%"; return ;;
-    tcp-f-both) echo "TCP 对照 · 满连接 · 双向对称 · 100%"; return ;;
+    base)  echo "基准（ping 丢包/延时 + iperf3 TCP 100%，单连接）"; return ;;
+    tcp-*) echo "TCP 对照 · $(scen_title "${sc#tcp-}")"; return ;;
     esac
     kp="${sc%%-*}"; who="单连接"; [ "$kp" = f ] && who="满连接"
     rest="${sc#*-}"
@@ -707,16 +738,6 @@ for e in $ENVS; do
             CU["$e/base/server"]="$(cpu_fmt "$OUT/raw/$e-base/iperf-up.txt.srv.cpu")"
             confirm_base "$e" "$BASE_LOSS" "$(echo "${BASE_RTT:-/}" | cut -d/ -f2)" "$BASE_DN_MBPS"
         fi
-        # 满连接 TCP 对照（单连接三方向已经由 base_run 跑过 ⇒ 这里只差 -P）
-        for dm in up down both; do
-            sc="tcp-f-$dm"
-            [ "$SCEN" = all ] || echo " $SCEN " | grep -q " $sc " || continue
-            if [ "$DRY" = 1 ]; then
-                echo "  (DRY) iperf3 -c $(env_host "$e") -P $CLIENTS（方向 $dm，${IPERF_TIME}s）"
-                continue
-            fi
-            tcp_run "$e" "$dm" "$OUT/raw/$e-$sc" "$sc"
-        done
     fi
 
     # ── ffrdp：11 档（方向 × 比例），单连接与满连接各一遍 ──
@@ -779,17 +800,42 @@ LOGDIR=$dir STAMP=$local_st CLIENTS=$nn DIR=$dmode DUMP_MS=$DUMP_MS"
             done
         done
     done
+
+    # ── TCP 对照：与 ffrdp 同一套档位 + **同一个参照基数** ──
+    # 必须放在 ffrdp 之后：REF 此时已被 both-100 回填（或来自 iperf3 容量）⇒ 同一档两边限到
+    # **同一个绝对带宽**，而不是"各自容量的 80%"（lo 上那会差 100 倍：iperf3 6 GB/s vs ffrdp 45 MB/s ✗）。
+    if [ "$TCP" = 1 ]; then
+        for tk in single full; do
+            tkp=s; [ "$tk" = full ] && tkp=f
+            tn=1; [ "$tk" = full ] && tn="$CLIENTS"
+            for spec in $SCEN_TABLE; do
+                IFS=: read -r dmode up_pct dn_pct <<< "$spec"
+                sc="tcp-$tkp-$(scen_name "$dmode" "$up_pct" "$dn_pct")"
+                [ "$SCEN" = all ] || echo " $SCEN " | grep -q " $sc " || continue
+                if [ "$DRY" = 1 ]; then
+                    echo "  (DRY) iperf3 -c $(env_host "$e") -P $tn（方向 $dmode 上 ${up_pct}% 下 ${dn_pct}%，${IPERF_TIME}s）"
+                    continue
+                fi
+                if { [ "$up_pct" != 0 ] && [ "$up_pct" != 100 ] && [ "${REF_UP:-0}" = 0 ]; } \
+                    || { [ "$dn_pct" != 0 ] && [ "$dn_pct" != 100 ] && [ "${REF_DN:-0}" = 0 ]; }; then
+                    say "  ⚠ TCP $sc：参照容量未定 ⇒ 本档不限速（先跑 s-both-100）"
+                fi
+                tcp_run "$e" "$tk" "$dmode" "$up_pct" "$dn_pct" "$OUT/raw/$e-$sc" "$sc"
+            done
+        done
+    fi
 done
 
 [ "$DRY" = 1 ] && { echo; echo "(DRY) 结束，什么都没跑"; exit 0; }
 
 # ── summary.md ──────────────────────────────────────────────────────────────
-# 表顺序：基准 → TCP 满连接三方向 → 单连接 11 档 → 满连接 11 档
-SCENS="base tcp-f-up tcp-f-down tcp-f-both"
+# 表顺序：基准 → 每档先 TCP 后 ffrdp（便于并排抄进报告）
+SCENS="base"
 for kp in s f; do
     for spec in $SCEN_TABLE; do
         IFS=: read -r dmode up_pct dn_pct <<< "$spec"
-        SCENS="$SCENS $kp-$(scen_name "$dmode" "$up_pct" "$dn_pct")"
+        nm="$(scen_name "$dmode" "$up_pct" "$dn_pct")"
+        SCENS="$SCENS tcp-$kp-$nm $kp-$nm"
     done
 done
 ENVCOLS=($ENVS)
