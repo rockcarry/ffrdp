@@ -26,10 +26,16 @@
 #                    缺一侧的话时间戳会被当载荷读出垃圾（日志里 lat_bad 计数非 0 ✗）。
 #     TEST_APP_BURST=N 应用侧每次 recv 处理 N 条（同上，两端一起透传；默认 0 = 旧行为 ✓）。
 #     TEST_PEER_SILENCE_MS=N 应用层多久收不到字节就判对端失联并重连（同上，两端一起透传；默认 2000）。
-#     SPEED=N        应用侧发送限速 KB/s（两端一起透传 ⇒ 两侧都限；默认 0 = 不限速 ✓）。
+#     SPEED=N        应用侧发送限速 KB/s（**每连接**，两端一起透传 ⇒ 两侧都限；默认 0 = 不限速 ✓）。
 #                    用途：分辨"协议/窗口算法不行"和"应用灌太猛把链路队列顶满"——
 #                    限速后若各档都不再重连，根因就是排队自激，不是拥塞窗口逻辑 ✗。
 #                     ⚠️ 200 ms 级链路建议给 10000：2 s 太紧，一次长静默就会重连，把长跑切成两段（口径随之错位）。
+#     UP_TOTAL=N     客户端**总上行** KB/s（按 CLIENTS 均分；0 = 用 SPEED）。限速到"链路容量以内"必须
+#     DOWN_TOTAL=N   用总量表达：容量是一个数（真机实测 上行 290~340KB/s / 下行 680~780KB/s，随时段与
+#                    AP 而异），而 SPEED 是每进程的
+#                    ⇒ 15 个客户端各自 100KB/s 时实际总供给 1.5MB/s = 5× 超卖（1019-122211 的崩溃来源 ✓）。
+#                    两者分开是因为真链路不对称；只给一侧时另一侧保持 SPEED 的行为 ✓。
+#                    例：UP_TOTAL=300 DOWN_TOTAL=780 CLIENTS=15 ⇒ 每连接 20/52 KB/s。
 #     CLIENTS=N      本地起 N 个客户端打同一个服务端（默认 1 ✓；上限 = 服务端 maxconn - 1 ✓）
 #                    日志：第 1 个是 <tag>_client_<stamp>.log ✓、第 2..N 个是它加 _c2.._cN ✓；
 #                    互通自测那几条用 ASCII 名（v1ref_v1srv_v2cli_hs0_* ✓），漂亮的 ①②③ 只在终端 ✓
@@ -137,9 +143,22 @@ fi
 BIN="$(abspath "$BIN")"                                  # ⇒ 裸名字也能跑 ✓（见文件头的说明）
 case "$DUR" in ''|*[!0-9]*) echo "✗ 时长必须是整数秒: $DUR"; exit 2;; esac
 case "$PORT" in ''|*[!0-9]*) echo "✗ 端口必须是数字: $PORT"; exit 2;; esac
-SPEED="${SPEED:-0}"        # 应用侧限速 KB/s（两端一起传 --send_speed；0 = 不限速 ✓）
+SPEED="${SPEED:-0}"        # 应用侧限速 KB/s（**每连接**，两端一起传 --send_speed；0 = 不限速 ✓）
 case "$SPEED" in ''|*[!0-9]*) echo "✗ SPEED 必须是整数 KB/s（0 = 不限速）: $SPEED"; exit 2;; esac
-SPEED_ARG=""; [ "$SPEED" != 0 ] && SPEED_ARG="--send_speed=$SPEED"
+# UP_TOTAL / DOWN_TOTAL：**总供给**限速（KB/s），按 CLIENTS 均分到每条连接（0/未设 = 沿用 SPEED）。
+# 为什么需要它们：SPEED 是**每进程**的 ⇒ 15 个客户端各自 100KB/s，实际总供给 1.5MB/s，而链路容量
+# 只有一个数（真机实测：上行 290~340、下行 680~780KB/s，随时段/AP 而异）⇒ "限速到容量以内"这件事只能按总量表达，
+# 否则每改一次 CLIENTS 就要手算一遍，而且很容易又把链路超卖（1019-122211 的 5× 超卖就是这么来的）。
+# 两端分开给：真链路不对称（上行 ≈0.3 vs 下行 ≈0.7 MB/s），给同一个数会白占下行带宽。
+# 具体每连接速率在下面（CLIENTS 已知之后）由 per_conn_speed 算成 CLI_SPEED_ARG / SRV_SPEED_ARG ✓。
+UP_TOTAL="${UP_TOTAL:-0}"
+DOWN_TOTAL="${DOWN_TOTAL:-0}"
+case "$UP_TOTAL"   in ''|*[!0-9]*) echo "✗ UP_TOTAL 必须是整数 KB/s（0 = 不限）: $UP_TOTAL"; exit 2;; esac
+case "$DOWN_TOTAL" in ''|*[!0-9]*) echo "✗ DOWN_TOTAL 必须是整数 KB/s（0 = 不限）: $DOWN_TOTAL"; exit 2;; esac
+# 头部那一行的限速描述：用总量模式时，SPEED 往往是 0（"不限"），照原样打印会读成"没限速"✗。
+SPEED_DESC="${SPEED}KB/s/连接"
+[ "$SPEED" = 0 ] && SPEED_DESC="不限"
+if [ "$UP_TOTAL" != 0 ] || [ "$DOWN_TOTAL" != 0 ]; then SPEED_DESC="按总量（见下一行）"; fi
 
 HOST="${TARGET#*@}"
 BASE="$(basename "$BIN")"
@@ -249,7 +268,7 @@ fi
 echo "──────────────────────────────────────────────────────────"
 echo " 本地端 : $BIN   (md5 $(md5sum "$BIN" | awk '{print $1}'))"
 echo " 远端   : $REMOTE_BIN   (md5 $(md5sum "$REMOTE_BIN" | awk '{print $1}'))"
-echo " 标签   : $TAG      时长 ${DUR}s   端口 $PORT   应用限速 ${SPEED}KB/s$([ "$SPEED" = 0 ] && echo '（不限）')"
+echo " 标签   : $TAG      时长 ${DUR}s   端口 $PORT   应用限速 $SPEED_DESC"
 echo " 服务端 : $TARGET:/tmp/$RBASE"
 echo " 客户端 : 本机 → $HOST:$PORT"
 echo " 日志   : $LOGDIR"
@@ -263,6 +282,25 @@ echo "────────────────────────�
 CLIENTS="${CLIENTS:-1}"
 case "$CLIENTS" in *[!0-9]*|"") echo "✗ CLIENTS 必须是正整数（现在是 "$CLIENTS"）"; exit 2;; esac
 [ "$CLIENTS" -ge 1 ] || { echo "✗ CLIENTS 必须 ≥ 1"; exit 2; }
+
+# ── 总量限速 ⇒ 每连接速率（UP_TOTAL 管客户端**发**、DOWN_TOTAL 管服务端**发**）──────
+# 均分到 1KB/s 粒度（四舍五入），下限 1（0 会让 test.c 当成"不限速" ⇒ 超卖回来 ✗）。
+per_conn_speed() {   # $1 = 总量 KB/s（0 = 沿用 SPEED 的每连接值）
+    local tot="$1" v
+    if [ "$tot" = 0 ]; then echo "$SPEED"; return; fi
+    v=$(( (tot + CLIENTS / 2) / CLIENTS ))
+    [ "$v" -lt 1 ] && v=1
+    echo "$v"
+}
+CLI_SPEED="$(per_conn_speed "$UP_TOTAL")"     # 客户端每条连接发多快 ⇒ 决定上行总量
+SRV_SPEED="$(per_conn_speed "$DOWN_TOTAL")"   # 服务端每条连接发多快 ⇒ 决定下行总量
+CLI_SPEED_ARG=""; [ "$CLI_SPEED" != 0 ] && CLI_SPEED_ARG="--send_speed=$CLI_SPEED"
+SRV_SPEED_ARG=""; [ "$SRV_SPEED" != 0 ] && SRV_SPEED_ARG="--send_speed=$SRV_SPEED"
+if [ "$UP_TOTAL" != 0 ] || [ "$DOWN_TOTAL" != 0 ]; then
+    echo " 限速总量: 上行 ${UP_TOTAL}KB/s"\
+         "⇒ 每连接 ${CLI_SPEED}KB/s（${CLIENTS} 条 = $((CLI_SPEED * CLIENTS))KB/s）|"\
+         "下行 ${DOWN_TOTAL}KB/s ⇒ 每连接 ${SRV_SPEED}KB/s（= $((SRV_SPEED * CLIENTS))KB/s）"
+fi
 
 # ── 服务端要活多久：必须**比最后一个客户端晚几秒** ✓ ────────────────────────────
 # 客户端是串行拉起的（间隔 0.4s，见 [4/6] 的 `sleep 0.4`）⇒ 第 N 个客户端结束于
@@ -306,7 +344,7 @@ if [ "$DRY" != 1 ]; then
     # 注意 pkill 的写法：模式里的路径写成 [/]tmp 这样带一对方括号。
     # 否则这条 ssh 包装命令自己的命令行里就含 "/tmp/xxx --server" 这个串，pkill -f 会连它一起杀掉，
     # 后面的启动步骤一行都不会执行（实测：ssh.out 是 0 字节、远端日志根本没生成、客户端连了个空端口）。
-    "${SSH[@]}" "$TARGET" "pkill -f '[/]tmp/$RBASE --server' 2>/dev/null; sleep 0.3; rm -f '$SRV_LOG'; ( sleep $SRV_HOLD; echo quit ) | timeout $((SRV_HOLD+17)) env FFRDP_HS='${FFRDP_HS:-}' FFRDP_IDLE='${FFRDP_IDLE:-}' FFRDP_CLOSE='${FFRDP_CLOSE:-}' TEST_STAMP='${TEST_STAMP:-}' TEST_APP_BURST='${TEST_APP_BURST:-}' TEST_PEER_SILENCE_MS='${TEST_PEER_SILENCE_MS:-}' stdbuf -oL '/tmp/$RBASE' --server=0.0.0.0:$PORT $SPEED_ARG > '$SRV_LOG' 2>&1; echo REMOTE_EXIT=\$?; wc -c < '$SRV_LOG'" \
+    "${SSH[@]}" "$TARGET" "pkill -f '[/]tmp/$RBASE --server' 2>/dev/null; sleep 0.3; rm -f '$SRV_LOG'; ( sleep $SRV_HOLD; echo quit ) | timeout $((SRV_HOLD+17)) env FFRDP_HS='${FFRDP_HS:-}' FFRDP_IDLE='${FFRDP_IDLE:-}' FFRDP_CLOSE='${FFRDP_CLOSE:-}' TEST_STAMP='${TEST_STAMP:-}' TEST_APP_BURST='${TEST_APP_BURST:-}' TEST_PEER_SILENCE_MS='${TEST_PEER_SILENCE_MS:-}' stdbuf -oL '/tmp/$RBASE' --server=0.0.0.0:$PORT $SRV_SPEED_ARG > '$SRV_LOG' 2>&1; echo REMOTE_EXIT=\$?; wc -c < '$SRV_LOG'" \
         > "$LOGDIR/${TAG}_server_${STAMP}.ssh.out" 2>&1 &
     SSHPID=$!
     sleep 4
@@ -328,7 +366,7 @@ if [ "$PINGWATCH" = 1 ] && [ "$DRY" != 1 ]; then
     ping_watch "$HOST" "$PINGP" "$((DUR+5))" && say "      PINGWATCH：同时对 $HOST 打 $((DUR+5)) 发（写 $PINGP）"
 fi
 if [ "$DRY" = 1 ]; then
-    say "      (DRY) ( sleep $DUR; echo quit ) | stdbuf -oL $BIN --client=$HOST:$PORT $SPEED_ARG > $LOCAL_LOG   ×${CLIENTS}"
+    say "      (DRY) ( sleep $DUR; echo quit ) | stdbuf -oL $BIN --client=$HOST:$PORT $CLI_SPEED_ARG > $LOCAL_LOG   ×${CLIENTS}"
 else
     CPIDS=""
     c=1
@@ -337,7 +375,7 @@ else
         # 注意：这里是**普通脚本行**，必须用双引号 —— 单引号不会展开 ⇒ env 会拿到字面量
         # "${TEST_STAMP:-}"、atoi 得 0 ⇒ 客户端等于没开 TEST_STAMP（症状：crc_err 全量 ✗）。
         # 远端那一行不同：它嵌在 ssh 的双引号命令串里，单引号内的 ${…} 仍由本地展开 ✓。
-        ( sleep "$DUR"; echo quit ) | timeout $((DUR+15)) env TEST_STAMP="${TEST_STAMP:-}" TEST_APP_BURST="${TEST_APP_BURST:-}" TEST_PEER_SILENCE_MS="${TEST_PEER_SILENCE_MS:-}" stdbuf -oL "$BIN" --client="$HOST:$PORT" $SPEED_ARG > "$LOG_C" 2>&1 &
+        ( sleep "$DUR"; echo quit ) | timeout $((DUR+15)) env TEST_STAMP="${TEST_STAMP:-}" TEST_APP_BURST="${TEST_APP_BURST:-}" TEST_PEER_SILENCE_MS="${TEST_PEER_SILENCE_MS:-}" stdbuf -oL "$BIN" --client="$HOST:$PORT" $CLI_SPEED_ARG > "$LOG_C" 2>&1 &
         CPIDS="$CPIDS $!"
         [ "$c" = 1 ] && TPID=$!
         sleep 0.4          # 让它们依次连上（也免得 N 个 SYN 挤在同一毫秒 ✓）

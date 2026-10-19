@@ -53,6 +53,14 @@
 - **做法**：`FFRDP_PACE_ENABLE` 在 15 流不限速场景下 A/B（也可先试调 `FFRDP_UNSENT_MAX`）。
 - **判据**：resend 6% → 3% 且总吞吐降幅 ≤ 5% 才算赢。
 
+## 维护（不急，动 sweep 脚本前先看这条）
+
+- [ ] **三个 sweep 脚本合并成"档位定义 + 日志聚合"两层**：`tools/window-sweep.sh`、
+      `tools/inflight-sweep.sh`、`tools/win-ladder.sh` 各自维护一套 `tier → EXTRA_CFLAGS`，已经漂了
+      （`MAX_WAITSND = W` vs `W+128`；环 `pow2ge(W)` vs `2^n ≥ W+128`），现在只有 ≤64 档才碰巧同义。
+      `win-ladder.sh` 真正独有的价值只在**多连接聚合 + 重连计数 + 判定列**这一层 ⇒ 抽成共享函数，
+      三个入口只保留参数差异。
+
 ## 不做（已判负 / 已证伪，避免重复劳动）
 
 | 项 | 结论 |
