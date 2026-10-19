@@ -16,10 +16,18 @@
 #define FFRDP_LOWLEVEL_FRAME_MAX 1500
 #endif
 
-// 这个端点给自己开的收发缓冲大小（字节）：按上面的一帧上限算 128 帧，再给每帧留 6 字节余地 —— 协议层
+// 这个端点给自己开的收发缓冲大小（字节）：按上面的一帧上限算 N 帧，再给每帧留 6 字节余地 —— 协议层
 // 会在一帧外面套几字节（4 字节帧头 + 2 字节 FEC seq），这里不引用它的宏：那是协议的事，传输层只需要
 // 一个"装得下一段时间里在途的帧"的数。它跟着实现走（UDP 用一个 socket 缓冲，别的后端可能完全没有）。
-#define FFRDP_LOWLEVEL_BUFFER_SIZE (128 * (FFRDP_LOWLEVEL_FRAME_MAX + 6))
+// 取值口径（**安全余量，不是吞吐旋钮** ✓）：N ≥ 协议的在途上限（= 通告窗 / 发送环槽数），否则
+//   · 发送侧：一个窗口的突发填不满内核发送队列 ⇒ sendto 报 EWOULDBLOCK ⇒ 帧被"内核没收下"打回 cwnd ✗；
+//   · 接收侧：工作线程来不及收时静默丢包 ⇒ 重传上升 ✗。
+// 默认档（窗口/在途 64 帧 × 1512 B ≈ 97 KB）⇒ 64 够用 ✓；吞吐档（窗口/在途 128 帧 ≈ 194 KB）⇒ 给 128 ✓。
+// 内核会把请求翻倍、再按 net.core.wmem_max / rmem_max 夹（本仓实测上限 208 KB：64 档请求 96 KB ⇒ 实给 ≈192 KB；
+// 128 档请求 188 KB ⇒ 被夹到 208 KB ⇒ 两档实得只差 8%）。可 -DFFRDP_LOWLEVEL_BUFFER_SIZE=... 覆盖 ✓。
+#ifndef FFRDP_LOWLEVEL_BUFFER_SIZE
+#define FFRDP_LOWLEVEL_BUFFER_SIZE (64 * (FFRDP_LOWLEVEL_FRAME_MAX + 6))
+#endif
 
 enum {
     FFRDP_LOWLEVEL_TYPE_RECV  = 1,
