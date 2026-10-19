@@ -672,10 +672,14 @@ LOGDIR=$dir STAMP=$local_st CLIENTS=$nn"
                     record "$e" "$sc" "${res}%" "${rt}" "$up" "$dn" "$ccl" "$csrv" "$note"
                     CU["$e/$sc/client"]="$(cpu_fmt "$dir/cpu.client")"
                     CU["$e/$sc/server"]="$(cpu_fmt "$dir/cpu.server")"
-                    # lo 的参照：单流满速自身（loopback 没有外部瓶颈，iperf3 的容量对 ffrdp 无意义）
-                    if [ "$e" = lo ] && [ "$kind" = single ] && [ "$lim" = 0 ] && [ "${REF_UP:-0}" = 0 ]; then
+                    # 参照：单流满速**自身**。lo 恒用（loopback 没有外部瓶颈，iperf3 的容量对 ffrdp 无意义）；
+                    # 真机在 REF_MODE=self 时同样回填（单向 iperf3 高于 ffrdp 单流上限时，只能拿自身当参照）。
+                    # ⚠ 回填条件里必须带上 REF_MODE=self：若只认 lo，真机 REF_MODE=self 会把 REF 清成 0
+                    #   ⇒ 限速档 `[ "$lim" != 0 ] && [ "$REF_UP" != 0 ]` 不成立 ⇒ **完全不限速**，白跑一轮 ✗
+                    if [ "$kind" = single ] && [ "$lim" = 0 ] && [ "${REF_UP:-0}" = 0 ] \
+                        && { [ "$e" = lo ] || [ "$REF_MODE" = self ]; }; then
                         REF_UP="$(kb_of "$up")"; REF_DN="$(kb_of "$dn")"
-                        say "  lo 参照容量（ffrdp 单流满速）：上 ${REF_UP}KB/s 下 ${REF_DN}KB/s"
+                        say "  $e 参照容量（ffrdp 单流满速）：上 ${REF_UP}KB/s 下 ${REF_DN}KB/s"
                     fi
                 fi
             done
