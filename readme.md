@@ -262,6 +262,7 @@ QUICK=1 bash tools/check.sh      # skip ASAN and e2e (about 1 minute) ✓
 ├── socket.c / socket.h     thin socket wrapper (init, options, timeouts, non-blocking)
 ├── utils.c / utils.h       timestamps, thread setname/getname, module thread state machine
 ├── test.c                  test program (server/client share one parameterised peer loop + dump every 10 s)
+├── ffcrypto.c / ffcrypto.h app-side reference encryption for the ENCRYPT/DECRYPT callbacks (ChaCha20, no dependencies; deliberately **not** in libffrdp — see [`docs/ffrdp-crypto.md`](docs/ffrdp-crypto.md))
 ├── test.sh                 **real-machine A/B comparison** (upload → remote server → local client → logs → summary; see §4)
 ├── build.sh                build script (static library + test program + pkg-config)
 ├── readme.md               this file, the **English version** (shown by default on GitHub ✓; kept in sync with the Chinese one ✓)
@@ -270,6 +271,7 @@ QUICK=1 bash tools/check.sh      # skip ASAN and e2e (about 1 minute) ✓
 ├── docs/
 │   ├── ffrdp-v1.md   protocol description: v1.0.0 / v1.1.0 / v1.2.0 in three parts (frame format, parameters, changes and rationale)
 │   ├── ffrdp-v2.md    the v2.0.0 description: interface (params / handles / events), handshake and teardown, multi-client, encryption callbacks, keepalive; §9 covers the v2.x improvements over v1.1.x
+│   ├── ffrdp-crypto.md     how to wire encryption in: the ENCRYPT/DECRYPT contract, the built-in ChaCha20 scheme (ffcrypto) and how an app must drive it, TLS over ffrdp with OpenSSL, and how to build/run test.c's `--key`
 │   ├── sim-test.md         how to use the differential simulation harness (tools/sim)
 │   ├── ffrdp-latency.md audio/video latency budget and tuning: the formula, numbers for slow/fast APs, the cost of loss, MTU and fragmentation, how to measure
 │   └── notes.md            development and debugging record (chronological, including the raw logs of every run)
@@ -341,6 +343,7 @@ void  ffrdp_dump  (void *ctxt, int clearhistory);     // print diagnostics
 | Contract test for the transport layer (packets / timers / wakeup) | `tools/test-lowlevel-udp.sh` (usage in §4) |
 | The v2.0.0 interface (params / handles / events / encryption callbacks / handshake and teardown / keepalive) | [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) (Chinese) |
 | v2.0.0's design trade-offs and boundary conditions (connection table / handle generation / half-open ceiling / encryption contract) | [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) (Chinese) |
+| **How to wire encryption in**: the `ENCRYPT`/`DECRYPT` contract and what it rules out, the built-in ChaCha20 scheme (`ffcrypto`, salt record, handle-not-an-index pitfall), TLS over ffrdp with OpenSSL, and `test.c --key` (build / CLI / expected output / reconnect regression) | [`docs/ffrdp-crypto.md`](docs/ffrdp-crypto.md) (Chinese) |
 | **A/V (H.265 / VBR) latency budget and tuning**: the formula, numbers for slow/fast APs, the cost of a loss, MTU and IP fragmentation, how to measure | [`docs/ffrdp-latency.md`](docs/ffrdp-latency.md) (Chinese) |
 | **v2.x improvements over v1.1.x** (with acceptance criteria, known limits, rejected routes and still-open directions) | [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) §9 (Chinese) |
 

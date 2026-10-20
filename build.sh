@@ -118,7 +118,12 @@ build_package()
     ${CROSS_COMPILE}gcc -c $CFLAGS socket.c
     ${CROSS_COMPILE}gcc -c $CFLAGS utils.c
     $AR rcs libffrdp.a ffrdp.o lowlevel-udp.o socket.o utils.o
-    ${CROSS_COMPILE}gcc $CFLAGS test.c libffrdp.a $LDFLAGS -o test_ffrdp
+    # 加密模块是**应用侧**的可选代码，刻意不进 libffrdp（库保持零依赖、且不知道密码学）：
+    #   · 后端可选：-DFFC_BACKEND=0 内置 ChaCha20（默认，零依赖）
+    #               -DFFC_BACKEND=1 OpenSSL   （切过去要自己加 -lcrypto 到 EXTRA_CFLAGS/LDFLAGS）
+    #               -DFFC_BACKEND=2 mbedTLS   （切过去要自己加 -lmbedcrypto）
+    #   · 不用加密的构建可以把它从命令行里删掉，不影响 test_ffrdp 的其它功能。
+    ${CROSS_COMPILE}gcc $CFLAGS test.c ffcrypto.c libffrdp.a $LDFLAGS -o test_ffrdp
     mkdir -p $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/include
     mkdir -p $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/lib/pkgconfig
     cp $TOPDIR/ffrdp.h     $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/include/

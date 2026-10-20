@@ -12,8 +12,9 @@
 #else
 #define TEST_HAVE_BACKTRACE 0   // mingw 没有 execinfo.h ⇒ 那一边不打栈（其余逻辑照旧 ✓）
 #endif
-#include "ffrdp.h"
 #include "utils.h"
+#include "ffrdp.h"
+#include "ffcrypto.h"   // 应用侧加密模块（可选：不给 --key 就完全走明文）
 
 #define TEST_VERSION            "1.1.0" // 与 build.sh 生成的 libffrdp.pc 里的 Version 保持一致
 #define TEST_DUMP_INTERVAL_MS   10000   // 每隔这么久打印一次诊断
@@ -56,10 +57,10 @@ static int msg_oh(void) { return TEST_MSG_OVERHEAD + (stamp_on() ? 4 : 0); }   /
 
 // 退出只有一条路：输入 quit/exit（或 stdin 结束）⇒ 收尾 + verify 汇总 + ffrdp_free；Ctrl+C 直接结束、看不到汇总（接受的代价）。
 static volatile int g_exit = 0;
-static char server_bind_ip[32]   = "0.0.0.0";
-static char client_cnnt_ip[32]   = "127.0.0.1";
-static int  server_bind_port     = 8000;
-static int  client_cnnt_port     = 8000;
+static char server_bind_ip[32] = "0.0.0.0";
+static char client_cnnt_ip[32] = "127.0.0.1";
+static int  server_bind_port   = 8000;
+static int  client_cnnt_port   = 8000;
 
 // ①-41 的两个应用侧旋钮（env ✓，默认 = 老行为 ✓）：
 //   TEST_APP_SENDRETRY：send 被拒后立刻重试几次（0 = 下一个循环再说，会白等一次 10ms 的 recv ✗）；
@@ -163,6 +164,153 @@ static int accept_pop(void)
     return h;
 }
 
+// ── 加密（可选：--key=<64 hex> / FFRDP_KEY）────────────────────────────────────
+// 一个 ffrdp 上下文一个实例。**同一进程可以既有 server 又有 client**（本程序就支持），
+// 两者的角色相反、方向密钥映射也相反 ⇒ 实例随 cbctx 传进回调，绝不能用全局的一份。
+//
+// 盐（每连接每方向 8 字节，明文）怎么走：发送方 ffc_set_salt(TX) 后把 8 字节作为该方向的
+// **第一批数据**发出去（模块原样放过、不解密）；接收方什么都不用做 —— 模块在第一次
+// ffc_crypt(RX) 时自己把这 8 字节读成盐，应用只需在读流时丢掉这 8 字节（rx_skip）。
+// 多客户端（1 camera + N monitor）必须这么做，否则 N 条连接共用同一段密钥流（two-time pad）。
+//
+// ⚠️ 下面所有数组的下标都是**密码槽**（0..TEST_MAX_LINK-1），**不是**连接句柄。
+//    句柄 = 代号 × FFRDP_MAXCONN + 槽号，槽位复用时代号 +1 ⇒ 句柄会变成 17、33…
+//    直接拿句柄当下标会越界（ffc_crypt 对越界是**静默不加密** ⇒ 线上明文、对端解出乱码，
+//    而且没有任何报错）。句柄 → 槽的映射见 crypto_slot_get()。
+typedef struct {
+    FFC_CTX *fc;                           // NULL = 不加密（线上明文，行为与改造前逐字相同）
+    pthread_mutex_t lock;                  // 保护下面两张表：回调和 link 线程都会碰
+    uint8_t  used        [TEST_MAX_LINK];  // 1 = 该槽在用
+    int      hnd         [TEST_MAX_LINK];  // 该槽当前对应的句柄（-1 = 空）
+    uint8_t  rx_need_salt[TEST_MAX_LINK];  // 1 = 还没通知读流侧"要丢 8 字节盐"
+    uint8_t  rx_skip     [TEST_MAX_LINK];  // 读流时要丢弃的字节数（= 盐长度）
+} TEST_CRYPTO;
+
+static uint8_t g_key[FFC_KEY_LEN];
+static int     g_key_set = 0;
+
+// 盐只要求**唯一**，不要求不可预测（它是 nonce，不是密钥）：时间 + pid + 地址混一下即可。
+static void salt_make(uint8_t out[FFC_SALT_LEN])
+{
+    static uint32_t s;
+    if (!s) s = get_timestamp32_ms() ^ ((uint32_t)getpid() << 16) ^ (uint32_t)(uintptr_t)&s;
+    for (int i = 0; i < (int)FFC_SALT_LEN; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        out[i] = (uint8_t)(s >> 8);
+    }
+}
+
+static void crypto_init(TEST_CRYPTO *cr, int is_server)
+{
+    memset(cr, 0, sizeof(*cr));
+    pthread_mutex_init(&cr->lock, NULL);
+    for (int i = 0; i < TEST_MAX_LINK; i++) { cr->hnd[i] = -1; cr->rx_need_salt[i] = 1; }
+    if (g_key_set) {
+        cr->fc = ffc_new(g_key, is_server);
+        if (!cr->fc) printf("✗ ffc_new failed -- falling back to plaintext\n");
+    }
+}
+
+// 排查用（TEST_CRYPTO_DBG=1）：把"句柄 → 槽 / 盐 / 丢字节"打到 stderr。
+// 加密接错时的表现只有"crc/len 错"，没有这张轨迹就只能猜是哪一端、哪条连接先错位的。
+static int cdbg_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TEST_CRYPTO_DBG") ? 1 : 0;
+    return on;
+}
+#define CDBG(...) do { if (cdbg_on()) { fprintf(stderr, __VA_ARGS__); fflush(stderr); } } while (0)
+
+// ── 句柄 → 密码槽 ─────────────────────────────────────────────────────────────
+// 为什么需要这张表：句柄 = 代号 × FFRDP_MAXCONN + 槽号，**同一个槽被复用时代号 +1**
+// （ffrdp.h 的"槽位回收、句柄不复活"）⇒ 重连后句柄是 17、33…，拿它当数组下标必然越界。
+// 加锁的原因：DECRYPT / ACCEPT / DISCONN 在协议线程（持 ffrdp->lock），收发在 link 线程。
+// 锁序：回调里是 ffrdp->lock → cr->lock；link 线程只短暂拿 cr->lock，且**不在**锁内调 ffrdp_*
+//       ⇒ 不存在反向拿锁，不会死锁。
+static int crypto_slot_get(TEST_CRYPTO *cr, int handle)   // 查；没有就分配。-1 = 不加密 / 槽满
+{
+    int i, s = -1;
+    if (!cr || !cr->fc || handle < 0) return -1;
+
+    pthread_mutex_lock(&cr->lock);
+    for (i = 0; i < TEST_MAX_LINK; i++) if (cr->used[i] && cr->hnd[i] == handle) { s = i; break; }
+    if (s < 0) {
+        for (i = 0; i < TEST_MAX_LINK; i++) if (!cr->used[i]) { s = i; break; }
+        if (s >= 0) {
+            cr->used[s] = 1; cr->hnd[s] = handle;
+            cr->rx_need_salt[s] = 1; cr->rx_skip[s] = 0;
+            ffc_drop(cr->fc, s);       // 这个槽可能被上一条连接用过 ⇒ 清掉它的密钥流
+            CDBG("[crypto] alloc handle=%d -> slot=%d\n", handle, s);
+        } else {
+            static int warned;
+            if (!warned) { warned = 1; printf("✗ crypto slots exhausted (%d) -- further connections run in PLAINTEXT\n", TEST_MAX_LINK); }
+        }
+    }
+    pthread_mutex_unlock(&cr->lock);
+    return s;
+}
+
+static void crypto_slot_drop(TEST_CRYPTO *cr, int handle)  // 连接断开：清密钥流 + 还槽
+{
+    int i, s = -1;
+    if (!cr || !cr->fc || handle < 0) return;
+
+    pthread_mutex_lock(&cr->lock);
+    for (i = 0; i < TEST_MAX_LINK; i++) if (cr->used[i] && cr->hnd[i] == handle) { s = i; break; }
+    if (s >= 0) {
+        ffc_drop(cr->fc, s);
+        cr->used[s] = 0; cr->hnd[s] = -1;
+        cr->rx_need_salt[s] = 1; cr->rx_skip[s] = 0;
+        CDBG("[crypto] free  handle=%d slot=%d\n", handle, s);
+    }
+    pthread_mutex_unlock(&cr->lock);
+}
+
+static void crypto_rx_first(TEST_CRYPTO *cr, int s)   // 该方向第一帧：通知读流侧丢 8 字节盐
+{
+    if (!cr || s < 0) return;
+    pthread_mutex_lock(&cr->lock);
+    if (cr->rx_need_salt[s]) {
+        cr->rx_need_salt[s] = 0; cr->rx_skip[s] = FFC_SALT_LEN;
+        CDBG("[crypto] rx-first slot=%d -> skip %d\n", s, (int)FFC_SALT_LEN);
+    }
+    pthread_mutex_unlock(&cr->lock);
+}
+
+static int crypto_rx_skip(TEST_CRYPTO *cr, int s, int n)   // 取"这次要丢几字节"并扣减
+{
+    int d = 0;
+    if (!cr || s < 0 || n <= 0) return 0;
+    pthread_mutex_lock(&cr->lock);
+    if (cr->rx_skip[s] > 0) {
+        d = cr->rx_skip[s] < n ? (int)cr->rx_skip[s] : n;
+        cr->rx_skip[s] = (uint8_t)(cr->rx_skip[s] - d);
+    }
+    pthread_mutex_unlock(&cr->lock);
+    return d;
+}
+
+// "--key=<64 个十六进制字符>" / FFRDP_KEY：不设 ⇒ 不加密。返回 0 = 解析成功
+static int key_parse_hex(const char *hex, uint8_t out[FFC_KEY_LEN])
+{
+    int n = 0;
+    if (!hex) return -1;
+    while (*hex == ' ' || *hex == '\t') hex++;
+    if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) hex += 2;
+    while (*hex && n < FFC_KEY_LEN) {
+        int hi, lo, a, b;
+        if (*hex == ':' || *hex == '-' || *hex == ' ') { hex++; continue; }
+        a = *hex; b = hex[1];
+        hi = (a >= '0' && a <= '9') ? a - '0' : (a >= 'a' && a <= 'f') ? a - 'a' + 10 : (a >= 'A' && a <= 'F') ? a - 'A' + 10 : -1;
+        lo = (b >= '0' && b <= '9') ? b - '0' : (b >= 'a' && b <= 'f') ? b - 'a' + 10 : (b >= 'A' && b <= 'F') ? b - 'A' + 10 : -1;
+        if (hi < 0 || lo < 0) return -1;
+        out[n++] = (uint8_t)((hi << 4) | lo);
+        hex += 2;
+    }
+    while (*hex == ' ' || *hex == '\t') hex++;
+    return (n == FFC_KEY_LEN && *hex == 0) ? 0 : -1;
+}
+
 // ── 断开原因（FFRDP_DISCONN 的 ev->code）──────────────────────────────────────
 // 为什么必须在这里记 ✗：对端发 FIN 干净关闭之后，协议**当场回收句柄** ⇒ link 线程随后调
 // `ffrdp_isdead(handle)` 走的是"句柄无效 = 已断"那条路，返回 1 —— 与 keepalive 超时判死**完全同形**，
@@ -209,7 +357,26 @@ static const char *disc_name(int code)
 
 static long on_event(void *cbctx, const FFRDP_EVENT *ev)
 {
-    (void)cbctx;
+    TEST_CRYPTO *cr = (TEST_CRYPTO*)cbctx;
+    // 加密/解密（原地改、等长）——回调在协议锁里跑 ⇒ 只做变换，绝不回调 ffrdp_* ✓
+    if (ev->type == FFRDP_ENCRYPT) {
+        if (!cr || !cr->fc) return FFRDP_NOT_CONSUMED;
+        int s = crypto_slot_get(cr, ev->conn);   // 句柄 → 密码槽（和 DECRYPT 同一张表）
+        if (s >= 0) ffc_crypt(cr->fc, s, FFC_TX, ev->buf, ev->len);
+        return FFRDP_NOT_CONSUMED;
+    }
+    if (ev->type == FFRDP_DECRYPT) {
+        if (!cr || !cr->fc) return FFRDP_NOT_CONSUMED;
+        // 句柄 → 密码槽（**不能**拿句柄当下标：槽位复用后句柄会变成 17、33…）
+        int s = crypto_slot_get(cr, ev->conn);
+        if (s >= 0) {
+            // 该方向最前面的 8 字节明文盐是**模块自己**从流里读的（原样放过、不解密），这里只管
+            // 通知读流侧把这 8 字节丢掉。绝不能再 ffc_set_salt(RX)：那会多跳 8 字节 ⇒ 全乱。
+            crypto_rx_first(cr, s);
+            ffc_crypt(cr->fc, s, FFC_RX, ev->buf, ev->len);
+        }
+        return FFRDP_NOT_CONSUMED;
+    }
     if (ev->type == FFRDP_ACCEPT) {
         pthread_mutex_lock(&g_accept_lock);
         if (g_accept_qn < TEST_MAX_LINK) g_accept_q[g_accept_qn++] = ev->conn;
@@ -223,6 +390,10 @@ static long on_event(void *cbctx, const FFRDP_EVENT *ev)
         pthread_mutex_unlock(&g_accept_lock);
         printf("accept ok: handle %d\n", ev->conn); fflush(stdout);
     } else if (ev->type == FFRDP_DISCONN) {
+        // 加密状态跟着连接走：不清的话，重连后会带着上一个连接的密钥流偏移继续跑
+        // ⇒ 从第一条数据起就是乱码（而且没有任何报错）。
+        // 这里同时把密码槽还掉（句柄随连接一起失效 ⇒ 新连接会拿到新的槽/新的句柄）。
+        crypto_slot_drop(cr, ev->conn);
         disc_note(ev->conn, ev->code);   // 普通跑法只记账、不打印（日志量与以前一致 ✓）
         if (g_do_close || g_idle_sec) {  // 两个验收模式下才打印
             printf("DISCONN: handle %d -- %s (code %d)\n", ev->conn, disc_name(ev->code), ev->code);
@@ -448,6 +619,7 @@ struct link_arg {
     int             is_server;
     int             owns_ctx;
     int             slot;        // 在服务端的 links[] 里占的名额（跑完要还 ✓）；栈上的那两条不用 ✓
+    TEST_CRYPTO    *cr;          // 本端的加密实例（NULL = 不加密）
 };
 
 static int link_loop(struct link_arg *a)
@@ -479,6 +651,23 @@ static int link_loop(struct link_arg *a)
         goto done;
     }
 
+    // 加密：本方向第一次发送前，先把 8 字节盐（明文）发出去 —— 之后的数据才走 ffc_crypt。
+    // 盐没被接受之前**一条数据都不发**：否则盐就不是这个方向字节流的最前面 8 字节了，
+    // 对端从第一帧起就会解错（而且没有任何报错，只表现为花屏/校验失败）。
+    int      tx_salt_left = 0;
+    uint8_t  tx_salt[FFC_SALT_LEN];
+    if (a->cr && a->cr->fc && !g_recv_only) {
+        int s = crypto_slot_get(a->cr, handle);          // 句柄 → 密码槽，别用句柄当下标
+        if (s >= 0) {
+            salt_make(tx_salt);
+            ffc_set_salt(a->cr->fc, s, FFC_TX, tx_salt);
+            tx_salt_left = FFC_SALT_LEN;
+            CDBG("[crypto] TX salt handle=%d slot=%d %02x%02x%02x%02x%02x%02x%02x%02x\n",
+                 handle, s, tx_salt[0], tx_salt[1], tx_salt[2], tx_salt[3],
+                 tx_salt[4], tx_salt[5], tx_salt[6], tx_salt[7]);
+        }
+    }
+
     tick_dump  = get_timestamp32_ms();
     tick_recv  = tick_dump;   // 还没收到过数据 ⇒ 从这一刻起算
     tick_speed = tick_dump;
@@ -496,8 +685,14 @@ static int link_loop(struct link_arg *a)
             }
         }
 
+        // 盐先走（不等待：被拒就下一轮再试，数据一条都不许越过它）
+        if (tx_salt_left > 0) {
+            int n = ffrdp_send(ffrdp, handle, (char*)tx_salt, tx_salt_left, 0);
+            if (n == tx_salt_left) tx_salt_left = 0;
+        }
+
         // ①-22：这个开关要放在"造消息"**之前** ✓（原来放后面 ⇒ 进循环体时 msg_len 已 >0 ⇒ 一次都不跑 ✗，实测踩过 ✓）。
-        if (!g_idle_sec && !g_recv_only && g_app_burst > 1) {
+        if (!g_idle_sec && !g_recv_only && g_app_burst > 1 && tx_salt_left == 0) {
             int k;
             for (k = 1; k < g_app_burst && !g_exit && msg_len == 0; k++) {
                 int room = 1, maxp = send_max - oh;
@@ -537,7 +732,7 @@ static int link_loop(struct link_arg *a)
             if (msg_len > 0) { tick_msg_first = get_timestamp32_ms(); msg_retries = 0; }   // 只读（§26.30 ①-①）：新一条的起点 ✓
         }
 
-        if (msg_len > 0) {
+        if (msg_len > 0 && tx_salt_left == 0) {
             // 传 0（不等待）：这个测试的背压方式是"被拒就下一轮原样重试"，节拍由那次带超时的 recv 提供 ✓。
             msg_stamp(sendbuf, msg_len);                    // A1：每次尝试前刷新 ⇒ 不含"被拒后干等"的那段 ✓
             ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, app_sendwait_get());
@@ -579,6 +774,16 @@ static int link_loop(struct link_arg *a)
                 if (ret > 0) { rd_n++; rd_us += d; } else { re_n++; re_us += d; }
             }
             if (ret > 0) {
+                // 这个方向最前面的 8 字节是明文盐（解密已在 DECRYPT 回调里做完）⇒ 读流时要丢掉，
+                // 否则 msg_parse 会把盐当成消息头（表现为 crc/length 错乱）。
+                // 注意：rx_skip 用**密码槽**索引（句柄不是下标 ⇒ 见 crypto_slot_get）。
+                {
+                    int d = crypto_rx_skip(a->cr, crypto_slot_get(a->cr, handle), ret);
+                    if (d > 0) {
+                        memmove((char*)stream + stream_len, (char*)stream + stream_len + d, (size_t)(ret - d));
+                        ret -= d;
+                    }
+                }
                 stream_len += ret;
                 if (connected == 0) {
                     connected = 1;
@@ -787,6 +992,9 @@ static void* peer_thread(void *param)
     pthread_t links[TEST_MAX_LINK];
     int live[TEST_MAX_LINK] = {0};   // 固定槽位：1 = 这一格有线程在跑（**不挪动** ⇒ link_arg.slot 永远对得上 ✓）
     int nlink = 0, i;
+    // 本端的加密实例（同进程的 server/client 各一份：角色相反 ⇒ 方向密钥映射相反）
+    TEST_CRYPTO cr;
+    crypto_init(&cr, peer->is_server);
 
     while (!g_exit) {
         if (!ffrdp) {
@@ -801,7 +1009,7 @@ static void* peer_thread(void *param)
                          (hs && *hs) ? (atoi(hs) ? ",hs:1" : ",hs:0") : "");
                 printf("%s ffrdp_init: %s\n", peer->name, params);   // 排查用：实际配置进日志 ✓
                 fflush(stdout);
-                ffrdp = ffrdp_init(params, on_event, NULL);
+                ffrdp = ffrdp_init(params, on_event, &cr);   // cbctx = 本端的加密实例
             }
             if (!ffrdp) { usleep(100 * 1000); continue; }
         }
@@ -810,6 +1018,7 @@ static void* peer_thread(void *param)
             // 客户端：只有主连接（handle 0 ✓）⇒ 直接在本线程里跑 ✓
             struct link_arg a;
             a.ffrdp = ffrdp; a.handle = 0; a.peer = peer; a.is_server = 0; a.owns_ctx = 1;
+            a.slot = -1; a.cr = &cr;
             // ⚠️ owns_ctx=1 ⇒ link_loop 自己已经 ffrdp_exit ⇒ 这里**绝不能再退一次**（再退一次会在进程退出时 SIGSEGV ✗）。
             link_loop(&a);
             ffrdp = NULL;
@@ -821,6 +1030,7 @@ static void* peer_thread(void *param)
         if (!g_use_hs) {
             struct link_arg a;
             a.ffrdp = ffrdp; a.handle = 0; a.peer = peer; a.is_server = 1; a.owns_ctx = 1;
+            a.slot = -1; a.cr = &cr;
             link_loop(&a);                          // 同上：exit 由它负责 ✓
             ffrdp = NULL;
             if (g_exit) break;
@@ -836,7 +1046,7 @@ static void* peer_thread(void *param)
                 struct link_arg *a = (struct link_arg*)malloc(sizeof(*a));
                 if (a) {
                     a->ffrdp = ffrdp; a->handle = h; a->peer = peer; a->is_server = 1; a->owns_ctx = 0;
-                    a->slot = i; g_link_done[i] = 0;
+                    a->slot = i; a->cr = &cr; g_link_done[i] = 0;
                     if (pthread_create(&links[i], NULL, link_thread, a) == 0) { live[i] = 1; nlink++; }
                     else free(a);
                 }
@@ -856,6 +1066,7 @@ static void* peer_thread(void *param)
         pthread_mutex_lock(&g_mutex); ffrdp_dump(ffrdp, -1, 0); pthread_mutex_unlock(&g_mutex);
         ffrdp_exit(ffrdp);             // 只有"上下文还开着"的那条路才需要退 ✓
     }
+    if (cr.fc) { ffc_free(cr.fc); cr.fc = NULL; }   // 协议线程已停 ⇒ 之后不会再有回调 ✓
     return NULL;
 }
 
@@ -936,7 +1147,24 @@ int main(int argc, char *argv[])
         } else if (strstr(argv[i], "--dump_ms=") == argv[i]) {
             g_dump_ms = atoi(argv[i] + 10);
             if (g_dump_ms < 100) g_dump_ms = 100;   // 再小就是自残：一次 dump 要遍历全表 ✗
+        } else if (strstr(argv[i], "--key=") == argv[i]) {
+            if (key_parse_hex(argv[i] + 6, g_key) != 0) {
+                printf("✗ --key= must be 64 hex chars (32 bytes); encryption stays off\n");
+            } else g_key_set = 1;
         }
+    }
+    {   // 环境变量形式（脚本里方便）：FFRDP_KEY=<64 hex>；命令行给了就以命令行为准
+        const char *ke = getenv("FFRDP_KEY");
+        if (!g_key_set && ke && *ke) {
+            if (key_parse_hex(ke, g_key) != 0) printf("✗ FFRDP_KEY must be 64 hex chars (32 bytes); encryption stays off\n");
+            else g_key_set = 1;
+        }
+    }
+    if (g_key_set) {
+        int st = ffc_selftest();
+        printf("encryption          : on, backend %s, selftest %s\n",
+               ffc_backend(), st ? "FAILED (do not trust the numbers below)" : "ok");
+        if (st) g_key_set = 0;   // 实现自检不过就别加密：宁可明文，也别发出一堆对端解不开的字节
     }
 
     strtok_r(server_bind_ip, ":", &str); if (str && *str) server_bind_port = atoi(str);

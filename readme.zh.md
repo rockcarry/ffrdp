@@ -213,6 +213,7 @@ QUICK=1 bash tools/check.sh      # 跳过 ASAN 与 e2e（约 1 分钟）✓
 ├── socket.c / socket.h     socket 薄封装（初始化、选项、超时、非阻塞）
 ├── utils.c / utils.h       时间戳、线程 setname/getname、模块线程状态机
 ├── test.c                  测试程序（服务端/客户端共用一个参数化的对等端循环 + 每 10 秒 dump）
+├── ffcrypto.c / ffcrypto.h 给 ENCRYPT/DECRYPT 回调用的**参考加密实现**（ChaCha20，零依赖；刻意**不进** libffrdp —— 见 [`docs/ffrdp-crypto.md`](docs/ffrdp-crypto.md)）
 ├── test.sh                 **真机 A/B 对测脚本**（上传 → 远端服务端 → 本地客户端 → 收日志 → 出摘要；用法见 §四）
 ├── build.sh                构建脚本（静态库 + 测试程序 + pkg-config）
 ├── readme.md               本文件的**英文版**（GitHub 默认显示 ✓；与中文版同步维护 ✓）
@@ -221,6 +222,7 @@ QUICK=1 bash tools/check.sh      # 跳过 ASAN 与 e2e（约 1 分钟）✓
 ├── docs/
 │   ├── ffrdp-v1.md   协议说明：v1.0.0 / v1.1.0 / v1.2.0 三部分（帧格式、参数、改动与依据）
 │   ├── ffrdp-v2.md    v2.0.0 说明：接口（params / 句柄 / 事件）、握手与四次挥手、多客户端、加密回调、keepalive；§九 v2.x 相对 v1.1.x 的协议改进
+│   ├── ffrdp-crypto.md     加密接入指南：ENCRYPT/DECRYPT 契约与取舍、内置 ChaCha20 方案（ffcrypto）与上层写法、TLS 架在 ffrdp 之上（OpenSSL）、test.c 的 `--key` 怎么编怎么跑
 │   ├── sim-test.md         差分仿真工具（tools/sim）使用说明
 │   ├── ffrdp-latency.md 音视频延迟预算与调优：公式、慢/快 AP 的数字、丢包代价、MTU/分片、怎么量
 │   └── notes.md            开发与调试记录（按时间顺序，含每次上机的原始 log）
@@ -283,6 +285,7 @@ void  ffrdp_dump  (void *ctxt, int clearhistory);     // 打印诊断
 | 传输层（收发包 / 定时器 / 唤醒）的契约测试 | `tools/test-lowlevel-udp.sh`（用法见 §四）|
 | v2.0.0 的接口（params / 句柄 / 事件 / 加密回调 / 握手与挥手 / keepalive）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |
 | v2.0.0 的设计取舍与边界条件（连接表 / 句柄代号与槽位回收 / 半开上限 / 加密约定）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |
+| **加密怎么接**：`ENCRYPT`/`DECRYPT` 契约与它排除了什么、内置 ChaCha20 方案（`ffcrypto`：盐记录、句柄不是下标）、TLS 架在 ffrdp 之上（OpenSSL 代码骨架）、`test.c --key`（编译 / 命令行 / 期望输出 / 重连回归）| [`docs/ffrdp-crypto.md`](docs/ffrdp-crypto.md) |
 | **音视频（H.265 / VBR）延迟预算与调优**：延迟公式、慢/快 AP 的数字、丢包代价、MTU 与 IP 分片、怎么量 | [`docs/ffrdp-latency.md`](docs/ffrdp-latency.md) |
 | **v2.x 相对 v1.1.x 的协议改进**（含验收口径、已知边界、已否路线与仍开放方向）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) §九 |
 
