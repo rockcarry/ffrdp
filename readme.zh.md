@@ -186,12 +186,16 @@ column -s, -t logs/summary.csv | tail -10     # 摘要表
 **一条命令跑完全部判据**（改协议后先跑它 ✓，尤其适合性能优化那种改动 ✓）：
 
 ```bash
-bash tools/check.sh              # 编译 + 仿真(14 测试/3 场景组) + ASAN + 本机两进程四条路径 + v1 互通
-QUICK=1 bash tools/check.sh      # 跳过 ASAN 与 e2e（约 1 分钟）✓
+bash tools/check.sh              # 编译 + 仿真(15 测试/3 场景组) + ASAN + 本机两进程八条路径 + v1 互通
+QUICK=1 bash tools/check.sh      # 跳过 ASAN / e2e / 加密那三格（约 1 分钟）✓
 ```
 - 六步：真机口径 `build.sh` ✓、仿真默认模型（HEAD 与工作区逐条对照 ✓）、仿真 **ASAN** ✓、
-  本机两进程（默认 / `FFRDP_HS=0` 老路径 / `FFRDP_IDLE=1 FFRDP_CLOSE=1` 空闲+挥手 / 多客户端 ✓）、
+  本机两进程（默认 / `FFRDP_HS=0` 老路径 / `FFRDP_IDLE=1 FFRDP_CLOSE=1` 空闲+挥手 / 逐消息延迟 / 多客户端 /
+  **加密**（`FFRDP_KEY`，ChaCha20）/ **加密 + 多客户端** / **加密 + 重连 3 次** ✓）、
   **v1 互通**（`hs:0` 两个方向必须通、默认 `hs:1` 必须不通 ✓）；
+- 加密那三格的判据不只是"两侧 `verify OK`"✓ —— 还必须确认**两端真的开着加密**（`encryption : on, … selftest ok`）、
+  以及重连后**每条连接**都 `crc_err 0 / len_err 0` ✓。原因见 [`docs/ffrdp-crypto.md`](docs/ffrdp-crypto.md) §4.7：
+  句柄不是数组下标，接错时的表现是"第一条连接好、重连之后全乱"，而服务端 `verify` 照样全绿 ⇒ 只看 `verify` 会假绿 ✗；
 - 全绿 exit 0，任何一项红 exit 1 ⇒ 可直接挂 `pre-push` 或流水线 ✓；日志在 `logs/check-<时间戳>/` ✓。
   （本地仍用第 1 个参数，远端用 `REMOTE_BIN` ✓ —— 用来分辨"某个方向被掐"是本地发送还是对端确认的问题 ✓）；
 - 其它开关：`DUR` / `PORT` / `LOGDIR` ✓、`CLIENTS=N`（本地起 N 个客户端打同一个服务端 ⇒ 验多客户端 ✓；上限 = 服务端 `maxconn` − 1 ✓）、`CPUWATCH=1`（采样客户端 CPU ✓）、`PINGWATCH=1`（整轮 1 秒一次 ping 对端 ⇒ 把链路本身量成 min/avg/max + 丢包 ✓，用来分辨"退化是代码还是链路"✓）、`CLEAN=1`（跑完清远端 ✓）、`DRY=1`（只打印计划、不碰网络 ✓）、`FFRDP_IDLE=1` / `FFRDP_CLOSE=1`（空闲与挥手验收 ✓）、`V1_REF=<v1 二进制>`（本地跑 v2 ↔ v1.2.x 互通矩阵 ✓，见 §二的兼容性）；
@@ -281,7 +285,7 @@ void  ffrdp_dump  (void *ctxt, int clearhistory);     // 打印诊断
 | 帧格式、mack、FEC、RTO 计算、通信流程 | [`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) 第一部分（v1.0.0）|
 | 每个改动的动机、被否掉的路线、当时的上机原始 log | [`docs/notes.md`](docs/notes.md) |
 | 没有真机时怎么验证"没有回归" | [`docs/sim-test.md`](docs/sim-test.md) |
-| **一条命令跑完所有判据**（编译 / 仿真 / ASAN / 本机两进程四条路径 / v1 互通）| `tools/check.sh`（用法见 §四）|
+| **一条命令跑完所有判据**（编译 / 仿真 / ASAN / 本机两进程八条路径，含加密与重连 / v1 互通）| `tools/check.sh`（用法见 §四）|
 | 传输层（收发包 / 定时器 / 唤醒）的契约测试 | `tools/test-lowlevel-udp.sh`（用法见 §四）|
 | v2.0.0 的接口（params / 句柄 / 事件 / 加密回调 / 握手与挥手 / keepalive）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |
 | v2.0.0 的设计取舍与边界条件（连接表 / 句柄代号与槽位回收 / 半开上限 / 加密约定）| [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) |

@@ -3,16 +3,19 @@
 #
 #   用法:
 #     bash tools/check.sh                 # 全量（含 ASAN 与 e2e 两组；几分钟 ✓）
-#     QUICK=1 bash tools/check.sh         # 只跑快的那部分（跳过 ASAN 与 e2e ✓；约 1 分钟）
+#     QUICK=1 bash tools/check.sh         # 只跑快的那部分（跳过 ASAN / e2e / 加密那几格 ✓；约 1 分钟）
 #     REBUILD_REF=1 bash tools/check.sh   # 强制重建 v1 参考二进制（默认：没有才建 ✓）
 #     V1_REF=/path/to/v1_bin bash tools/check.sh    # 用指定的 v1 参考（不自动建 ✓）
 #     KEEP=1 bash tools/check.sh          # 保留临时 worktree（默认清理 ✓）
+#     CRYPTO_KEY=<64 hex> bash tools/check.sh       # 换掉加密那几格的 PSK（默认内置一把测试密钥 ✓）
 #
 #   结果: 全绿 exit 0；任何一项红 exit 1 ✓；明细日志在 logs/check-<时间戳>/
 #
-#   为什么要有它: 改协议（尤其**性能优化**那种改动 ✓）最容易在三处悄悄退步 ——
+#   为什么要有它: 改协议（尤其**性能优化**那种改动 ✓）最容易在四处悄悄退步 ——
 #     · 老路径（hs:0）行为 ✗   · 内存安全（只有 ASAN 会露 ✗）   · v1 互通 ✗
-#   这三样都不会在"跑一下看看吞吐"里露出来 ✓，所以把六步串成一条命令 ✓，挂 pre-push 或流水线 ✓。
+#     · 加密接线（句柄 / 盐）✗：句柄不是数组下标、盐必须每条连接每个方向各一个；
+#       接错的典型表现是"第一条连接好、重连之后全乱"，而**明文跑永远看不出来** ✗
+#   这四样都不会在"跑一下看看吞吐"里露出来 ✓，所以把六步串成一条命令 ✓，挂 pre-push 或流水线 ✓。
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,6 +30,8 @@ REF_BRANCH="${REF_BRANCH:-v1.2.x}"
 REF_WT="${REF_WT:-/tmp/check-v1ref}"
 REF_CACHE="${REF_CACHE:-$ROOT/logs/v1ref-$(basename "$REF_BRANCH").bin}"
 KEEP="${KEEP:-0}"
+# 加密那几格用的 PSK（32 字节 = 64 hex）。只是测试用的一把常量密钥 ✓，不是秘密。
+CRYPTO_KEY="${CRYPTO_KEY:-00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff}"
 mkdir -p "$OUT"
 
 FAILS=0
@@ -111,11 +116,11 @@ else
     fi
 fi
 
-# ── 4 本机两进程：四条路径 ──────────────────────────────────────────────────
-step "4/6 本机两进程·真 socket（默认 / 老路径 / 空闲+挥手 / 多客户端）"
+# ── 4 本机两进程：真 socket ─────────────────────────────────────────────────
+step "4/6 本机两进程·真 socket（默认 / 老路径 / 空闲+挥手 / 多客户端 / 加密 / 重连）"
 PAIR_OK=1; PAIR_NOTE=""
 
-pair_run() {   # $1=标签（只给人看 ✓）$2=env $3=期望(通|空闲) $4=端口
+pair_run() {   # $1=标签（只给人看 ✓）$2=env $3=期望(通|空闲) $4=端口 $5=1 ⇒ 还要求两端真的开着加密
     # 文件名里只放 ASCII ✓：标签里的中文进文件名会让 `for f in $(ls "$OUT"/*)` 断掉 ✗
     # （2026-10-14 实测：日志目录里出现 pair_空闲挥手_client.log 之类 ✓）。
     case "$1" in
@@ -123,9 +128,10 @@ pair_run() {   # $1=标签（只给人看 ✓）$2=env $3=期望(通|空闲) $4=
         老路径)   slug=legacy_hs0 ;;
         空闲挥手) slug=idle_close ;;
         延迟量具) slug=latency ;;
+        加密)     slug=crypto ;;
         *)        slug=pair ;;
     esac
-    local tag="$1" envs="${2:-}" want="$3" P="$4" sp rc cs ss
+    local tag="$1" envs="${2:-}" want="$3" P="$4" crypto="${5:-0}" sp rc cs ss
     pkill -f "test_ffrdp --server=127.0.0.1:$P" 2>/dev/null
     ( sleep 14; echo quit ) | timeout 40 env $envs stdbuf -oL ./test_ffrdp --server=127.0.0.1:$P > "$OUT/pair_${slug}_server.log" 2>&1 &
     sp=$!
@@ -139,6 +145,14 @@ pair_run() {   # $1=标签（只给人看 ✓）$2=env $3=期望(通|空闲) $4=
     if [ "$want" = "通" ]; then
         { [ "$cs" = 1 ] && [ "$ss" = 1 ] && [ "${rc:-1}" = 0 ]; } || PAIR_OK=0
         PAIR_NOTE="两侧 verify OK=${cs}/${ss}，客户端 rc=$rc"
+        # 加密格额外要求：两端启动都打了 `encryption : on` 且自检 ok ✓。
+        # 少了这条，`ffc_new` 失败 / 自检不过时程序会**静默退回明文**，verify 照样全绿 ✗ ⇒ 假绿 ✗。
+        if [ "$crypto" = 1 ]; then
+            local on
+            on=$(cat "$OUT/pair_${slug}_"*.log 2>/dev/null | grep -c 'encryption *: on,.*selftest ok' || true)
+            [ "${on:-0}" = 2 ] || PAIR_OK=0
+            PAIR_NOTE="$PAIR_NOTE；encryption on + selftest ok 的进程 ${on:-0}/2"
+        fi
     else
         grep -q 'idle mode *: on' "$OUT/pair_${slug}_client.log" 2>/dev/null || PAIR_OK=0
         grep -q 'close: peer FIN received' "$OUT/pair_${slug}_client.log" 2>/dev/null || PAIR_OK=0
@@ -167,25 +181,86 @@ else
     row "两进程：TEST_STAMP=1（逐消息延迟量具）" FAIL "$PAIR_NOTE（见 $OUT/pair_latency_*.log）"
 fi
 
-MC=3; MCP=$((PORT+3)); MC_PIDS=""
-pkill -f "test_ffrdp --server=127.0.0.1:$MCP" 2>/dev/null
-( sleep 16; echo quit ) | timeout 45 stdbuf -oL ./test_ffrdp --server=127.0.0.1:$MCP > "$OUT/mc_server.log" 2>&1 &
-MSP=$!
-sleep 1
-mci=1
-while [ "$mci" -le "$MC" ]; do
-    ( sleep 10; echo quit ) | timeout 45 stdbuf -oL ./test_ffrdp --client=127.0.0.1:$MCP > "$OUT/mc_client$mci.log" 2>&1 &
-    MC_PIDS="$MC_PIDS $!"
-    mci=$((mci+1))
-done
-for p in $MC_PIDS; do wait "$p" 2>/dev/null; done
-wait $MSP 2>/dev/null
-mc_srv=$(grep -c 'verify: OK' "$OUT/mc_server.log" 2>/dev/null || true)
-mc_cli=$(cat "$OUT"/mc_client*.log 2>/dev/null | grep -c 'verify: OK' || true)
-if [ "$mc_srv" = "$MC" ] && [ "${mc_cli:-0}" = "$MC" ]; then
-    row "两进程：多客户端 1×$MC" PASS "服务端 $mc_srv 条 link 各自 verify OK ✓；各客户端也都 OK ✓"
+# 4c) 加密：ENCRYPT / DECRYPT 回调 + ffcrypto（接入方式见 docs/ffrdp-crypto.md）。
+#     判据除了"两侧 verify OK"，还要求两端**真的**开着加密（pair_run 的第 5 个参数 ✓）：
+#     `ffc_new` 失败或自检不过时程序会**静默退回明文**，verify 照样全绿 ✗ ⇒ 只看 verify 就是假绿 ✗。
+if [ "$QUICK" = 1 ]; then
+    row "两进程：加密（FFRDP_KEY）" SKIP "QUICK=1"
 else
-    row "两进程：多客户端 1×$MC" FAIL "服务端 verify OK=$mc_srv（要 $MC ✗）；客户端 OK=${mc_cli:-0}（要 $MC ✗）"
+    pair_run "加密" "FFRDP_KEY=$CRYPTO_KEY" "通" "$((PORT+5))" 1
+    [ "$PAIR_OK" = 1 ] && row "两进程：加密（FFRDP_KEY，ChaCha20）" PASS "$PAIR_NOTE" \
+                       || row "两进程：加密（FFRDP_KEY）" FAIL "$PAIR_NOTE（见 $OUT/pair_crypto_*.log）"
+fi
+
+# 多客户端：`env` 一栏同时用来挂 FFRDP_KEY ⇒ 顺带覆盖"每条连接每个方向各一个盐"。
+# 共用一段密钥流就是 two-time pad ✗，而 verify 依旧是绿的 ⇒ 只能靠"加密真的开着"这条盯着。
+mc_run() {   # $1=标签 $2=slug $3=env $4=客户端数 ⇒ 设 MC_SRV / MC_CLI
+    local slug="$2" envs="${3:-}" n="$4" MCP=$((PORT+3)) MSP pids="" i=1
+    pkill -f "test_ffrdp --server=127.0.0.1:$MCP" 2>/dev/null
+    ( sleep 16; echo quit ) | timeout 45 env $envs stdbuf -oL ./test_ffrdp --server=127.0.0.1:$MCP > "$OUT/mc_${slug}_server.log" 2>&1 &
+    MSP=$!
+    sleep 1
+    while [ "$i" -le "$n" ]; do
+        ( sleep 10; echo quit ) | timeout 45 env $envs stdbuf -oL ./test_ffrdp --client=127.0.0.1:$MCP > "$OUT/mc_${slug}_client$i.log" 2>&1 &
+        pids="$pids $!"
+        i=$((i+1))
+    done
+    for p in $pids; do wait "$p" 2>/dev/null; done
+    wait $MSP 2>/dev/null
+    MC_SRV=$(grep -c 'verify: OK' "$OUT/mc_${slug}_server.log" 2>/dev/null || true)
+    MC_CLI=$(cat "$OUT"/mc_${slug}_client*.log 2>/dev/null | grep -c 'verify: OK' || true)
+}
+
+MC=3
+mc_run "多客户端" plain "" "$MC"
+if [ "$MC_SRV" = "$MC" ] && [ "${MC_CLI:-0}" = "$MC" ]; then
+    row "两进程：多客户端 1×$MC" PASS "服务端 $MC_SRV 条 link 各自 verify OK ✓；各客户端也都 OK ✓"
+else
+    row "两进程：多客户端 1×$MC" FAIL "服务端 verify OK=$MC_SRV（要 $MC ✗）；客户端 OK=${MC_CLI:-0}（要 $MC ✗）"
+fi
+
+if [ "$QUICK" = 1 ]; then
+    row "两进程：加密 + 多客户端 1×$MC" SKIP "QUICK=1"
+else
+    mc_run "加密多客户端" crypto "FFRDP_KEY=$CRYPTO_KEY" "$MC"
+    mc_on=$(cat "$OUT"/mc_crypto_*.log 2>/dev/null | grep -c 'encryption *: on,.*selftest ok' || true)
+    if [ "$MC_SRV" = "$MC" ] && [ "${MC_CLI:-0}" = "$MC" ] && [ "${mc_on:-0}" = "$((MC+1))" ]; then
+        row "两进程：加密 + 多客户端 1×$MC" PASS "服务端 $MC_SRV 条 link verify OK ✓；客户端 $MC 个 verify OK ✓；开着加密的进程 ${mc_on} 个 ✓"
+    else
+        row "两进程：加密 + 多客户端 1×$MC" FAIL "verify OK 服务端=${MC_SRV:-0} 客户端=${MC_CLI:-0}（各要 $MC ✗）；开着加密的进程 ${mc_on:-0}（要 $((MC+1)) ✗）"
+    fi
+fi
+
+# 4d) 重连 = 句柄复用。句柄 = 代号 × FFRDP_MAXCONN + 槽号，槽位回收后代号 +1 ⇒ **第 2 条连接起
+#     句柄就是 17、33…**（不是 1、2、3 ✗）。拿句柄当数组下标就在这一刻越界，而越界在 ffcrypto 里是
+#     **静默不加密** ⇒ 那几条连接线上是明文。所以这一格必须逐条看 crc/len：只看"两侧 verify OK"
+#     发现不了（服务端收得没问题，回出去的那份才是明文 ✗）。
+if [ "$QUICK" = 1 ]; then
+    row "两进程：加密 + 重连 3 次（句柄 1→33）" SKIP "QUICK=1"
+else
+    RC_N=3; RCP=$((PORT+6)); RC_OK=1
+    pkill -f "test_ffrdp --server=127.0.0.1:$RCP" 2>/dev/null
+    ( sleep $((RC_N * 3 + 14)); echo quit ) | timeout $((RC_N * 3 + 45)) \
+        env FFRDP_KEY=$CRYPTO_KEY stdbuf -oL ./test_ffrdp --server=127.0.0.1:$RCP > "$OUT/rc_server.log" 2>&1 &
+    RSP=$!
+    sleep 1
+    rci=1; rc_cli=0
+    while [ "$rci" -le "$RC_N" ]; do
+        ( sleep 2; echo quit ) | timeout 40 env FFRDP_KEY=$CRYPTO_KEY stdbuf -oL ./test_ffrdp --client=127.0.0.1:$RCP > "$OUT/rc_client$rci.log" 2>&1
+        grep -q 'verify: OK' "$OUT/rc_client$rci.log" && rc_cli=$((rc_cli + 1))
+        rci=$((rci + 1))
+    done
+    wait $RSP 2>/dev/null
+    rc_srv=$(grep -c 'verify: OK' "$OUT/rc_server.log" 2>/dev/null || true)
+    rc_bad=$(cat "$OUT"/rc_*.log 2>/dev/null | grep 'verify: sent' | grep -vc 'crc_err 0, len_err 0' || true)
+    rc_on=$(cat "$OUT"/rc_*.log 2>/dev/null | grep -c 'encryption *: on,.*selftest ok' || true)
+    RC_NOTE="客户端 verify OK=$rc_cli/$RC_N；服务端 link verify OK=${rc_srv:-0}/$RC_N；crc/len 非零行 ${rc_bad:-0}；开着加密的进程 ${rc_on:-0}/$((RC_N + 1))"
+    { [ "$rc_cli" = "$RC_N" ] && [ "${rc_srv:-0}" = "$RC_N" ] && [ "${rc_bad:-0}" = 0 ] && [ "${rc_on:-0}" = "$((RC_N + 1))" ]; } || RC_OK=0
+    if [ "$RC_OK" = 1 ]; then
+        row "两进程：加密 + 重连 $RC_N 次（句柄 1→33）" PASS "$RC_NOTE"
+    else
+        row "两进程：加密 + 重连 $RC_N 次（句柄 1→33）" FAIL "$RC_NOTE（见 $OUT/rc_*.log）"
+    fi
 fi
 
 # ── 5 v1 互通（V1_REF 三格 ✓）───────────────────────────────────────────────

@@ -226,13 +226,19 @@ column -s, -t logs/summary.csv | tail -10     # the summary table
 **One command that runs every criterion** (run it after touching the protocol ✓, especially for performance work ✓):
 
 ```bash
-bash tools/check.sh              # build + simulation (14 tests / 3 scenario groups) + ASAN + local two-process four paths + v1 interop
-QUICK=1 bash tools/check.sh      # skip ASAN and e2e (about 1 minute) ✓
+bash tools/check.sh              # build + simulation (15 tests / 3 scenario groups) + ASAN + local two-process eight paths + v1 interop
+QUICK=1 bash tools/check.sh      # skip ASAN / e2e / the three encrypted rows (about 1 minute) ✓
 ```
 - Six steps: real-machine-profile `build.sh` ✓, simulation with the default model (HEAD and the working tree compared
   line by line ✓), simulation under **ASAN** ✓, local two-process runs (default / `FFRDP_HS=0` old path /
-  `FFRDP_IDLE=1 FFRDP_CLOSE=1` idle+teardown / multi-client ✓) and **v1 interop** (`hs:0` must work in both
-  directions, the default `hs:1` must not ✓);
+  `FFRDP_IDLE=1 FFRDP_CLOSE=1` idle+teardown / per-message latency / multi-client / **encrypted** (`FFRDP_KEY`,
+  ChaCha20) / **encrypted + multi-client** / **encrypted + 3 reconnects** ✓) and **v1 interop** (`hs:0` must work in
+  both directions, the default `hs:1` must not ✓);
+- The three encrypted rows do **not** stop at "both sides `verify OK`" ✓ — they also require that both sides really
+  enabled encryption (`encryption : on, … selftest ok`) and that **every** connection stays at `crc_err 0 / len_err 0`
+  after a reconnect ✓. Why: see [`docs/ffrdp-crypto.md`](docs/ffrdp-crypto.md) §4.7 — the handle is not an array
+  index, and the failure mode is "first connection fine, everything after a reconnect garbage" while the server's
+  `verify` still reads all green ⇒ checking `verify` alone goes green on a broken build ✗;
 - All green ⇒ exit 0, any red ⇒ exit 1 ⇒ it can be wired straight into `pre-push` or a pipeline ✓; logs land in
   `logs/check-<timestamp>/` ✓. (The local side still uses argument 1, the remote side `REMOTE_BIN` ✓ — so you can tell
   whether "one direction being cut" is a local send problem or a peer acknowledgement problem ✓);
@@ -339,7 +345,7 @@ void  ffrdp_dump  (void *ctxt, int clearhistory);     // print diagnostics
 | Frame format, mack, FEC, RTO computation, communication flow | part 1 (v1.0.0) of [`docs/ffrdp-v1.md`](docs/ffrdp-v1.md) (Chinese) |
 | The motivation for each change, the routes that were rejected, the raw logs | [`docs/notes.md`](docs/notes.md) (Chinese) |
 | How to prove "no regression" without a real machine | [`docs/sim-test.md`](docs/sim-test.md) (Chinese) |
-| **One command that runs every criterion** (build / simulation / ASAN / local two-process four paths / v1 interop) | `tools/check.sh` (usage in §4) |
+| **One command that runs every criterion** (build / simulation / ASAN / local two-process eight paths incl. encrypted + reconnect / v1 interop) | `tools/check.sh` (usage in §4) |
 | Contract test for the transport layer (packets / timers / wakeup) | `tools/test-lowlevel-udp.sh` (usage in §4) |
 | The v2.0.0 interface (params / handles / events / encryption callbacks / handshake and teardown / keepalive) | [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) (Chinese) |
 | v2.0.0's design trade-offs and boundary conditions (connection table / handle generation / half-open ceiling / encryption contract) | [`docs/ffrdp-v2.md`](docs/ffrdp-v2.md) (Chinese) |

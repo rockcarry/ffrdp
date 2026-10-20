@@ -717,10 +717,16 @@ grep -h 'server] verify: sent' /tmp/s.log     # 每一行都该是 crc_err 0, le
 ./test.sh ./test_ffrdp chenk@192.168.0.213 abc 120
 ```
 
-⚠️ **`test.sh` 目前不透传密钥**：它只在 ssh 的 `env` 白名单里传 `FFRDP_HS` / `FFRDP_IDLE` /
-`FFRDP_CLOSE` / `TEST_STAMP` 等（`test.sh:372`、`test.sh:403`），没有 `FFRDP_KEY`。
-要么两端手工各跑一条 `test_ffrdp`，要么给这两行 `env` 列表各加 `FFRDP_KEY='${FFRDP_KEY:-}'`
-（远端那一行在双引号命令串里，`${…}` 由本地展开 ⇒ 写法与现有变量一致）。
+`test.sh` **会把 `FFRDP_KEY` 同时透传给两端**（远端服务端在 `test.sh:374` 的 ssh `env` 白名单里、
+本地客户端在 `test.sh:405`），所以真机加密对测只需要在本地带上这个变量：
+
+```bash
+FFRDP_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff \
+    ./test.sh ./test_ffrdp chenk@192.168.0.213 abc 120
+```
+
+⚠️ **只给一侧开加密**＝线上密文/明文打架：`crc_err` / `len_err` 暴涨，两端都不会出现"加密失败"这种明确报错。
+另外远端二进制必须是同一份（`REMOTE_BIN` 默认就是上传本地那个 ✓），否则两边编的 `ffcrypto` 不一致也会这样。
 
 ### 7.6 `test.c` 的实现要点（读代码时对着看）
 
