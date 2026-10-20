@@ -2,15 +2,18 @@
 # tools/perf-stats.sh —— 从 perf-eval.sh 的产物目录算"分布统计"（纯离线，不重跑、不改测试口径）
 #
 # 为什么需要它：perf-eval.sh 的 results.csv 每场景只留**最后一帧 dump**（resend/rtts 单值 +
-# 整段平均速率），那只能回答"跑到最后是多少"，回答不了"中间抖不抖"。而 test.c 本来就每
-# TEST_DUMP_INTERVAL_MS(10 s) dump 一次（`rttm: …` / `counter_resend_ratio: …` / `total_send, total_recv: …`
-# / `conn age: …`），120 s 就有 12 个采样点 —— 把这份现成数据算成 min/max/avg/方差即可。
+# 整段平均速率），那只能回答"跑到最后是多少"，回答不了"中间抖不抖"。而 test.c 本来就按固定节拍
+# dump（`rttm: …` / `counter_resend_ratio: …` / `total_send, total_recv: …` / `conn age: …`）：
+# 节拍由 perf-eval.sh 的 DUMP_MS（默认 5000）经 --dump_ms= 传给 test_ffrdp（不传则用
+# TEST_DUMP_INTERVAL_MS，10 s）。60 s 轮次配 5 s ⇒ 12 个采样点；120 s 轮次配 10 s ⇒ 也是 12 个 ✓。
+# 把这份现成数据算成 min/max/avg/方差即可。
 #
 # 口径（报告里必须照抄这几条，否则数字对不上）：
-#   · **单连接**：同一连接的 12 次 dump = 时间序列；吞吐用**区间差分** Δtotal_send/Δconn_age
-#     （用累计平均会让方差假性偏小）。首帧没有"上一帧"，所以 n = dump 次数 − 1。
-#   · **多连接**：横截面 —— 每条连接取它最后一次 dump 的快照（累计吞吐 = total_send / conn age），
-#     再跨连接算 min/max/avg/方差；吞吐另给 **sum**（= 全部连接之和）。
+#   · **单连接**：同一连接的 N 次 dump = 时间序列；吞吐用**区间差分** Δtotal_send/Δconn_age
+#     （用累计平均会让方差假性偏小）。首帧没有"上一帧"，所以 n = dump 次数 − 1 − SKIP_FIRST。
+#   · **多连接**：两阶段 —— 每条连接先做**区间差分 + 时间均值**（把时间维度压掉），再跨连接算
+#     min/max/avg/方差；吞吐另给 **sum**（= 各连接均值之和）与 **total**（同一区间序号跨连接相加，
+#     n = 对齐后的区间数）。不是"取最后一次快照"——那会被末帧的瞬时抖动带偏。
 #   · **方向**：上行 = 客户端日志（客户端发的），下行 = 服务端日志（服务端发的）。
 #     resend / rtts 也用同一侧日志 ⇒ 每个方向的三项指标同源，不会拿服务端的 RTT 去配客户端的重传率。
 #   · **方差**是**总体方差**（除以 n，不是 n−1）；单位随指标：resend = %²，rtts = ms²，吞吐 = (MB/s)²。
