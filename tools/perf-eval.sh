@@ -78,10 +78,22 @@ env_host() { case "$1" in lo) echo "127.0.0.1";; *) echo "${TARGET#*@}";; esac; 
 is_remote() { [ "$1" != "lo" ]; }
 
 # ── CPU 采样：/proc/<pid>/stat 的 utime+stime，跨**所有**匹配进程求和 ──────────
-# 为什么按模式找而不是按 pid：满连接有 15 个客户端进程，只盯第一个会漏掉 14/15 的 CPU。
-_cpu_ticks() {  # $1 = pgrep -f 模式
-    local pat="$1" tot=0 p a b
-    for p in $(pgrep -f "$pat" 2>/dev/null); do
+# 两种寻址方式：
+#   `pid:1234` 或 `pid:1234,5678` —— 直接按 pid（iperf3 这种"脚本自己起的进程"必须走这条）
+#   `[i]perf3 -c …`（pgrep -f 模式）—— ffrdp 满连接有 15 个客户端进程，别人起的只能按模式找
+# ⚠ 为什么 iperf3 不能用模式：实测出现过"采了 29 个点全是 0"（进程活着、ticks 不动 ⇒ 匹配到的
+#   不是 iperf3 本身）。iperf3 的 pid 就在手里（`$!`），按 pid 采没有任何歧义 ✓
+_cpu_ticks() {  # $1 = "pid:P[,Q…]" 或 pgrep -f 模式
+    local spec="$1" tot=0 p a b pids=""
+    case "$spec" in
+    pid:*)
+        pids="$(printf '%s' "${spec#pid:}" | tr ',' ' ')"
+        ;;
+    *)
+        pids="$(pgrep -f "$spec" 2>/dev/null)"
+        ;;
+    esac
+    for p in $pids; do
         [ -r "/proc/$p/stat" ] || continue
         a="$(awk '{print $14}' "/proc/$p/stat" 2>/dev/null)"
         b="$(awk '{print $15}' "/proc/$p/stat" 2>/dev/null)"
@@ -101,6 +113,12 @@ cpu_loop() {  # $1 = 模式，$2 = 最长采样秒数 ⇒ 输出 min/avg/peak/va
     while [ "$(date +%s)" -lt "$end" ]; do
         t="$(_cpu_ticks "$pat")"
         if [ "$t" != 0 ]; then break; fi
+        # pid 模式：进程都没了就别再等 20 s（iperf3 可能秒退）
+        case "$pat" in
+        pid:*) local any=0 pp
+               for pp in $(printf '%s' "${pat#pid:}" | tr ',' ' '); do [ -d "/proc/$pp" ] && any=1; done
+               [ "$any" = 1 ] || break ;;
+        esac
         sleep 0.2
     done
     if [ "$t" = 0 ]; then echo "no_pid"; return; fi
@@ -402,7 +420,8 @@ _iperf_server_start() {  # $1=环境 $2=输出前缀 ⇒ 置 IPERF_SP / IPERF_SC
         iperf3 -s -1 -p "$IPERF_PORT" > "$2.srv" 2>&1 &
         IPERF_SP=$!
         sleep 1
-        cpu_start_local "$(pat_of "iperf3 -s -1 -p $IPERF_PORT")" $((IPERF_TIME + 15)) "$2.srv.cpu"
+        # 本机起的服务端：pid 就在手上，按 pid 采（远端只能按模式，见上面那条注释）
+        cpu_start_local "pid:$IPERF_SP" $((IPERF_TIME + 15)) "$2.srv.cpu"
         IPERF_SCP=$CPUPID
     fi
 }
@@ -417,19 +436,41 @@ iperf_one() {  # $1=环境 $2="-R" 或 "" $3=原始输出 $4=并行流数（默�
     local IPERF_SP=0 IPERF_SCP=0
     _iperf_server_start "$e" "$out"
     local sp=$IPERF_SP scp=$IPERF_SCP
-    cpu_start_local "$(pat_of "iperf3 -c $h")" $((IPERF_TIME + 15)) "$out.cli.cpu"
-    local ccp=$!
     # 并发 ping：**空载** ping 看不到排队（bufferbloat）。吞吐打满时的 RTT 才是体感，
     # 而且 5 次/秒 ⇒ 30 s 有 150 个样本，够看 P 型尾部（见 base-load.csv）。
     timeout $((IPERF_TIME + 5)) ping -c $((IPERF_TIME * 5)) -i 0.2 -W 2 "$h" > "$out.ping" 2>&1 &
     local pp=$!
     host_cpu_loop $((IPERF_TIME + 2)) > "$out.hostcpu" &
     local hcp=$!
-    iperf3 -c "$h" -p "$IPERF_PORT" -t "$IPERF_TIME" -i "$DUMP_S" $parg $rarg $rev > "$out" 2>&1 || true
+    # iperf3 放后台拿 pid：CPU 按 **pid** 采，不再用 pgrep 模式（模式会采到别的进程 ⇒ 一侧恒 0）
+    iperf3 -c "$h" -p "$IPERF_PORT" -t "$IPERF_TIME" -i "$DUMP_S" $parg $rarg $rev > "$out" 2>&1 &
+    local ipid=$!
+    cpu_start_local "pid:$ipid" $((IPERF_TIME + 15)) "$out.cli.cpu"
+    local ccp=$!
+    wait $ipid 2>/dev/null || true
     wait $pp 2>/dev/null
     wait $hcp 2>/dev/null
     wait $sp 2>/dev/null; wait $scp 2>/dev/null; wait $ccp 2>/dev/null
+    # TCP 侧的重传：iperf3 汇总行的 `Retr` 列（sender 行倒数第二个字段）。
+    # 换成"次/MB"就是为了和 ffrdp 的 counter_resend_perMB 同口径 —— 用 % 不行：
+    # TCP 的分母是段、ffrdp 的分母是帧，两个百分比没法放一起看 ✗
+    _retr_of "$out" > "$out.retr" 2>/dev/null || true
     _bitrate_mbps "$(_bitrate_units "$out")"
+}
+
+_retr_of() {  # $1=iperf3 输出 ⇒ "retr MB perMB"（没有 sender 汇总行 ⇒ "- - -"）
+    awk '
+        $NF == "sender" {
+            retr = $(NF - 1) + 0
+            for (i = 1; i < NF; i++)
+                if ($(i + 1) ~ /^(K|M|G)?Bytes$/) { sz = $(i); u = $(i + 1) }
+            mult = (u == "GBytes") ? 1024 : (u == "KBytes") ? 0.0009765625 : 1
+            mb = sz * mult
+        }
+        END {
+            if (mb + 0 > 0) printf "%d %.2f %.2f\n", retr, mb, retr / mb
+            else print "- - -"
+        }' "$1"
 }
 
 iperf_bidir() {  # $1=环境 $2=原始输出 $3=并行流数（默认 1）$4=每流 bit/s（0=不限）⇒ echo "上行 下行"（MB/s）
@@ -444,17 +485,42 @@ iperf_bidir() {  # $1=环境 $2=原始输出 $3=并行流数（默认 1）$4=每
     local IPERF_SP=0 IPERF_SCP=0
     _iperf_server_start "$e" "$out"
     local sp=$IPERF_SP scp=$IPERF_SCP
-    cpu_start_local "$(pat_of "iperf3 -c $h")" $((IPERF_TIME + 15)) "$out.cli.cpu"
-    local ccp=$!
     # 双向期间的并发 ping：这一档最接近 ffrdp 的真实工作点（上下行同时压满）
     timeout $((IPERF_TIME + 5)) ping -c $((IPERF_TIME * 5)) -i 0.2 -W 2 "$h" > "$out.ping" 2>&1 &
     local pp=$!
     host_cpu_loop $((IPERF_TIME + 2)) > "$out.hostcpu" &
     local hcp=$!
-    iperf3 -c "$h" -p "$IPERF_PORT" -t "$IPERF_TIME" -i "$DUMP_S" $parg $rarg --bidir > "$out" 2>&1 || true
+    # iperf3 3.7 的 --bidir 在某些 NAT/AP 路径上会 `Connection reset by peer`
+    # （实测快 AP：7/7 次全挂在"第二条 stream 建不起来"）⇒ 重试 2 次，仍失败就**降级**，
+    # 不要静默留个 `-/-`（那种"看起来像测到了 0"的坑已经踩过一次 ✗）。
+    # CPU 按 **pid** 采（每次尝试各采各的；用 pgrep 模式会采到别的进程 ⇒ 一侧恒 0）
+    local attempt=0 ccp=0 ipid=0
+    while [ "$attempt" -lt 2 ]; do
+        attempt=$((attempt + 1))
+        iperf3 -c "$h" -p "$IPERF_PORT" -t "$IPERF_TIME" -i "$DUMP_S" $parg $rarg --bidir > "$out" 2>&1 &
+        ipid=$!
+        cpu_start_local "pid:$ipid" $((IPERF_TIME + 15)) "$out.cli.cpu"
+        ccp=$CPUPID
+        wait $ipid 2>/dev/null || true
+        wait $ccp 2>/dev/null || true
+        grep -q 'iperf3: error' "$out" 2>/dev/null || break
+        say "  ⚠ --bidir 第 $attempt 次失败（$(grep -m1 'iperf3: error' "$out")）"
+        sleep 2
+    done
     wait $pp 2>/dev/null
     wait $hcp 2>/dev/null
-    wait $sp 2>/dev/null; wait $scp 2>/dev/null; wait $ccp 2>/dev/null
+    wait $sp 2>/dev/null; wait $scp 2>/dev/null
+    if grep -q 'iperf3: error' "$out" 2>/dev/null; then
+        # 降级：两条单向**顺序**跑（与 asym 档同构，也比没有强）。文件按规范名落在同目录，
+        # perf-tables.sh 发现 bidir 没数据时会自动回退读这两个 ✓
+        local dp; dp="$(dirname "$out")"
+        say "  ⚠ --bidir 两次都失败 ⇒ 降级为两条单向（iperf-up/down.txt）"
+        local u v
+        u="$(iperf_one "$e" "" "$dp/iperf-up.txt" "$par" "$rate")"
+        v="$(iperf_one "$e" "-R" "$dp/iperf-down.txt" "$par" "$rate")"
+        printf '%s %s' "$u" "$v"
+        return 0
+    fi
     # --bidir 的行带角色标记：[TX-C] = 客户端发（上行）、[RX-C] = 客户端收（下行）
     printf '%s %s' "$(_bitrate_mbps "$(_bitrate_units "$out" 'TX-C')")" \
                    "$(_bitrate_mbps "$(_bitrate_units "$out" 'RX-C')")"
@@ -530,7 +596,9 @@ lo_metrics() {  # $1=日志 ⇒ "res,waste,rtts,up,down"（取最后一个 dump 
         /^verify: OK/              { vok = 1 }
         END {
             # 必须写成 "up/down" 一格（与 test.sh 的 summary.csv 同格式 ✓ —— 写成两个字段后面全错位 ✗）
-            if (ca + 0 > 0 && s + 0 > 0) printf "%s,%s,%s,%.2f/%.2f\n", \
+            # ⚠ 判据只能是 conn age > 0：**纯接收端** total_send 恒为 0，原来要求 s > 0
+            #   会把 lo 整轮的下行吞吐全写成 -/-（进而被当成 0.00 ✗，实测坑过一次）。
+            if (ca + 0 > 0) printf "%s,%s,%s,%.2f/%.2f\n", \
                 (res == "" ? "-" : res), (wa == "" ? "-" : wa), (rt == "" ? "-" : rt), s / ca, r / ca
             else printf "%s,%s,%s,-/-\n", (res == "" ? "-" : res), (wa == "" ? "-" : wa), (rt == "" ? "-" : rt)
         }' "$1"
@@ -547,9 +615,16 @@ run_ap() {  # $1=kind $2=方向 $3=上行% $4=下行% $5=目录 $6=stamp
     # CPU：客户端（本机，多进程合计）+ 服务端（远端单进程）
     cpu_start_local "$(pat_cli "$BIN" "$CUR_ENV")" $((DUR + 45)) "$dir/cpu.client"; local cclid=$CPUPID
     cpu_start_remote "$(pat_srv_ap "$BIN")" $((DUR + 45)) "$dir/cpu.server";   local cspid=$CPUPID
+    # 吞吐期间的 ping：iperf3 那边一直有（`iperf-*.txt.ping`），ffrdp 这边原来**完全没有** ⇒
+    # 唯一能和 TCP 对齐的"丢包 + 时延"口径就断了。这里用与 iperf 完全相同的参数（-i 0.2）补上，
+    # 落 `<dir>/ping.txt`；建连那几秒先跳过（lead 5 s），只覆盖真正的传输窗口。
+    ( sleep 5; timeout $((DUR - 5 + 10)) ping -c $((DUR * 5 - 25)) -i 0.2 -W 2 "$(env_host "$CUR_ENV")" \
+        > "$dir/ping.txt" 2>&1 ) &
+    local ppid=$!
     env LOGDIR="$dir" STAMP="$st" KEEP_MUX=1 CLIENTS="$ncl" DIR="$dmode" DUMP_MS="$DUMP_MS" \
         $up_arg $dn_arg ./test.sh "$BIN" "$TARGET" "$PASS" "$DUR" > "$dir/testsh.out" 2>&1 \
         || say "  ⚠ test.sh 非零退出（看 $dir/testsh.out）"
+    wait $ppid 2>/dev/null || true
     wait $cclid 2>/dev/null || true
     wait $cspid 2>/dev/null || true
 }

@@ -6,50 +6,61 @@
 # dump（`rttm: …` / `counter_resend_ratio: …` / `total_send, total_recv: …` / `conn age: …`）：
 # 节拍由 perf-eval.sh 的 DUMP_MS（默认 5000）经 --dump_ms= 传给 test_ffrdp（不传则用
 # TEST_DUMP_INTERVAL_MS，10 s）。60 s 轮次配 5 s ⇒ 12 个采样点；120 s 轮次配 10 s ⇒ 也是 12 个 ✓。
-# 把这份现成数据算成 min/max/avg/方差即可。
+# 把这份现成数据算成 min/max/avg/σ²/std 即可。
 #
 # 口径（报告里必须照抄这几条，否则数字对不上）：
 #   · **单连接**：同一连接的 N 次 dump = 时间序列；吞吐用**区间差分** Δtotal_send/Δconn_age
 #     （用累计平均会让方差假性偏小）。首帧没有"上一帧"，所以 n = dump 次数 − 1 − SKIP_FIRST。
 #   · **多连接**：两阶段 —— 每条连接先做**区间差分 + 时间均值**（把时间维度压掉），再跨连接算
-#     min/max/avg/方差；吞吐另给 **sum**（= 各连接均值之和）与 **total**（同一区间序号跨连接相加，
+#     min/max/avg/std；吞吐另给 **sum**（= 各连接均值之和）与 **total**（同一区间序号跨连接相加，
 #     n = 对齐后的区间数）。不是"取最后一次快照"——那会被末帧的瞬时抖动带偏。
 #   · **方向**：上行 = 客户端日志（客户端发的），下行 = 服务端日志（服务端发的）。
-#     resend / rtts 也用同一侧日志 ⇒ 每个方向的三项指标同源，不会拿服务端的 RTT 去配客户端的重传率。
-#   · **方差**是**总体方差**（除以 n，不是 n−1）；单位随指标：resend = %²，rtts = ms²，吞吐 = (MB/s)²。
+#     resend / waste / rtts / incap 也用同一侧日志 ⇒ 每个方向的三项指标同源，不会拿服务端的 RTT
+#     去配客户端的重传率。
+#   · **方差**是**总体方差**（除以 n，不是 n−1）；**std = √var**，与均值同单位，报告直接用它。
+#   · 指标单位：resend %、waste %、rtts ms、incap 帧（自适应在途上限，越大越"敢发"）、
+#     tput MB/s（= 10^6 B/s）、cpu %（单核百分比，多进程合计）。
 #
 # 用法:
 #   bash tools/perf-stats.sh logs/perf-1019-200633 [logs/perf-1019-202754 ...]
 #   ⇒ 每个目录写 <dir>/detail.csv，并在终端打印各场景的摘要
+#   bash tools/perf-stats.sh --tables logs/perf-<stamp>     # 只出 markdown 表（转调 perf-tables.sh）
 #
-# 输出列: env,scen,conn,dir,metric,n,min,max,avg,var,sum
-#   conn ∈ single|full；dir ∈ up|down；metric ∈ resend|rtts|tput（resend 单位 %、rtts ms、tput MB/s）
+# 输出列: env,scen,conn,dir,metric,n,min,max,avg,var,std,sum
+#   conn ∈ single|full；dir ∈ up|down|client|server
+#   metric ∈ resend|waste|rtts|incap|tput|cpu（tput 另出 total 行：15 条合计的时间序列）
 set -u
 
 die() { echo "✗ $*" >&2; exit 2; }
 
-# ── 单连接：从一份 dump 日志抽样本，每行 "resend% rtts_ms tput_MBps" ───────────
+# ── 单连接：从一份 dump 日志抽样本，每行 "resend% waste% rtts_ms incap tput_MBps" ───
 # 第一个区间含握手/慢启动前段，速率明显偏低（甚至因为分母小反而偏高）⇒ 默认丢掉 ✓
 SKIP_FIRST="${SKIP_FIRST:-1}"
+# 五个指标的名字（顺序与 extract/extract_rows 的输出列一一对应）
+METRICS="resend waste rtts incap tput"
+
 extract() {  # $1=日志 ⇒ 相邻两次 dump 的区间差分（累计平均会让方差假性偏小 ✗）
     awk -v skip="$SKIP_FIRST" '
-        /^---- conn [0-9]+/ { cid = $3 }
         /^total_send, total_recv:/ { gsub(/MB,/, "", $3); s = $3 + 0 }
         /^rttm:/  { gsub(/,/, "", $4); rt = $4 + 0 }
         /^counter_resend_ratio/ { v = $2; gsub(/%/, "", v); rs = v + 0 }
+        /^counter_resend_waste/ { v = $2; gsub(/%/, "", v); ws = v + 0 }
+        # 自适应在途上限（①-49）："in-flight limit : 42 frames (default 64; ...)" ⇒ 只取第一个数
+        # ⚠ 必须取**第一个**冒号：行内还有 "adaptive ①-49: AIMD..."，用 .*: 会吃到最后那个冒号
+        /^in-flight limit/ { v = $0; sub(/^[^:]*:[ \t]*/, "", v); sub(/[ \t].*/, "", v); cp = v + 0 }
         /^conn age/ {
             age = $4 + 0
             if (age <= 0) next
             if (have && age > lag) {                 # age 回退 = 重连过，重新起算
                 n++
-                if (n > skip) print rs, rt, (s - las) / (age - lag)
+                if (n > skip) print rs, ws, rt, cp, (s - las) / (age - lag)
             }
             lag = age; las = s; have = 1
         }' "$1"
 }
 
 # ── 多连接：两阶段口径 ──────────────────────────────────────────────────────
-# 阶段 1：一份日志 ⇒ 每行 "文件序号 连接号 区间序号 吞吐 resend rtts"
+# 阶段 1：一份日志 ⇒ 每行 "文件序号 连接号 区间序号 吞吐 resend waste rtts incap"
 #   服务端的 15 条连接在**同一份** server.log 里（15 个 conn 段）⇒ 靠 cid 分开；
 #   客户端是 15 份日志 ⇒ 靠文件序号分开。两条来源都送进阶段 2，口径一致 ✓
 extract_rows() {  # $1=日志 $2=文件序号
@@ -60,6 +71,8 @@ extract_rows() {  # $1=日志 $2=文件序号
         /^total_send, total_recv:/ { v = $3; gsub(/MB,?/, "", v); cum[cid] = v + 0 }
         /^rttm:/  { v = $4; gsub(/,/, "", v); rt[cid] = v + 0 }
         /^counter_resend_ratio/ { v = $2; gsub(/%/, "", v); rs[cid] = v + 0 }
+        /^counter_resend_waste/ { v = $2; gsub(/%/, "", v); ws[cid] = v + 0 }
+        /^in-flight limit/ { v = $0; sub(/^[^:]*:[ \t]*/, "", v); sub(/[ \t].*/, "", v); cp[cid] = v + 0 }
         /^conn age/ {
             age = $4 + 0
             if (age <= 0) next
@@ -73,47 +86,51 @@ extract_rows() {  # $1=日志 $2=文件序号
             if (pag[cid] > 0) {
                 it[cid]++
                 if (it[cid] > skip)
-                    printf "%s %s %d %.6f %.4f %.2f\n", fid, cid, it[cid],
-                           (cum[cid] - pcum[cid]) / (age - pag[cid]), rs[cid], rt[cid]
+                    # 列序必须与 METRICS 一致：resend waste rtts incap tput
+                    printf "%s %s %d %.4f %.4f %.2f %d %.6f\n", fid, cid, it[cid],
+                           rs[cid], ws[cid], rt[cid], cp[cid],
+                           (cum[cid] - pcum[cid]) / (age - pag[cid])
             }
             pag[cid] = age; pcum[cid] = cum[cid]
         }' "$1"
 }
 
 # 阶段 2：聚合成 detail.csv 的行
-#   · 每连接的**时间均值**（三个指标各一个）——先把时间维度压掉 ✓
-#   · 跨连接：对这些均值求 min/max/avg/方差（n = 连接数）
-#   · 总量序列：同一区间序号把各连接相加 ⇒ 再求 min/max/avg/方差（n = 区间数）
+#   · 每连接的**时间均值**（五个指标各一个）——先把时间维度压掉 ✓
+#   · 跨连接：对这些均值求 min/max/avg/std（n = 连接数）
+#   · 总量序列：同一区间序号把各连接相加 ⇒ 再求 min/max/avg/std（n = 区间数）
 #     ⚠ 只取"所有连接都有样本"的区间，否则缺一条连接的区间会让总量假性偏低 ✗
 aggregate_rows() {  # $1=env $2=scen $3=dir
-    awk -v env="$1" -v scen="$2" -v dir="$3" '
+    awk -v env="$1" -v scen="$2" -v dir="$3" -v names="$METRICS" '
         {
             k = $1 ":" $2
             if (!(k in nk)) nk[k] = 0
             nk[k]++
-            sp[k] += $4; sr[k] += $5; st[k] += $6
-            tot[$3] += $4; cnt[$3]++
+            for (i = 1; i <= 5; i++) sp[k, i] += $(i + 3)
+            tot[$3] += $8; cnt[$3]++        # $8 = tput（第 5 个指标，列序见 extract_rows）
             if ($3 > itmax) itmax = $3
         }
         END {
+            split(names, name, " ")
             m = 0
             for (k in nk) {
                 m++
-                pm = sp[k] / nk[k]
-                if (m == 1 || pm < mnp) mnp = pm; if (m == 1 || pm > mxp) mxp = pm; ap += pm; qp += pm * pm
-                rm = sr[k] / nk[k]
-                if (m == 1 || rm < mnr) mnr = rm; if (m == 1 || rm > mxr) mxr = rm; ar += rm; qr += rm * rm
-                tm = st[k] / nk[k]
-                if (m == 1 || tm < mnt) mnt = tm; if (m == 1 || tm > mxt) mxt = tm; at += tm; qt += tm * tm
+                for (i = 1; i <= 5; i++) {
+                    v = sp[k, i] / nk[k]
+                    if (m == 1 || v < mnm[i]) mnm[i] = v
+                    if (m == 1 || v > mxm[i]) mxm[i] = v
+                    am[i] += v; qm[i] += v * v
+                }
             }
             if (m == 0) exit
-            vr = qr / m - (ar / m) ^ 2; if (vr < 0) vr = 0
-            vt = qt / m - (at / m) ^ 2; if (vt < 0) vt = 0
-            vp = qp / m - (ap / m) ^ 2; if (vp < 0) vp = 0
-            printf "%s,%s,full,%s,resend,%d,%.2f,%.2f,%.2f,%.4f,-\n",    env, scen, dir, m, mnr, mxr, ar / m, vr
-            printf "%s,%s,full,%s,rtts,%d,%.1f,%.1f,%.1f,%.2f,-\n",      env, scen, dir, m, mnt, mxt, at / m, vt
-            printf "%s,%s,full,%s,tput,%d,%.3f,%.3f,%.3f,%.6f,%.3f\n",   env, scen, dir, m, mnp, mxp, ap / m, vp, ap
-            # 总量：按"区间序号"把各连接相加。各连接是错峰启动的 ⇒ 区间数会差 1~2 个，
+            for (i = 1; i <= 5; i++) {
+                a = am[i] / m
+                vv = qm[i] / m - a * a; if (vv < 0) vv = 0
+                # sum 列只有 tput 有意义（= 15 条均值之和 = 15 条合计）
+                printf "%s,%s,full,%s,%s,%d,%.3f,%.3f,%.3f,%.4f,%.4f,%s\n", env, scen, dir, name[i], m,
+                       mnm[i], mxm[i], a, vv, sqrt(vv), (i == 5 ? sprintf("%.3f", a * m) : "-")
+            }
+            # 总量序列：按"区间序号"把各连接相加。各连接是错峰启动的 ⇒ 区间数会差 1~2 个，
             # 所以取**样本最多的那批区间**（maxc），而不是要求"全都有"（那样常常一个都不剩 ✗）。
             # n 列给出实际参与的对齐度：n == 连接数 才是完美的（错峰越小越接近）。
             maxc = 0
@@ -131,35 +148,46 @@ aggregate_rows() {  # $1=env $2=scen $3=dir
             }
             if (nt > 0) {
                 vg = qg / nt - (ag / nt) ^ 2; if (vg < 0) vg = 0
-                printf "%s,%s,full,%s,total,%d,%.3f,%.3f,%.3f,%.6f,-\n", env, scen, dir, nt, mng, mxg, ag / nt, vg
+                printf "%s,%s,full,%s,total,%d,%.3f,%.3f,%.3f,%.4f,%.4f,-\n", env, scen, dir, nt,
+                       mng, mxg, ag / nt, vg, sqrt(vg)
             }
         }'
 }
 
-# ── 统计：stdin 的 "res rtts tput" 样本 ⇒ "metric,n,min,max,avg,var,sum" ────────
+# ── 统计：stdin 的 "res waste rtts incap tput" 样本 ⇒ "metric,n,min,max,avg,var,std,sum" ──
 stats_of() {
-    awk '
-        { n++; r = $1 + 0; t = $2 + 0; p = $3 + 0
-          if (n == 1 || r < mnr) mnr = r; if (n == 1 || r > mxr) mxr = r; sr += r; qr += r * r
-          if (n == 1 || t < mnt) mnt = t; if (n == 1 || t > mxt) mxt = t; st += t; qt += t * t
-          if (n == 1 || p < mnp) mnp = p; if (n == 1 || p > mxp) mxp = p; sp += p; qp += p * p }
+    awk -v names="$METRICS" '
+        { n++
+          for (i = 1; i <= 5; i++) {
+              v = $i + 0
+              if (n == 1 || v < mnm[i]) mnm[i] = v
+              if (n == 1 || v > mxm[i]) mxm[i] = v
+              sm[i] += v; qm[i] += v * v
+          } }
         END {
             if (n == 0) exit
-            vr = qr / n - (sr / n) ^ 2; if (vr < 0) vr = 0
-            vt = qt / n - (st / n) ^ 2; if (vt < 0) vt = 0
-            vp = qp / n - (sp / n) ^ 2; if (vp < 0) vp = 0
-            printf "resend,%d,%.2f,%.2f,%.2f,%.4f,-\n",  n, mnr, mxr, sr / n, vr
-            printf "rtts,%d,%d,%d,%.1f,%.2f,-\n",        n, mnt, mxt, st / n, vt
-            printf "tput,%d,%.3f,%.3f,%.3f,%.6f,%.3f\n", n, mnp, mxp, sp / n, vp, sp
+            split(names, name, " ")
+            for (i = 1; i <= 5; i++) {
+                a = sm[i] / n
+                vv = qm[i] / n - a * a; if (vv < 0) vv = 0
+                printf "%s,%d,%.3f,%.3f,%.3f,%.4f,%.4f,%s\n", name[i], n, mnm[i], mxm[i], a, vv, sqrt(vv),
+                       (i == 5 ? sprintf("%.3f", sm[i]) : "-")
+            }
         }'
 }
 
-[ "$#" -ge 1 ] || die "用法: bash tools/perf-stats.sh <perf 目录> [更多目录]"
+# --tables：只出 markdown 表（渲染交给 perf-tables.sh，避免两份口径）
+if [ "${1:-}" = "--tables" ]; then
+    shift
+    exec bash "$(dirname "$0")/perf-tables.sh" "$@"
+fi
+
+[ "$#" -ge 1 ] || die "用法: bash tools/perf-stats.sh <perf 目录> [更多目录]  |  --tables <perf 目录>"
 
 for D in "$@"; do
     [ -d "$D/raw" ] || die "$D 下没有 raw/（不是 perf-eval.sh 的产物目录？）"
     OUT="$D/detail.csv"
-    echo 'env,scen,conn,dir,metric,n,min,max,avg,var,sum' > "$OUT"
+    echo 'env,scen,conn,dir,metric,n,min,max,avg,var,std,sum' > "$OUT"
     for rd in "$D"/raw/*/; do
         b="$(basename "$rd")"
         env="${b%%-*}"; scen="${b#*-}"
@@ -176,12 +204,12 @@ for D in "$@"; do
         # 上行：客户端侧（它发的方向）；下行：服务端侧
         if [ "$nc" -le 1 ]; then
             # 单连接：同一连接的 N 次 dump = 时间序列（区间差分）
-            for f in $CF; do extract "$f"; done | stats_of | while IFS=, read -r m n mn mx av vr sm; do
-                echo "$env,$scen,$conn,up,$m,$n,$mn,$mx,$av,$vr,$sm" >> "$OUT"
+            for f in $CF; do extract "$f"; done | stats_of | while IFS=, read -r m n mn mx av vr sd sm; do
+                echo "$env,$scen,$conn,up,$m,$n,$mn,$mx,$av,$vr,$sd,$sm" >> "$OUT"
             done
             if [ -n "$SF" ]; then
-                extract "$SF" | stats_of | while IFS=, read -r m n mn mx av vr sm; do
-                    echo "$env,$scen,$conn,down,$m,$n,$mn,$mx,$av,$vr,$sm" >> "$OUT"
+                extract "$SF" | stats_of | while IFS=, read -r m n mn mx av vr sd sm; do
+                    echo "$env,$scen,$conn,down,$m,$n,$mn,$mx,$av,$vr,$sd,$sm" >> "$OUT"
                 done
             fi
         else
@@ -193,7 +221,7 @@ for D in "$@"; do
                 extract_rows "$SF" 1 | aggregate_rows "$env" "$scen" down >> "$OUT"
             fi
         fi
-        # CPU：cpu_loop 在测试期间每秒采一个点，所以 min/max/avg/σ² 都是现成的
+        # CPU：cpu_loop 在测试期间每秒采一个点，所以 min/max/avg/σ²/std 都是现成的
         # （dir 列在这里是 client/server：CPU 属于"端"，不属于"方向" ✗）
         for side in client server; do
             cf="$rd/cpu.$side"
@@ -204,7 +232,8 @@ for D in "$@"; do
             mx="$(grep -m1 '^peak_pct_of_one_core=' "$cf" 2>/dev/null | cut -d= -f2)"
             vr="$(grep -m1 '^var_pct_of_one_core='  "$cf" 2>/dev/null | cut -d= -f2)"
             sn="$(grep -m1 '^samples='             "$cf" 2>/dev/null | cut -d= -f2)"
-            echo "$env,$scen,$conn,$side,cpu,${sn:--},${mn:--},${mx:--},$av,${vr:--},-" >> "$OUT"
+            sd="$(awk -v v="${vr:-0}" 'BEGIN { printf "%.2f", (v + 0 > 0) ? sqrt(v + 0) : 0 }')"
+            echo "$env,$scen,$conn,$side,cpu,${sn:--},${mn:--},${mx:--},$av,${vr:--},$sd,-" >> "$OUT"
         done
         echo "· $b（$conn）"
     done
