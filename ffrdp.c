@@ -1134,6 +1134,7 @@ static void ffrdp_p2p_client_start(FFRDPCONTEXT *ffrdp, const char *peer_text)
 // ffp2p 事件（跑在 ffp2p 自己的 worker 线程上，不能阻塞）。
 static long ffrdp_p2p_event(void *cbctx, int type, void *buf, int len)
 {
+    (void)len;
     FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)cbctx;
     if (!ffrdp) return -1;
     if (type == FFP2P_EVENT_CONNECTED) {
