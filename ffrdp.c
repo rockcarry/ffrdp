@@ -1488,6 +1488,14 @@ static int ffrdp_isdead_locked(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
             return (int32_t)(now - h->tick_1sts) > FFRDP_DEAD_TIMEOUT &&
                    (int32_t)(now - c->tick_last_recv) > FFRDP_DEAD_TIMEOUT;
         } else {
+            // head 还没首发（还排在 unsent 里）⇒ 没有 tick_1sts，谈不上"久等"，只能看 QUERY 往返。
+            // ⚠️ 必须先挡 0 哨兵：tick_send_query == 0（**一次 QUERY 都还没发过**）时，
+            //    `0 - tick_recv_ack` 是 uint32 减法，机器 uptime 超过 24.8 天（2^31 ms）就回绕成
+            //    **正的巨大数**（客户端 uptime 25.5 天 ⇒ 2094852 s，dump 里 `delay-off 2094852 s`
+            //    就是这笔同一个回绕）⇒ 明明刚收到过 ack 也被判死 ✗。
+            // 现象：握手成功 ~0.7 s 后 `lost ! ... protocol says dead`，而服务端一直 established ——
+            // 服务端 uptime 只有 3.3 h（t=11908613 ms），回绕不到正数，所以只有客户端这边炸 ✓。
+            if (!c->tick_send_query || !c->tick_recv_ack) return 0;
             return (int32_t)c->tick_send_query - (int32_t)c->tick_recv_ack > FFRDP_DEAD_TIMEOUT;
         }
     }
@@ -2653,7 +2661,7 @@ static void ffrdp_tick_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c)
                             if (next < (uint32_t)FFRDP_INFLIGHT_MIN) next = FFRDP_INFLIGHT_MIN;
                             if (next < cur) { c->cap_kept = next; FFRDP_CNT(c, counter_cap_down); moved = 1; }
                         } else if (w <= FFRDP_ADAPT_W_LO_PM && excess >= FFRDP_ADAPT_Q_CUT_MS &&
-                                   (int32_t)(now - c->delay_off_until) >= 0) {
+                                   (!c->delay_off_until || (int32_t)(now - c->delay_off_until) >= 0)) {
                             if (cur <= (uint32_t)FFRDP_INFLIGHT_MIN) {
                                 // 已经在地板还排着队 ⇒ 这队不是我们造的，别再问 30 s（也让 ③ 放行）
                                 c->delay_off_until = now + FFRDP_ADAPT_Q_GAP_MS;
@@ -3340,7 +3348,8 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
                c->cap_kept ? c->cap_kept : (uint32_t)FFRDP_INFLIGHT_MAX,
                (int)FFRDP_INFLIGHT_MIN, (int)FFRDP_INFLIGHT_CEIL,
                c->counter_cap_down, c->counter_cap_up,
-               (int)((int32_t)(c->delay_off_until - NOW_MS()) / 1000));
+               // 0 = 从没设过 ⇒ 打 0；不然 `0 - NOW_MS()` 在 uptime > 24.8 天时回绕成正数（假的 2094852 s ✗）
+               c->delay_off_until ? (int)((int32_t)(c->delay_off_until - NOW_MS()) / 1000) : 0);
 #endif
         // 探测触发时看到的量：waste（‰/秒）、out（在途）、排队判据（典型 RTT 对地板）；尺寸闸读作两个数 —— out/2 必须落在下一行那个上限之下。
         printf("probe trigger       : waste %u pm, rtts/rtt_min %u/%u, out %u (needs %u pm, >%ux, OR ①-39 mem: out >= %u and out/2 under the limit above)\n",
