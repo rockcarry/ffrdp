@@ -42,9 +42,13 @@ typedef struct {
     void (*exit )(void *fl);
 
     #define FLAG_BIND_ADDR (1 << 0)
+    #define FLAG_EXT_FD    (1 << 1) // fd 由上层（ffp2p 打洞）持有：本层不建、不 bind、不 close
     uint32_t           flags;
     struct sockaddr_in addr;
     int                sockfd;
+    int                ext_ready;   // 外部 fd 的非阻塞/缓冲区选项已经设过
+    FFRDP_LOWLEVEL_FLT filter;      // 可选：包先过它，返回非 0 = 已被上层消费（不当 FFRDP 帧）
+    void              *filter_user;
     FFRDP_LOWLEVEL_CB  callback;
     void              *cbctx;
     MOD_THREAD         mthread;
@@ -282,7 +286,7 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
             printf("<2> ffrdp-udp failed to create the wakeup socket\n");
             usleep(100 * 1000); continue;
         }
-        if (udp->sockfd < 0) {
+        if (udp->sockfd < 0 && !(udp->flags & FLAG_EXT_FD)) {
             udp->sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             socket_setopt(udp->sockfd, "reuse_addr" , 1); // enable reuse addr
             // 非阻塞：交不出去的帧要作为错误回到调用方 ✓，不能在收包循环里卡住 ✓。
@@ -303,6 +307,23 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
                 printf("<2> udpproxy failed to bind socket to port %d !\n", ntohs(udp->addr.sin_port));
                 closesocket(udp->sockfd); udp->sockfd = -1; usleep(100 * 1000); continue;
             }
+        }
+
+        // 外部 fd（p2p）：那个 socket 是 ffp2p 建好并 bind 过的，这里只补本层需要的选项。
+        if ((udp->flags & FLAG_EXT_FD) && udp->sockfd >= 0 && !udp->ext_ready) {
+            socket_setopt(udp->sockfd, "nonblock_io", 1);
+            socket_setopt(udp->sockfd, "send_buffer", udp->bufsize);
+            socket_setopt(udp->sockfd, "recv_buffer", udp->bufsize);
+#if FFRDP_DIAG
+            {   // ext fd 上这些值原本全是 0（dump 里看着像"内核一点缓冲都没给"）⇒ 补读一次真实值
+                socklen_t sl = sizeof(int);
+                udp->buf_rcv_eff = udp->buf_snd_eff = 0;
+                getsockopt(udp->sockfd, SOL_SOCKET, SO_RCVBUF, (void*)&udp->buf_rcv_eff, &sl);
+                sl = sizeof(int);
+                getsockopt(udp->sockfd, SOL_SOCKET, SO_SNDBUF, (void*)&udp->buf_snd_eff, &sl);
+            }
+#endif
+            udp->ext_ready = 1;
         }
 
 #if FFRDP_DIAG
@@ -329,10 +350,15 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
             LSTAT(udp, stat_sleep_none); // 没有期限 ⇒ 永久睡 ✓
         }
         fd_set rfds;
+        int    maxfd = udp->notify;
         FD_ZERO(&rfds);
-        FD_SET(udp->sockfd, &rfds);
         FD_SET(udp->notify, &rfds);
-        ret = select(MAX(udp->sockfd, udp->notify) + 1, &rfds, NULL, NULL, tvp);
+        // 外部 fd 模式在注入之前 sockfd 是 -1：只能等 notify（FD_SET(-1) 是未定义行为 ✓）。
+        if (udp->sockfd >= 0) {
+            FD_SET(udp->sockfd, &rfds);
+            if (udp->sockfd > maxfd) maxfd = udp->sockfd;
+        }
+        ret = select(maxfd + 1, &rfds, NULL, NULL, tvp);
         ffrdp_udp_sleep_end(udp); // awake again, whatever select() answered
 #if FFRDP_DIAG
         if (cost) t_c1 = ffrdp_udp_us(); // pre 段结束 ✓
@@ -348,7 +374,7 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
         if (ret > 0 && FD_ISSET(udp->notify, &rfds)) ffrdp_udp_notify_drain(udp);
         // 这里和下面的收包循环都不测"停"：每圈都有界 ✓（收包有上限 ✓、socket 非阻塞 ✓、select 有期限 ✓）⇒
         // 顶多多跑一圈 ✓；ffrdp_free() 会先 join 我们 ✓。
-        if (ret > 0 && FD_ISSET(udp->sockfd, &rfds)) {
+        if (ret > 0 && udp->sockfd >= 0 && FD_ISSET(udp->sockfd, &rfds)) {
             // 一圈把就绪的包都收下来（有上限 ✓）：上层是"一段一个 ack" ✓ ⇒ 一圈只收一帧就等于一帧一个 ack ✗。
             int frames = 0;
             while (frames < udp->rx_batch) { // ①-25：运行时上限 ✓
@@ -362,6 +388,9 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
                     LSTAT_SET(udp, stat_rx_errno, socket_errno());
                     break;
                 }
+                // p2p：这个 socket 是跟 ffp2p 共用的，它的保活/探测包也在这条队列上
+                // ⇒ 先交给上层认领（"FFP2" 开头），认领走的不算 FFRDP 帧。
+                if (udp->filter && udp->filter(udp->filter_user, buf, ret, &from)) continue;
                 frames++; LSTAT(udp, stat_rx_frames); if (frames == 1) LSTAT(udp, stat_lap_frame);
                 if (udp->callback) {
                     // msg 带来源地址 ⇒ 回复能原路 send() 回去 ✓（这是本层报地址的唯一原因 ✓）；buf 是每圈复用的栈缓冲 ⇒
@@ -487,9 +516,11 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
     printf("udp lowlevel arm cost: from loop %u calls %u us, from other threads %u calls %u us\n",
            udp->stat_arm_n_loop, udp->stat_arm_us_loop, udp->stat_arm_n_other, udp->stat_arm_us_other);
 #endif
-    closesocket(udp->sockfd); udp->sockfd = -1;
+    // 外部 fd（p2p）不归本层：它属于 ffp2p，这里关掉会让对端以为链路没了
+    if (!(udp->flags & FLAG_EXT_FD)) closesocket(udp->sockfd);
+    udp->sockfd = -1;
     {   int fd = udp->notify;
-        udp->notify = -1;              // 先摘引用、再关：晚到的 timer() 只会看到"没有"，不会发到已关的 fd 上
+        udp->notify = -1;  // 先摘引用、再关：晚到的 timer() 只会看到"没有"，不会发到已关的 fd 上
         if (fd >= 0) closesocket(fd);
     }
     socket_exit();
@@ -584,6 +615,8 @@ static int ffrdp_udp_lowlevel_parse_params(UDP_LOWLEVEL *udp, char *params)
     // "none": 明确表示"这个端点不绑定"（客户端就是这样：源端口由内核在第一次发包时定）。它是一条正常
     // 的配置，不是笔误，所以不打印、也没有 flags 位 —— 没有 FLAG_BIND_ADDR，接收线程就不去 bind。
     if (strcmp(params, "none") == 0) return 0;
+    // "p2p"：fd 由上层（ffp2p 打洞成功）注入，本层不建 socket、不 bind
+    if (strcmp(params, "p2p") == 0) { udp->flags |= FLAG_EXT_FD; return 0; }
     if (strncmp(params, "bind:", 5) != 0) {
         printf("<3> ffrdp-udp params \"%s\" is not \"bind:ip:port\" or \"none\", no bind address is set\n", params);
         return 0;
@@ -599,6 +632,35 @@ static int ffrdp_udp_lowlevel_parse_params(UDP_LOWLEVEL *udp, char *params)
     udp->addr.sin_port        = htons((uint16_t)port);
     udp->addr.sin_addr.s_addr = htonl(ip);
     udp->flags |= FLAG_BIND_ADDR;
+    return 0;
+}
+
+// 外部 fd 注入（p2p）：接管 fd 的收发，但**不拥有**它（不 close）。可在运行中重复调用：
+// ffp2p 重新打洞换了端口时，fd 会换一个，旧的自然由它自己关。
+int ffrdp_udp_lowlevel_attach(void *fl, uintptr_t fd, FFRDP_LOWLEVEL_FLT filter, void *user)
+{
+    UDP_LOWLEVEL *udp = (UDP_LOWLEVEL *)fl;
+    int           s   = (int)(intptr_t)fd;
+
+    // fd == 0 是合法的（stdin 关掉的守护进程里 socket() 就可能拿到 0）⇒ 只挡负数。
+    if (!udp || s < 0) return -1;
+    // 本层的 sockfd 是 int（与 send/recv 那几处一致）：装不进去就明确拒绝，别静默截断
+    if ((uintptr_t)(intptr_t)s != fd) {
+        printf("<2> ffrdp-udp attach: fd %p does not fit in int on this build\n", (void*)(intptr_t)fd);
+        return -1;
+    }
+
+    pthread_mutex_lock(&udp->lock);
+    // filter 必须先于 sockfd 写：工作线程一看到新 sockfd 就会开始 recv 并回调 filter，
+    // 顺序反了那几个包会落进 FFRDP 的帧解析（FFP2 保活包被当垃圾丢掉，连累 punch 判死）。
+    udp->filter      = filter;
+    udp->filter_user = user;
+    udp->sockfd      = s;
+    udp->ext_ready   = 0;  // 新 fd：非阻塞/缓冲要重设一遍（由工作线程做）
+    udp->flags      |= FLAG_EXT_FD;
+    pthread_mutex_unlock(&udp->lock);
+
+    ffrdp_udp_notify(udp); // 叫醒可能正永久睡着的接收线程
     return 0;
 }
 

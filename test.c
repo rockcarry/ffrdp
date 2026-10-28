@@ -61,6 +61,14 @@ static char server_bind_ip[32] = "0.0.0.0";
 static char client_cnnt_ip[32] = "127.0.0.1";
 static int  server_bind_port   = 8000;
 static int  client_cnnt_port   = 8000;
+// --server=/--client= 的值里含 "://" 时，整串当成**完整 URL** 原样交给 ffrdp_init：
+//   --server="ffrdpsonffp2p://local:uuid_a,server:ffp2p.nat100.top"
+//   --client="ffrdpconffp2p://local:uuid_b,remote:uuid_a,server:ffp2p.nat100.top"
+// p2p 下没有 ip:port 可拆，所以这两条走独立缓冲（ip/port 保持默认，只用于打印）。
+static char server_url[512] = "";
+static char client_url[512] = "";
+// 任一 URL 带 "://" ⇒ p2p 模式：建链要等打洞（秒级到几十秒），"还没连上"的宽限期不能再用 5 s
+static int  g_p2p_mode = 0;
 
 // ①-41 的两个应用侧旋钮（env ✓，默认 = 老行为 ✓）：
 //   TEST_APP_SENDRETRY：send 被拒后立刻重试几次（0 = 下一个循环再说，会白等一次 10ms 的 recv ✗）；
@@ -127,13 +135,14 @@ typedef struct {
     int        *port;      // 端口（指向命令行解析出来的全局变量）
     int        *send_size; // 本端每条消息的最大字节数（含 framing 头尾）
     int        *send_speed;// 发送限速 KB/s（0 = 不限速），指向命令行解析出来的全局变量
+    const char *url;       // 完整 URL（*onffp2p:// 等）；非空时忽略 ip/port，原样交给 ffrdp_init
 } TEST_PEER;
 
 static TEST_PEER g_peers[] = {
     { "server", "client", "client connected !"    , 1, server_bind_ip, &server_bind_port,
-      &server_max_send_size, &send_speed },
+      &server_max_send_size, &send_speed, server_url },
     { "client", "server", "connect to server ok !", 0, client_cnnt_ip, &client_cnnt_port,
-      &client_max_send_size, &send_speed },
+      &client_max_send_size, &send_speed, client_url },
 };
 #define TEST_PEER_SERVER  (&g_peers[0])
 #define TEST_PEER_CLIENT  (&g_peers[1])
@@ -599,7 +608,13 @@ static void lat_print(const TEST_VERIFY *v, const char *name)
 static int peer_connect_get(void)
 {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TEST_PEER_CONNECT_MS"); v = (e && *e) ? atoi(e) : TEST_PEER_CONNECT_MS; }
+    if (v < 0) {
+        const char *e = getenv("TEST_PEER_CONNECT_MS");
+        // p2p：打洞 + 信令下发链路本来就是秒级到几十秒（被动端要靠 sync 才发现链路）。
+        // 这里若还用 5 s，就会不停重建上下文 ⇒ 每次重建都把正在打洞的 ffp2p 实例丢掉，
+        // 永远连不上（实测日志：88 s 内重建 17 次、link 号一路 +1、sendto 0 次）。
+        v = (e && *e) ? atoi(e) : (g_p2p_mode ? 90000 : TEST_PEER_CONNECT_MS);
+    }
     if (v < 100) v = 100;
     return v;
 }
@@ -998,15 +1013,20 @@ static void* peer_thread(void *param)
 
     while (!g_exit) {
         if (!ffrdp) {
-            char addr[80];
-            snprintf(addr, sizeof(addr), "%s:%d", peer->ip, *peer->port);
             {
                 // v2 接口：角色进 scheme、smss/sfec 进配置串 ✓；FFRDP_HS（A/B 用）0 ⇒ 老路径、1 ⇒ 强制握手、不设 ⇒ 跟随默认 ✓。
-                char params[160];
+                char params[512];
                 const char *hs = getenv("FFRDP_HS");
-                snprintf(params, sizeof(params), "%s://%s,mss:1280,fec:0%s",
-                         peer->is_server ? "ffrdps" : "ffrdpc", addr,
-                         (hs && *hs) ? (atoi(hs) ? ",hs:1" : ",hs:0") : "");
+                if (peer->url && peer->url[0]) {
+                    // 完整 URL（p2p 等）：默认值由 URL 自己写，不再追加 mss/fec
+                    snprintf(params, sizeof(params), "%s", peer->url);
+                } else {
+                    char addr[80];
+                    snprintf(addr, sizeof(addr), "%s:%d", peer->ip, *peer->port);
+                    snprintf(params, sizeof(params), "%s://%s,mss:1280,fec:0%s",
+                             peer->is_server ? "ffrdps" : "ffrdpc", addr,
+                             (hs && *hs) ? (atoi(hs) ? ",hs:1" : ",hs:0") : "");
+                }
                 printf("%s ffrdp_init: %s\n", peer->name, params);   // 排查用：实际配置进日志 ✓
                 fflush(stdout);
                 ffrdp = ffrdp_init(params, on_event, &cr);   // cbctx = 本端的加密实例
@@ -1122,13 +1142,16 @@ int main(int argc, char *argv[])
         if (strstr(argv[i], "--server=") == argv[i]) {
             server_en = 1;
             if (strcmp(argv[i] + 9, "") != 0) {
+                // 含 "://" ⇒ 完整 URL（如 ffrdpsonffp2p://local:...）：不拆 ip:port，原样用
+                if (strstr(argv[i] + 9, "://")) snprintf(server_url, sizeof(server_url), "%s", argv[i] + 9);
                 // snprintf 而不是 strncpy：源串可能比目标长 ⇒ strncpy 会填满 32 字节而不留结尾的 0（-O2 下 -Wstringop-truncation 拦下 ✓）。
-                snprintf(server_bind_ip, sizeof(server_bind_ip), "%s", argv[i] + 9);
+                else snprintf(server_bind_ip, sizeof(server_bind_ip), "%s", argv[i] + 9);
             }
         } else if (strstr(argv[i], "--client=") == argv[i]) {
             client_en = 1;
             if (strcmp(argv[i] + 9, "") != 0) {
-                snprintf(client_cnnt_ip, sizeof(client_cnnt_ip), "%s", argv[i] + 9);
+                if (strstr(argv[i] + 9, "://")) snprintf(client_url, sizeof(client_url), "%s", argv[i] + 9);
+                else snprintf(client_cnnt_ip, sizeof(client_cnnt_ip), "%s", argv[i] + 9);
             }
         } else if (strcmp(argv[i], "--server") == 0) {
             server_en = 1;
@@ -1169,6 +1192,7 @@ int main(int argc, char *argv[])
 
     strtok_r(server_bind_ip, ":", &str); if (str && *str) server_bind_port = atoi(str);
     strtok_r(client_cnnt_ip, ":", &str); if (str && *str) client_cnnt_port = atoi(str);
+    g_p2p_mode = (server_url[0] || client_url[0]) ? 1 : 0;   // 影响"还没连上"的宽限期（见 peer_connect_get）
     {   // 两个验收开关（都不设 ⇒ 与以前完全一样 ✓）
         const char *si = getenv("FFRDP_IDLE");
         const char *sc = getenv("FFRDP_CLOSE");

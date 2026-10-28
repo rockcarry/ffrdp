@@ -85,7 +85,19 @@ typedef struct {
 //  - "bind:127.0.0.1:1234", indicate bind address and port
 //  - "none": do not bind. A client endpoint wants this: the source port is then chosen by the kernel when
 //    the first frame goes out, which is what this project did before the transport owned the socket.
+//  - "p2p": 外部 fd 模式。不建 socket、不 bind，等 ffrdp_p2p_attach() 把已经打洞成功的 socket
+//    交进来（复用打洞时那个 fd 才能保住 NAT 映射：新开 socket = 换五元组 = 打洞白做）。
+//    注入前 send() 返回 -1（帧丢，协议自己重传），接收线程只等着被唤醒。
 FFRDP_LOWLEVEL* ffrdp_udp_lowlevel_init(void *params, FFRDP_LOWLEVEL_CB callback, void *cbctx);
+
+// 外部 fd 注入（只对 params="p2p" 的端点有意义）。
+//  - fd 归调用方所有：本层不会 close 它，exit() 也不会；
+//  - filter 非 NULL 时，收到的包先交给它；返回非 0 = 已被上层消费（不当成 FFRDP 帧）。
+//    p2p 场景用它把 "FFP2" 保活包喂回 ffp2p，否则对端会在 dead_ms 后误判失联。
+//  - 可在运行中重复调用（重新打洞换了 fd 时），旧 fd 不会被关。
+//  返回 0 = 已接管，-1 = 参数错/不是 p2p 端点。
+typedef int (*FFRDP_LOWLEVEL_FLT)(void *user, uint8_t *buf, int len, const void *from);
+int ffrdp_udp_lowlevel_attach(void *fl, uintptr_t fd, FFRDP_LOWLEVEL_FLT filter, void *user);
 
 #endif
 

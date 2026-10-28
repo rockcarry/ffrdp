@@ -8,6 +8,10 @@
 #include "lowlevel.h"
 #include "ffrdp.h"
 
+#if FFRDP_WITH_FFP2P
+#include <ffp2p/ffp2p.h>
+#endif
+
 /* ══ FFRDP_DIAG：诊断/调试代码的总开关（默认 0）═════════════════════════════
  * 0（默认 · release / 嵌入式）：dump、①-xx、以及“只给 dump 用”的计数器全部**编译掉** ✓
  *   ⇒ 无 printf、无静态内存、无计数开销；逻辑真正要读的量不受影响 ✓。
@@ -122,6 +126,7 @@
 #define FFRDP_HS_FIN      4
 #define FFRDP_HS_RETRY_MS 500   // 重传间隔（总时限用配置的 handshake_ms）
 // 握手状态（每条连接）；0 = 无握手
+#define HS_NONE     0
 #define HS_SYN_SENT 1   // 客户端发了 SYN，等 SYN-ACK
 #define HS_SYN_RCVD 2   // 服务端发了 SYN-ACK（半开），等 ACK
 #define HS_UP       3   // 已建立
@@ -645,6 +650,7 @@ typedef struct {
     // ---- 上层边界 ----
     // 协议与应用线程只在这里见面：接收缓冲 + 几个"协议发布给应用看"的镜像量（协议自己的状态仍只被一个执行者碰）。
     FFRDP_LOWLEVEL   *lowlevel;      // 传输层：socket/收包/定时都在它自己的工作线程里
+    void             *p2p;           // ffp2p 实例（只有 *onffp2p:// 才有；NULL = 普通 UDP 端点）
     int               closing;       // 应用说要关：让等待中的应用线程醒来并返回（全部访问都在锁内，不需要原子类型）
     FFRDP_CALLBACK    app_callback;  // 应用回调（v2 起：ACCEPT/CONNECT/DISCONN/ENCRYPT/DECRYPT/RECVDATA）
     void             *app_cbctx;
@@ -1014,6 +1020,7 @@ static void ffrdp_conn_init(FFRDPCONN *c, int smss, int sfec)
     c->rto      = FFRDP_MIN_RTO;
     c->rmss     = FFRDP_MAX_RX_MSS; // rmss 是"对端能发多大"（收到的帧是多大）⇒ 用收 MSS ✓，不是我们发多大
     c->smss     = MAX(1, MIN(smss, FFRDP_MAX_MSS));
+    c->hs_state = HS_NONE;          // 默认不走握手（hs:1 时由建链/交接事件推进）
     c->fec_txredundancy = FFRDP_FEC_ENABLE ? MAX(0, MIN(sfec, FFRDP_FRAME_TYPE_FEC32)) : 0;  // 关掉 ⇒ 帧不加冗余尾 ✓
     // ①-45：这里不分配任何缓冲 —— 接收环等第一帧到达时再分配（见 rcv_ring_init ✓）。
     c->tick_conn_init = NOW_MS();   // 本连接的年龄起点 ⇒ dump 的 `conn age`（与 total_send/total_recv 同源 ✓）
@@ -1085,24 +1092,159 @@ static FFRDPCONN *ffrdp_conn_lookup(FFRDPCONTEXT *ffrdp, int handle)
     return c;
 }
 
+// ── p2p（ffp2p 打洞）────────────────────────────────────────────────────────
+#if FFRDP_WITH_FFP2P
+// 这个 socket 是跟 ffp2p 共用的：它的保活/探测包（"FFP2" 开头）要交回去，
+// 否则 punch 的 dead_ms 计时看不到任何回包 ⇒ 30s 后误判对端失联（数据面其实好好的）。
+static int ffrdp_p2p_filter(void *user, uint8_t *buf, int len, const void *from)
+{
+    FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)user;
+    if (!ffrdp || !ffrdp->p2p || len < 4) return 0;
+    if (buf[0] == 'F' && buf[1] == 'F' && buf[2] == 'P' && buf[3] == '2') {
+        ffp2p_data_feed(ffrdp->p2p, buf, len, from);
+        return 1;
+    }
+    return 0;
+}
+
+// 客户端的第一个 SYN 必须等到打洞成功：那时才知道对端的公网 ip:port。
+static void ffrdp_p2p_client_start(FFRDPCONTEXT *ffrdp, const char *peer_text)
+{
+    FFRDPCONN *c = &ffrdp->conn;
+    uint32_t   ip;
+    int        port;
+
+    if (!peer_text || !peer_text[0]) { printf("<3> ffrdp: p2p 已连通但没给对端地址\n"); return; }
+    if (ffrdp_addr_parse_text((char*)peer_text, &ip, &port, -1) != 0 || port <= 0) {
+        printf("<2> ffrdp: p2p 对端地址 \"%s\" 不是 ip:port\n", peer_text);
+        return;
+    }
+    pthread_mutex_lock(&ffrdp->lock);
+    c->peer_addr = ffrdp_addr_make(ip, (uint16_t)port);
+    if (ffrdp->hs_enable) {
+        c->hs_state = HS_SYN_SENT;
+        c->hs_start = NOW_MS();
+        ffrdp_hs_send(ffrdp, c, FFRDP_HS_SYN);
+        ffrdp_arm_timer(ffrdp);
+    }
+    pthread_mutex_unlock(&ffrdp->lock);
+    printf("<6> ffrdp: p2p 链路就绪，对端 %s，开始握手\n", peer_text);
+}
+
+// ffp2p 事件（跑在 ffp2p 自己的 worker 线程上，不能阻塞）。
+static long ffrdp_p2p_event(void *cbctx, int type, void *buf, int len)
+{
+    FFRDPCONTEXT *ffrdp = (FFRDPCONTEXT*)cbctx;
+    if (!ffrdp) return -1;
+    if (type == FFP2P_EVENT_CONNECTED) {
+        const FFP2P_CONN_INFO *ci = (const FFP2P_CONN_INFO*)buf;
+        long fd;
+
+        if (!ci) return 0;
+        // 顺序不能反：先让 ffp2p 停收这个 fd（否则两边抢包），再拿 fd，再交给本层。
+        ffp2p_set(ffrdp->p2p, FFP2P_KEY_DATA_DETACH, (void*)(intptr_t)1);
+        fd = ffp2p_get(ffrdp->p2p, FFP2P_KEY_FD, NULL);
+        if (fd < 0) { printf("<2> ffrdp: p2p 没有可用的 fd\n"); return 0; }   /* fd 0 是合法的 */
+        if (ffrdp_udp_lowlevel_attach(ffrdp->lowlevel, (uintptr_t)fd, ffrdp_p2p_filter, ffrdp) != 0) {
+            printf("<2> ffrdp: 接管 p2p fd 失败\n");
+            return 0;
+        }
+        // 这行必须两端都打：排障时"对端有没有 attach"全靠它（没有 = 对端 punch 还在收包，
+        // 会把我方发过去的所有帧当非 FFP2 包丢掉，现象是"打洞成功但握手一直不通"）。
+        if (ffrdp->is_server) printf("<6> ffrdp: p2p 链路就绪，对端 %s（服务端，等 SYN）\n", ci->addr);
+        if (!ffrdp->is_server) ffrdp_p2p_client_start(ffrdp, ci->addr);
+    } else if (type == FFP2P_EVENT_DISCONNECTED) {
+        printf("<3> ffrdp: p2p 链路断开（reason %d），交给协议判死\n", buf ? *(int*)buf : -1);
+    }
+    return 0;
+}
+#endif
+
+// 建 ffp2p 实例并启动（失败返回 -1）。没有 libffp2p 时这里就是一条明确的报错。
+static int ffrdp_p2p_start(FFRDPCONTEXT *ffrdp, const char *p2p_params)
+{
+#if FFRDP_WITH_FFP2P
+    char params[640];
+
+    if (!strstr(p2p_params, "server:")) { printf("ffrdp_init: p2p 必须给 server:<信令服务器>\n"); return -1; }
+    /* local:<UUID> 缺了 ffp2p 也能 init 成功，但永远建不了链，现象是"等 30s 后判死"。 */
+    if (!strstr(p2p_params, "local:"))
+        printf("<2> ffrdp: p2p 没有给 local:<本机 UUID>，将无法建链\n");
+    /* 被动端（ffrdpsonffp2p，不配 remote）只能靠 sync 拿到链路与对端候选，而 ffp2p 默认
+     * sync_idle = 30 s ⇒ 打洞要等半分钟，比协议层握手(handshake_ms)和应用层建链超时都长。
+     * 这里只补"没显式给"的 sync_idle（10 s：再快就变成频繁打信令，线上跑 natapp 隧道时更明显）；
+     * 用户写了 sync_idle 就完全听用户的。 */
+    snprintf(params, sizeof(params), "%s", p2p_params);
+    {   size_t n = strlen(params);
+        if (!strstr(params, "sync_idle") && n + 24 < sizeof(params))
+            snprintf(params + n, sizeof(params) - n, ",i_sync_idle:10000");
+    }
+    ffrdp->p2p = ffp2p_init((void*)params, ffrdp_p2p_event, ffrdp);
+    if (!ffrdp->p2p) { printf("failed to init ffp2p !\n"); return -1; }
+    if (ffp2p_set(ffrdp->p2p, FFP2P_KEY_STATE, (void*)(intptr_t)1) != 0) {
+        printf("<2> ffrdp: ffp2p 启动失败（params \"%s\"）\n", params);
+        ffp2p_exit(ffrdp->p2p); ffrdp->p2p = NULL;
+        return -1;
+    }
+    printf("<6> ffrdp: p2p 已启动（%s）\n", params);
+    return 0;
+#else
+    (void)ffrdp; (void)p2p_params;
+    printf("<2> ffrdp_init: *onffp2p:// 需要 libffp2p，本版本未编译 p2p 支持（FFRDP_WITH_FFP2P=0）\n");
+    return -1;
+#endif
+}
+
+// 退出前先把数据面交回 ffp2p（i_data_detach=0）：移交模式下 ffp2p 的 exit **不关** fd
+// （fd 归上层），而 lowlevel 也不拥有它 ⇒ 不交回就是句柄泄漏。交回后由 ffp2p 负责 close。
+#if FFRDP_WITH_FFP2P
+#define FFRDP_P2P_STOP(f) do {                                                  \
+        if ((f)->p2p) {                                                         \
+            ffp2p_set((f)->p2p, FFP2P_KEY_DATA_DETACH, (void*)(intptr_t)0);     \
+            ffp2p_set((f)->p2p, FFP2P_KEY_STATE, (void*)(intptr_t)0);           \
+            ffp2p_exit((f)->p2p);                                               \
+            (f)->p2p = NULL;                                                    \
+        }                                                                       \
+    } while (0)
+#else
+#define FFRDP_P2P_STOP(f) do { (void)(f); } while (0)
+#endif
+
 // 配置串解析（v2）："ffrdps://ip[:port][,key:val]..." / "ffrdpc://ip[:port][,key:val]..."。
+// p2p 变体："ffrdpsonffp2p://local:UUID_A[,remote:UUID_B],server:信令[,stun:...]"（无地址段）。
 void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
 {
     FFRDPCONTEXT *ffrdp = NULL;
-    char          buf[192];
+    char          buf[512];  // p2p 的 server/stun 串比 "0.0.0.0:8000" 长得多
+    char          p2p_params[512] = "";
+    int           p2p_n = 0;
     char         *text, *addr, *key;
-    int           server = 0, smss = FFRDP_MAX_MSS, sfec = 0;
+    int           server = 0, p2p = 0, smss = FFRDP_MAX_MSS, sfec = 0;
     int           maxconn = FFRDP_MAXCONN, handshake_ms = 10000, idle_ms = 5000, hs_enable = 1;
 
     if (!params) { printf("ffrdp_init: params is NULL\n"); return NULL; }
     snprintf(buf, sizeof(buf), "%s", (char*)params);
     text = buf;
-    if      (strncmp(text, "ffrdps://", 9) == 0) { server = 1; text += 9; }
+    // 新 scheme 必须排在前面判：ffrdpsonffp2p:// 与 ffrdps:// 的第 7 个字符不同，不会互相吃掉，
+    // 但先判长的更不容易在以后加变体时出错。
+    if      (strncmp(text, "ffrdpsonffp2p://", 16) == 0) { server = 1; p2p = 1; text += 16; }
+    else if (strncmp(text, "ffrdpconffp2p://", 16) == 0) { server = 0; p2p = 1; text += 16; }
+    else if (strncmp(text, "ffrdps://", 9) == 0) { server = 1; text += 9; }
     else if (strncmp(text, "ffrdpc://", 9) == 0) { server = 0; text += 9; }
-    else { printf("ffrdp_init: params must start with ffrdps:// or ffrdpc:// (got \"%s\")\n", buf); return NULL; }
-    addr = text;
-    key  = strchr(text, ',');
-    if (key) *key++ = 0;
+    else {
+        printf("ffrdp_init: params must start with ffrdps://, ffrdpc://, ffrdpsonffp2p:// or "
+               "ffrdpconffp2p:// (got \"%s\")\n", buf);
+        return NULL;
+    }
+    if (p2p) {
+        // p2p 没有"地址"那一段：整串都是 key:value（local:/remote:/server:/stun:/...）
+        addr = NULL;
+        key  = text;
+    } else {
+        addr = text;
+        key  = strchr(text, ',');
+        if (key) *key++ = 0;
+    }
     while (key && *key) {
         char *next = strchr(key, ',');
         char *colon;
@@ -1120,6 +1262,22 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
         else if (!strcmp(key, "mss"))          smss         = val;
         else if (!strcmp(key, "fec"))          sfec         = val;
         else if (!strcmp(key, "hs"))           hs_enable    = val;   // 三次握手开关（**默认开** ✓；hs:0 关掉 ⇒ v1 行为 ✓）
+        else if (p2p) {
+            // 其余键原样交给 ffp2p（local/remote/server/stun 以及它自己的 i_*/s_* 键）：
+            // ffrdp 不该维护第二份词表，ffp2p 新增键也就能直接用。server 补 http:// —— 它只认 URL。
+            int n;
+            if (!strcmp(key, "server") && strncmp(colon, "http://", 7) != 0 && strncmp(colon, "https://", 8) != 0)
+                n = snprintf(p2p_params + p2p_n, sizeof(p2p_params) - (size_t)p2p_n,
+                             "%sserver:http://%s", p2p_n ? "," : "", colon);
+            else
+                n = snprintf(p2p_params + p2p_n, sizeof(p2p_params) - (size_t)p2p_n,
+                             "%s%s:%s", p2p_n ? "," : "", key, colon);
+            if (n < 0 || p2p_n + n >= (int)sizeof(p2p_params)) {
+                printf("ffrdp_init: p2p 参数过长（上限 %u 字节）\n", (unsigned)sizeof(p2p_params));
+                return NULL;
+            }
+            p2p_n += n;
+        }
         else { printf("ffrdp_init: unknown option \"%s\"\n", key); return NULL; }
         key = next;
     }
@@ -1164,7 +1322,11 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
     pthread_cond_init(&ffrdp->cond, NULL);
     {
         char llparams[128], peer[128];
-        if (server) {
+        if (p2p) {
+            // 外部 fd 模式：本层不建 socket、不 bind，等 ffp2p 打洞成功后 attach 进来
+            ffrdp->is_server = server ? 1 : 0;
+            snprintf(llparams, sizeof(llparams), "p2p");
+        } else if (server) {
             ffrdp->is_server = 1;
             // 允许直接给传输层的原样写法（"bind:..."），其余情况由这里补前缀。
             if (addr && strncmp(addr, "bind:", 5) == 0) snprintf(llparams, sizeof(llparams), "%s", addr);
@@ -1175,7 +1337,10 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
             printf("failed to start the lowlevel transport !\n");
             goto failed;
         }
-        if (!server) {
+        if (p2p) {
+            // 必须在 lowlevel 之后：CONNECTED 回调里要 attach 到它
+            if (ffrdp_p2p_start(ffrdp, p2p_params) != 0) goto failed;
+        } else if (!server) {
             uint32_t peer_ip;
             int      peer_port;
             snprintf(peer, sizeof(peer), "%s", (addr && *addr) ? addr : "127.0.0.1");
@@ -1203,6 +1368,7 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
 
 failed:
     if (ffrdp->lowlevel) { ffrdp->lowlevel->exit(ffrdp->lowlevel); ffrdp->lowlevel = NULL; }
+    FFRDP_P2P_STOP(ffrdp);  // lowlevel 线程已停 ⇒ 现在才能关 ffp2p（那个 fd 是它的）
     pthread_cond_destroy (&ffrdp->cond);
     pthread_mutex_destroy(&ffrdp->lock);
     free(ffrdp);
@@ -1292,6 +1458,8 @@ void ffrdp_exit(void *ctxt)
     // 置 NULL 再 exit，那把正在跑的 tick 就会在 ffrdp_send_data_frame 里对 NULL 取成员（ffrdp->lowlevel->send ✓），实测 0.17% 的收尾段错误就是这么来的。
     if (ll) ll->exit(ll);
     FFEXIT_STAGE(3);   // lowlevel 线程已停 + join 完
+    // lowlevel 已不再读那个 fd ⇒ 现在才能关 ffp2p（fd 归它；反过来的话接收线程会踩到已关闭句柄）
+    FFRDP_P2P_STOP(ffrdp);
     pthread_mutex_lock(&ffrdp->lock);
     ffrdp->lowlevel = NULL; // 线程已停、handle 也已被它自己释放 ⇒ 现在摘掉才安全
     // ⚠️ 按需分配的连接**必须等在这里**再放 ✗✓：工作线程刚刚可能正跑在
@@ -3005,8 +3173,8 @@ static void ffrdp_hs_rx(FFRDPCONTEXT *ffrdp, uint64_t addr, uint8_t sub)
             ffrdp_hs_send(ffrdp, c, FFRDP_HS_SYN_ACK);
             return;
         }
-        if (sub == FFRDP_HS_SYN && c->hs_state == HS_SYN_RCVD) { // SYN 丢了 ⇒ 重发 SYN-ACK
-            ffrdp_hs_send(ffrdp, c, FFRDP_HS_SYN_ACK);
+        if (sub == FFRDP_HS_SYN && c->hs_state == HS_SYN_RCVD) {
+            ffrdp_hs_send(ffrdp, c, FFRDP_HS_SYN_ACK); // SYN 丢了 ⇒ 重发 SYN-ACK
             return;
         }
         if (sub == FFRDP_HS_ACK && c->hs_state == HS_SYN_RCVD) { // 握手完成
@@ -3377,6 +3545,13 @@ static void ffrdp_dump_conn(FFRDPCONTEXT *ffrdp, FFRDPCONN *c, int handle, int c
     // "发不出去"的另一半：ffrdp_send 记库的拒绝，这里记内核的（sendto 没接下）。非 0 ⇒ 套接字缓冲对突发不够；受影响的帧被重试过，代价只在这里可见。
     printf("counter_send_err    : %u\n"  , c->counter_send_err    );
     printf("counter_send_query  : %u\n"  , c->counter_send_query  );
+    // keepalive 现场：silent = 距上次"听到对端"的年龄。握手成功后它应该一直很小（QUERY/ACK
+    // 保活每 idle/2 刷一次）；一旦接近 deadline 就说明保活没在跑 ⇒ 再过几秒必判死。
+    {   char hab[48];
+        printf("keepalive now       : hs=%s, peer=%s, silent %u ms (deadline %u)\n",
+               dump_hs_name(c->hs_state), ffrdp_addr_text(c->peer_addr, hab, sizeof(hab)),
+               (unsigned)(NOW_MS() - c->tick_last_recv), (unsigned)ffrdp_idle_deadline(ffrdp, c));
+    }
     printf("counter_tailprobe     : %u\n", c->counter_tailprobe       );
     printf("counter_tailprobe_lost: %u\n", c->counter_tailprobe_lost  );
     printf("counter_resend_rto  : %u\n"  , c->counter_resend_rto  );

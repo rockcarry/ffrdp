@@ -54,6 +54,9 @@ gen_libffrdp_pkgconfig_file()
     echo "Description: ffrdp library"                   >> $TOPDIR/libffrdp.pc
     echo "Version: $ver"                                >> $TOPDIR/libffrdp.pc
     echo "Libs: -L\${libdir} -lffrdp"                   >> $TOPDIR/libffrdp.pc
+    # 编了 p2p 后端的话，静态链接的上层要把 libffp2p 一起带上（否则 ffrdp_init 里那两个
+    # 符号 undefined）。没编就什么都不写 —— 保持"零依赖"这个默认 ✓。
+    [ -n "$FFRDP_PC_REQUIRES" ] && echo "Requires.private: $FFRDP_PC_REQUIRES" >> $TOPDIR/libffrdp.pc
     echo "Cflags: -I\${includedir}"                     >> $TOPDIR/libffrdp.pc
 }
 
@@ -108,7 +111,26 @@ build_package()
         ;;
     esac
 
+    # ── p2p 后端（可选）─────────────────────────────────────────────────────
+    # 有 libffp2p 就编进去（ffrdpsonffp2p:// / ffrdpconffp2p://）；没有就只是不支持那两个 scheme，
+    # UDP 路径完全不受影响。交叉编译时 pkg-config 常常只认宿主库 ⇒ 可用 FFP2P_CFLAGS/FFP2P_LIBS 直接给。
+    local FFP2P_CFLAGS="${FFP2P_CFLAGS:-}"
+    local FFP2P_LIBS="${FFP2P_LIBS:-}"
+    local WITH_FFP2P=0
+    if [ -z "$FFP2P_LIBS" ] && pkg-config --exists libffp2p 2>/dev/null; then
+        FFP2P_CFLAGS=$(pkg-config --cflags libffp2p)
+        FFP2P_LIBS=$(pkg-config --libs --static libffp2p)
+    fi
+    FFRDP_PC_REQUIRES=""
+    if [ -n "$FFP2P_LIBS" ]; then
+        WITH_FFP2P=1
+        FFRDP_PC_REQUIRES="libffp2p"
+        CFLAGS="$CFLAGS -DFFRDP_WITH_FFP2P=1 $FFP2P_CFLAGS"
+    fi
+
     echo "build tier: $BUILD_MODE (${CROSS_COMPILE}gcc)"
+    if [ "$WITH_FFP2P" = "1" ]; then echo "p2p backend: on ($FFP2P_LIBS)"
+    else                              echo "p2p backend: off (no libffp2p; *onffp2p:// 不可用)"; fi
     gen_libffrdp_pkgconfig_file
     # 协议层依赖传输层：ffrdp.c 现在只认 lowlevel 的接口（send / timer / 回调），实现是 lowlevel-udp.c，
     # 它自己又用 socket.c 与 utils.c（工作线程）。所以这几份一起进库 —— 少一份就是运行期才发现的
@@ -123,7 +145,8 @@ build_package()
     #               -DFFC_BACKEND=1 OpenSSL   （切过去要自己加 -lcrypto 到 EXTRA_CFLAGS/LDFLAGS）
     #               -DFFC_BACKEND=2 mbedTLS   （切过去要自己加 -lmbedcrypto）
     #   · 不用加密的构建可以把它从命令行里删掉，不影响 test_ffrdp 的其它功能。
-    ${CROSS_COMPILE}gcc $CFLAGS test.c ffcrypto.c libffrdp.a $LDFLAGS -o test_ffrdp
+    # $FFP2P_LIBS 必须在 libffrdp.a 之后（静态链接的符号解析顺序 ✓）；没编 p2p 时它是空串 ✓
+    ${CROSS_COMPILE}gcc $CFLAGS test.c ffcrypto.c libffrdp.a $LDFLAGS $FFP2P_LIBS -o test_ffrdp
     mkdir -p $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/include
     mkdir -p $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/lib/pkgconfig
     cp $TOPDIR/ffrdp.h     $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/include/
