@@ -79,6 +79,12 @@ typedef struct {
     // RX 批上限 = FFRDP_LOWLEVEL_RX_BATCH_MAX（文件头的重扫选出来的 4 ✓）。
     int             rx_batch;         // 一圈最多收几帧（= FFRDP_LOWLEVEL_RX_BATCH_MAX ✓）
     int             bufsize;          // 套接字缓冲请求值（字节 ✓）= FFRDP_LOWLEVEL_BUFSIZE_KB * 1024
+    // 发送失败（**不受 FFRDP_DIAG 门控**）：p2p 模式下这个 fd 与 ffp2p 共用，一旦它坏了
+    // （EBADF/ENETUNREACH/ENOBUFS/EWOULDBLOCK 长挂），协议侧只会看到 counter_send_err 涨，
+    // 而日志里一个字节都没有 ⇒ "打洞成功但数据面不通"根本无从判断是没发还是没回。
+    uint32_t        tx_fail;          // sendto 没送满 len 的次数（含 EWOULDBLOCK）
+    int             tx_fail_errno;    // 最近一次的 errno
+    int             tx_fail_eagain;   // 其中 EWOULDBLOCK 的次数（本地发送缓冲满，不作错误但要看得到）
 #if FFRDP_DIAG
     int             buf_rcv_eff;      // 内核实际给的（getsockopt ✓，dump 里打 ✓）
     int             buf_snd_eff;
@@ -226,7 +232,7 @@ static void ffrdp_udp_tick(UDP_LOWLEVEL *udp)
 {
     uint32_t now = get_timestamp32_ms();
     pthread_mutex_lock(&udp->lock);
-    if (!udp->deadline || (int32_t)(udp->deadline - now) > 0) {
+    if (!udp->deadline || ffrdp_ts_diff(udp->deadline, now) > 0) {
         if (!udp->deadline) LSTAT(udp, stat_tick_none); else LSTAT(udp, stat_tick_early);
         pthread_mutex_unlock(&udp->lock); return;
     }
@@ -247,14 +253,14 @@ static int ffrdp_udp_lowlevel_timer(void *fl, uint32_t deadline_ms)
     pthread_mutex_lock(&udp->lock);
     old           = udp->deadline;
     udp->deadline = deadline_ms;
-    wake          = (old == 0) || ((int32_t)(deadline_ms - old) < 0) || udp->asleep;
+    wake          = (old == 0) || ffrdp_ts_before(deadline_ms, old) || udp->asleep;
     pthread_mutex_unlock(&udp->lock);
     // The same "am I the loop?" test exit() uses: a callback is running on the loop's own thread.
     from_loop = (udp->mthread.hthread && udp->mthread.hthread == (void*)pthread_self());
 #if FFRDP_DIAG
     {   uint64_t t_arm0 = ffrdp_udp_us();      // arm/wake 自己值多少 ✓
         // 分档：0 是"没有期限"的哨兵，**不是**"现在" ✓
-        {   int32_t left = (int32_t)(deadline_ms - get_timestamp32_ms());
+        {   int32_t left = ffrdp_ts_diff(deadline_ms, get_timestamp32_ms());
             if      (!deadline_ms)  udp->stat_arm_d0++;
             else if (left <= 0)   { udp->stat_arm_dnow++;
                                     if (from_loop) udp->stat_arm_now_loop++; else udp->stat_arm_now_other++; }
@@ -336,7 +342,7 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
         struct timeval tv, *tvp = NULL;
         uint32_t dl = ffrdp_udp_sleep_begin(udp);
         if (dl) {
-            int32_t left = (int32_t)(dl - get_timestamp32_ms());
+            int32_t left = ffrdp_ts_diff(dl, get_timestamp32_ms());
             // left<0 就是"实睡 0ms"的那种自旋圈 ✗（select 返回 0 ⇒ 又是一圈）
             if (left < 0)       LSTAT(udp, stat_left_le0);
             else if (left == 0) LSTAT(udp, stat_left_0);
@@ -516,6 +522,10 @@ static void* ffrdp_udp_lowlevel_proc(void *arg)
     printf("udp lowlevel arm cost: from loop %u calls %u us, from other threads %u calls %u us\n",
            udp->stat_arm_n_loop, udp->stat_arm_us_loop, udp->stat_arm_n_other, udp->stat_arm_us_other);
 #endif
+    // 这一行**不受 FFRDP_DIAG 门控**：p2p 的现场就是"发不出去还是收不到"，ship 构建也要看得到。
+    printf("udp lowlevel summary: %u sendto failures (last errno %d, of which EWOULDBLOCK %d)\n",
+           udp->tx_fail, udp->tx_fail_errno, udp->tx_fail_eagain);
+    fflush(stdout);
     // 外部 fd（p2p）不归本层：它属于 ffp2p，这里关掉会让对端以为链路没了
     if (!(udp->flags & FLAG_EXT_FD)) closesocket(udp->sockfd);
     udp->sockfd = -1;
@@ -551,7 +561,22 @@ static int ffrdp_udp_lowlevel_send(void *fl, uint64_t addr, uint8_t *buf, int le
 {
     UDP_LOWLEVEL *udp = (UDP_LOWLEVEL *)fl;
     struct sockaddr_in to;
-    if (!udp || !buf || len <= 0 || udp->sockfd < 0) return -1;
+    // sockfd < 0 = 还没有 socket（p2p 模式下是"ffp2p 还没把 fd 交过来"）⇒ 这也不是"对端
+    // 收不到"，而是我们压根没发。原来这一支**完全静默**，p2p 上看起来就像"一直发但没回包" ✗。
+    if (!udp || !buf || len <= 0 || udp->sockfd < 0) {
+        // 只有 p2p（外部 fd）模式才值得记：普通模式本层自己在 worker 起来时建 socket，
+        // 建好之前应用先发一两帧是正常的，打出来只是噪音。
+        if (udp && (udp->flags & FLAG_EXT_FD)) {
+            udp->tx_fail++;
+            udp->tx_fail_errno = (udp->sockfd < 0) ? EBADF : EINVAL;
+            if (udp->tx_fail <= 3 || (udp->tx_fail % 500) == 0) {
+                printf("<3> ffrdp-udp send: p2p fd not handed over yet (fd %d), %u frames dropped\n",
+                       udp->sockfd, udp->tx_fail);
+                fflush(stdout);
+            }
+        }
+        return -1;
+    }
     ffrdp_udp_addr_unpack(addr, &to);
 #if FFRDP_DIAG
     // ①-40：量"发侧的突发" —— 发送**之前**取时刻（sendto 的耗时属于内核，不该算进帧间隔 ✓）。
@@ -578,9 +603,18 @@ static int ffrdp_udp_lowlevel_send(void *fl, uint64_t addr, uint8_t *buf, int le
     if (ret > 0) LSTAT_ADD(udp, stat_tx_bytes, ret);
     if (ret == len) return 0;
     // 非阻塞 ⇒ 发送缓冲满是繁忙链路上的正常答复 ✓（不值得每帧打一行 ✓）；其余才算真错误 ✓。
-    if (socket_errno() != EWOULDBLOCK) {
-        printf("<3> ffrdp-udp sendto %s:%d failed, ret: %d, errno: %d\n",
-               inet_ntoa(to.sin_addr), ntohs(to.sin_port), ret, socket_errno());
+    // 但"完全不打"曾让 p2p 的"发不出去"看起来和"发出去没回包"一模一样 ⇒ 现在一律记账，
+    // 只按次数限频打日志（前 3 次 + 每 500 次一条），并单独数 EWOULDBLOCK。
+    {   int err = socket_errno();
+        udp->tx_fail++;
+        udp->tx_fail_errno = err;
+        if (ret < 0 && err == EWOULDBLOCK) udp->tx_fail_eagain++;
+        if (udp->tx_fail <= 3 || (udp->tx_fail % 500) == 0) {
+            printf("<3> ffrdp-udp sendto %s:%d failed, ret: %d, errno: %d (fd %d, %u failures, %d of them EWOULDBLOCK)\n",
+                   inet_ntoa(to.sin_addr), ntohs(to.sin_port), ret, err, udp->sockfd,
+                   udp->tx_fail, udp->tx_fail_eagain);
+            fflush(stdout);
+        }
     }
     return -1;
 }

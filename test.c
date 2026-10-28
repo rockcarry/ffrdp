@@ -622,7 +622,7 @@ static int peer_connect_get(void)
 static int peer_is_lost_preconnect(void *ffrdp, int handle, uint32_t tick_recv)
 {
     if (ffrdp_isdead(ffrdp, handle)) return 1;
-    return (int32_t)get_timestamp32_ms() - (int32_t)tick_recv > peer_connect_get();
+    return ffrdp_ts_diff(get_timestamp32_ms(), tick_recv) > peer_connect_get();
 }
 
 // 一条连接上的应用循环：ffrdp/handle/peer 由调用方给（服务端一个上下文要同时跑 N 条 ✓）；
@@ -654,11 +654,12 @@ static int link_loop(struct link_arg *a)
     // ①-23：应用循环的账（只读 ✓）—— dump 里全是协议侧 ⇒ "谁在等"在应用这一格本来是空的 ✗。
     uint32_t loop_iters = 0, t_loop0 = 0, t_loop1 = 0, t_w;
     uint32_t rd_n = 0, rd_us = 0, re_n = 0, re_us = 0, rf_n = 0, rf_us = 0;
+    uint32_t db_sent = 0, db_recv = 0, db_at = 0;  // 上次 dump 的收发字节数/时刻：算这一段窗口的吞吐 ✓
     TEST_VERIFY v;
 
     memset(&v, 0, sizeof(v));
-    const int oh = msg_oh();                                        // A1：TEST_STAMP=1 时 16，否则 12 ✓
-    if (send_max < oh + 1) send_max = oh + 1;                       // 至少装得下一条最小消息
+    const int oh = msg_oh();                   // A1：TEST_STAMP=1 时 16，否则 12 ✓
+    if (send_max < oh + 1) send_max = oh + 1;  // 至少装得下一条最小消息
     sendbuf = malloc((size_t)send_max);
     stream  = malloc(TEST_STREAM_MAX);
     if (!sendbuf || !stream) {
@@ -672,7 +673,7 @@ static int link_loop(struct link_arg *a)
     int      tx_salt_left = 0;
     uint8_t  tx_salt[FFC_SALT_LEN];
     if (a->cr && a->cr->fc && !g_recv_only) {
-        int s = crypto_slot_get(a->cr, handle);          // 句柄 → 密码槽，别用句柄当下标
+        int s = crypto_slot_get(a->cr, handle);  // 句柄 → 密码槽，别用句柄当下标
         if (s >= 0) {
             salt_make(tx_salt);
             ffc_set_salt(a->cr->fc, s, FFC_TX, tx_salt);
@@ -684,17 +685,17 @@ static int link_loop(struct link_arg *a)
     }
 
     tick_dump  = get_timestamp32_ms();
-    tick_recv  = tick_dump;   // 还没收到过数据 ⇒ 从这一刻起算
+    tick_recv  = tick_dump;  // 还没收到过数据 ⇒ 从这一刻起算
     tick_speed = tick_dump;
-    tokens     = quota;   // 一开跑就有一个周期的额度，否则头 1 秒发不出去、平均速率会偏低
+    tokens     = quota;      // 一开跑就有一个周期的额度，否则头 1 秒发不出去、平均速率会偏低
     while (!g_exit) {
         // 发送限速（令牌桶）：每 TEST_SPEED_INTERVAL_MS 把令牌补满一个周期的额度，
-        loop_iters++;                       // ①-23（只读 ✓）
+        loop_iters++;  // ①-23（只读 ✓）
         if (t_loop0 == 0) t_loop0 = app_us();
         t_loop1 = app_us();
         // 桶的上限就是这一个周期的量（不跨周期累积 ⇒ 不会攒出突发）。
         if (quota) {
-            if ((int32_t)get_timestamp32_ms() - (int32_t)tick_speed >= TEST_SPEED_INTERVAL_MS) {
+            if (ffrdp_ts_passed(get_timestamp32_ms(), tick_speed, TEST_SPEED_INTERVAL_MS)) {
                 tick_speed += TEST_SPEED_INTERVAL_MS;
                 tokens      = quota;
             }
@@ -727,34 +728,34 @@ static int link_loop(struct link_arg *a)
                     v.sent_msgs++; v.sent_bytes += (uint32_t)msg_len;
                     if (quota) tokens -= (uint32_t)msg_len;
                     seq++; msg_len = 0;
-                } else if (ret > 0) {          // 不该发生（send 是原子的 ✓）：丢掉这条并留下告警
+                } else if (ret > 0) {  // 不该发生（send 是原子的 ✓）：丢掉这条并留下告警
                     v.partial_err++; msg_len = 0; break;
-                } else {                       // 被拒 ⇒ 退出突发 ✓（应用不再空转 ✓）
+                } else {  // 被拒 ⇒ 退出突发 ✓（应用不再空转 ✓）
                     v.send_retries++; msg_retries++; break;
                 }
             }
         }
-        if (!g_idle_sec && !g_recv_only && msg_len == 0) {   // 上一条已经发出去了，生成下一条（失败重试时必须原样重发，不能重新生成）
+        if (!g_idle_sec && !g_recv_only && msg_len == 0) {  // 上一条已经发出去了，生成下一条（失败重试时必须原样重发，不能重新生成）
             // FFRDP_IDLE>0 ⇒ 压根不生成 ✓：应用层一个字节都不发，专门看协议自己会不会把连接判死 ✓
             int room = 1;
             max_payload = send_max - oh;
             if (quota) {
-                if (tokens <= (uint32_t)oh) room = 0; // 本周期额度装不下最小一条 ⇒ 这轮不发
+                if (tokens <= (uint32_t)oh) room = 0;  // 本周期额度装不下最小一条 ⇒ 这轮不发
                 else if (tokens - (uint32_t)oh < (uint32_t)max_payload) max_payload = (int)(tokens - (uint32_t)oh);
             }
             if (room) msg_len = msg_build(sendbuf, send_max, seq, max_payload, &rnd);
-            if (msg_len < 0) msg_len = 0;   // 不该发生；当作"这轮不发"，下一轮重来（绝不能留成负数）
+            if (msg_len < 0) msg_len = 0;  // 不该发生；当作"这轮不发"，下一轮重来（绝不能留成负数）
             if (msg_len > 0) { tick_msg_first = get_timestamp32_ms(); msg_retries = 0; }   // 只读（§26.30 ①-①）：新一条的起点 ✓
         }
 
         if (msg_len > 0 && tx_salt_left == 0) {
             // 传 0（不等待）：这个测试的背压方式是"被拒就下一轮原样重试"，节拍由那次带超时的 recv 提供 ✓。
-            msg_stamp(sendbuf, msg_len);                    // A1：每次尝试前刷新 ⇒ 不含"被拒后干等"的那段 ✓
+            msg_stamp(sendbuf, msg_len);  // A1：每次尝试前刷新 ⇒ 不含"被拒后干等"的那段 ✓
             ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, app_sendwait_get());
-            {   int t = app_sendretry_get();   // ①-41 实验：被拒立刻重试（0 = 关 ✓）
+            {   int t = app_sendretry_get();  // ①-41 实验：被拒立刻重试（0 = 关 ✓）
                 while (ret < 0 && t-- > 0) ret = ffrdp_send(ffrdp, handle, (char*)sendbuf, msg_len, app_sendwait_get());
             }
-            if (ret == msg_len) {                       // 整条被接受
+            if (ret == msg_len) {  // 整条被接受
                 // 只读（§26.30 ①-①）：这条被拒过 ⇒ 把"从第一次尝试到被接受"的时长记下来 ✓
                 if (msg_retries) {
                     uint32_t d = get_timestamp32_ms() - tick_msg_first;
@@ -765,11 +766,11 @@ static int link_loop(struct link_arg *a)
                 v.sent_msgs++; v.sent_bytes += (uint32_t)msg_len;
                 if (quota) tokens -= (uint32_t)msg_len;
                 seq++; msg_len = 0;
-            } else if (ret > 0) {                       // 0 < ret < len：send 是原子的，这不该发生
+            } else if (ret > 0) {  // 0 < ret < len：send 是原子的，这不该发生
                 verify_log(peer->name, peer->peer, "partial send (ffrdp_send is atomic, this cannot happen)",
                            (uint32_t)ret, (uint32_t)msg_len, &v.log_part);
                 v.partial_err++;
-                msg_len = 0;                            // 没法安全重发，丢掉这一条（并留下告警）
+                msg_len = 0;  // 没法安全重发，丢掉这一条（并留下告警）
             }
             // ret == -1 / -2：队列满或连接已断 ⇒ 什么都不动，下一轮原样重试这一条
             else { v.send_retries++; msg_retries++; }   // 只读（§26.30 ①-①）：这一轮被拒了 ✓
@@ -777,7 +778,7 @@ static int link_loop(struct link_arg *a)
 
         if (stream_len < TEST_STREAM_MAX) {
             // 应用侧唯一的等待点：一有数据立刻返回，没有数据最多等 TEST_RECV_WAIT_MS。
-            t_w = app_us();                 // ①-23：应用侧唯一的等待点 ✓
+            t_w = app_us();  // ①-23：应用侧唯一的等待点 ✓
             // 只发端本来就是"没数据可等"：这里若还按 g_recv_wait_ms(默认 10 ms) 阻塞，应用循环的节拍
             // 就被压成 100 轮/s ⇒ 16 KB × 100 = 1.6 MB/s 的硬上限（实测 lo 上只有 0.73 MB/s ✗，
             // 与协议无关，纯粹是量具自己挡住了）。改成非阻塞 + 50 us 短睡 ⇒ 上限 ~320 MB/s ✓
@@ -807,11 +808,11 @@ static int link_loop(struct link_arg *a)
                 tick_recv = get_timestamp32_ms();
             }
         } else {
-            t_w = app_us();                 // ①-23：流满那条路（注释说"正常情况下到不了"✓，量一下 ✓）
-            usleep(10 * 1000);   // 流满了 ⇒ 这一轮没地方收；睡一下别空转（正常情况下到不了这里）
+            t_w = app_us();    // ①-23：流满那条路（注释说"正常情况下到不了"✓，量一下 ✓）
+            usleep(10 * 1000); // 流满了 ⇒ 这一轮没地方收；睡一下别空转（正常情况下到不了这里）
             rf_n++; rf_us += app_us() - t_w;
         }
-        if (stream_len > 0) {   // 每轮都试着解析（不足一条时这个循环体不会进入）
+        if (stream_len > 0) {  // 每轮都试着解析（不足一条时这个循环体不会进入）
             int used = msg_parse(&v, peer->name, peer->peer, stream, stream_len);
             if (used > 0) {
                 memmove(stream, stream + used, (size_t)(stream_len - used));
@@ -820,19 +821,19 @@ static int link_loop(struct link_arg *a)
         }
 
         // 这里原来有一句 ffrdp_update()：协议现在由 lowlevel 的工作线程驱动 ✓，应用不需要它了。
-        t_loop1 = app_us();                 // ①-23（含 msg_parse ✓）
+        t_loop1 = app_us();  // ①-23（含 msg_parse ✓）
         if (g_idle_sec) {
             uint32_t nowi = get_timestamp32_ms();
-            if ((int32_t)nowi - (int32_t)tick_dump > 1000) {
+            if (ffrdp_ts_diff(nowi, tick_dump) > 1000) {
                 int      dead   = ffrdp_isdead(ffrdp, handle);
                 uint32_t silent = nowi - tick_recv;
                 printf("[%s] idle: conn=%d isdead=%d app_silent=%ums%s\n",
                        peer->name, handle, dead, (unsigned)silent,
-                       (dead == 0 && (int32_t)silent > TEST_PEER_SILENCE_MS)
+                       (dead == 0 && silent > (uint32_t)TEST_PEER_SILENCE_MS)
                            ? "  <- the application-level silence would have been a false alarm; the protocol side did not declare it dead" : "");
                 fflush(stdout);
                 tick_dump = nowi;
-                if (++hb % 5 == 0) {   // 每 5s 打一次协议状态（连接数 / 握手状态 / 计数器）
+                if (++hb % 5 == 0) {  // 每 5s 打一次协议状态（连接数 / 握手状态 / 计数器）
                     pthread_mutex_lock(&g_mutex); ffrdp_dump(ffrdp, -1, 0)   /* ①-8：打全表 —— 服务端 0 号内嵌槽的计数原来完全不可见 ✗ */; pthread_mutex_unlock(&g_mutex);
                 }
             }
@@ -863,8 +864,14 @@ static int link_loop(struct link_arg *a)
                     printf("%s lost ! (handle %d; %s, app silent %u ms)\n", peer->peer, handle,
                            dr ? disc_name(dr) : (dp ? "protocol says dead" : "app-level silence"), (unsigned)silent);
                 } else {
-                    printf("%s lost ! (handle %d; never connected; %s) -- 握手超时，重建上下文重试\n",
-                           peer->peer, handle, dr ? disc_name(dr) : (dp ? "protocol says dead" : "app-level silence"));
+                    // 真实原因必须分开打 ✓：这句以前固定写"握手超时"，把 keepalive / 首帧久等 /
+                    // 应用级宽限期全都盖成了同一句 ⇒ 排障时只能猜 ✗（实测踩过 ✓）。
+                    printf("%s lost ! (handle %d; never connected; %s) -- %s, rebuild the context and retry\n",
+                           peer->peer, handle,
+                           dr ? disc_name(dr) : (dp ? "protocol says dead" : "app-level silence"),
+                           dr ? "closed by the protocol layer (see the [hs] ... lines)"
+                              : dp ? "protocol judged it dead (see the [hs] ... lines)"
+                                   : "no byte from the peer within the connect grace");
                 }
                 // 干净关闭不刷 dump（那是噪音 ✓），只有真异常才留现场 ✓
                 if (ffrdp && dr != FFRDP_DISCONN_PEER_FIN) {
@@ -873,7 +880,7 @@ static int link_loop(struct link_arg *a)
                 }
             }
             lost = 1;
-            break;                        // 这条连接完了；要不要重建由调用方决定 ✓
+            break;  // 这条连接完了；要不要重建由调用方决定 ✓
         } else if (!connected) {
             // 握手还没成（hs 进行中 / 已失败但上面还没轮到）：ffrdp_recv 在 HS_FAILED 时**立即**返回、
             // send 也立即被拒 ⇒ 这里不睡，整个循环就是一个死转的 CPU 核 ✗（实测 480 万次/s ✓）
@@ -889,9 +896,34 @@ static int link_loop(struct link_arg *a)
             uint32_t nowd = get_timestamp32_ms();
             int do_dump = 0;
             pthread_mutex_lock(&g_mutex);
-            if ((int32_t)nowd - (int32_t)g_dump_tick >= g_dump_ms) { g_dump_tick = nowd; do_dump = 1; }
+            // 必须走 ffrdp_ts_passed()：get_timestamp32_ms() 是 CLOCK_MONOTONIC 截断到 32 位，
+            // 主机 uptime 一过 24.85 天（2^31 ms）它就是"负数"。而 g_dump_tick 初值 0 且只在这里
+            // 播种 ⇒ 有符号比较下 `(int32_t)nowd - 0` 恒为负、永远 >= g_dump_ms 不成立，
+            // g_dump_tick 于是永不播种 ⇒ 这一整块 status/dump **永久失效**（实测 home-server
+            // uptime 375 天：连了一整轮、发了 11 MB，一条 [server] status 都没有 ✗）。
+            // 助手把 0 当"早就过了"、差值用无符号 ⇒ 短 uptime 主机上的行为（首次立即打一次）逐字不变 ✓。
+            if (ffrdp_ts_passed_or_zero(nowd, g_dump_tick, g_dump_ms)) { g_dump_tick = nowd; do_dump = 1; }
             pthread_mutex_unlock(&g_mutex);
             if (do_dump) {
+                // 应用这一层的账**必须单独打**：ffrdp_dump 整块被 `#if FFRDP_DIAG` 包着，
+                // Makefile 里默认 -DFFRDP_DIAG=0 ⇒ 上面那次 dump 一个字节都不会输出。
+                // 现场就是"连上了、P2P 也稳、但看不出到底有没有数据在走" ⇒ 这一行自己数。
+                // 顺带按"上次 dump 到现在"算这一段窗口的吞吐（Δbytes/Δms）：绝对值累加看不出
+                // "现在到底跑多快"，尤其限速档（--send_speed）和掉速/回速的时候 ✗。
+                uint32_t iv = db_at ? (uint32_t)(nowd - db_at) : 0;
+
+                printf("[%s] status: tx %7.1f KB/s, rx %7.1f KB/s | sent %u msgs / %u B, recv %u msgs / %u B | "
+                       "seq_gap %u(miss %u), crc_err %u, len_err %u, partial_err %u | %s | %u ms\n",
+                       peer->name,
+                       iv ? (double)(v.sent_bytes - db_sent) * 1000.0 / iv / 1024.0 : 0.0,
+                       iv ? (double)(v.recv_bytes - db_recv) * 1000.0 / iv / 1024.0 : 0.0,
+                       v.sent_msgs, v.sent_bytes, v.recv_msgs, v.recv_bytes,
+                       v.seq_gap, v.seq_missing, v.crc_err, v.len_err, v.partial_err,
+                       connected ? "connected" : "connecting", nowd);
+                fflush(stdout);
+                db_sent = v.sent_bytes;
+                db_recv = v.recv_bytes;
+                db_at   = nowd;
                 pthread_mutex_lock(&g_mutex);
                 ffrdp_dump(ffrdp, -1, 0)   /* ①-8：打全表 —— 服务端 0 号内嵌槽的计数原来完全不可见 ✗ */;
                 pthread_mutex_unlock(&g_mutex);
@@ -959,7 +991,7 @@ done:
     else if (ffrdp && !a->owns_ctx && handle >= 0) ffrdp_close(ffrdp, handle);
     free(sendbuf);
     free(stream);
-    if (a->owns_ctx) ffrdp_exit(ffrdp);      // 上下文归角色线程 ⇒ 只有它退 ✓
+    if (a->owns_ctx) ffrdp_exit(ffrdp);  // 上下文归角色线程 ⇒ 只有它退 ✓
     return lost;
 }
 
@@ -974,7 +1006,7 @@ static void* link_thread(void *param)
 {
     struct link_arg *a = (struct link_arg*)param;
     link_loop(a);
-    g_link_done[a->slot] = 1;      // 先置位再退出 ⇒ 主线程 join 得到"确实跑完了" ✓
+    g_link_done[a->slot] = 1;  // 先置位再退出 ⇒ 主线程 join 得到"确实跑完了" ✓
     free(a);
     return NULL;
 }
@@ -1005,7 +1037,7 @@ static void* peer_thread(void *param)
     const TEST_PEER *peer = (const TEST_PEER*)param;
     void *ffrdp = NULL;
     pthread_t links[TEST_MAX_LINK];
-    int live[TEST_MAX_LINK] = {0};   // 固定槽位：1 = 这一格有线程在跑（**不挪动** ⇒ link_arg.slot 永远对得上 ✓）
+    int live[TEST_MAX_LINK] = {0};  // 固定槽位：1 = 这一格有线程在跑（**不挪动** ⇒ link_arg.slot 永远对得上 ✓）
     int nlink = 0, i;
     // 本端的加密实例（同进程的 server/client 各一份：角色相反 ⇒ 方向密钥映射相反）
     TEST_CRYPTO cr;
@@ -1043,7 +1075,7 @@ static void* peer_thread(void *param)
             link_loop(&a);
             ffrdp = NULL;
             if (g_exit) break;
-            continue;                               // 断了 ⇒ 重建（原来的行为 ✓）
+            continue;  // 断了 ⇒ 重建（原来的行为 ✓）
         }
 
         // ⚠️ hs:0（老路径）下协议**不发 ACCEPT** ⇒ 服务端的应用句柄就是 0，必须照旧直接在 0 号上收发 ✓。
@@ -1051,17 +1083,17 @@ static void* peer_thread(void *param)
             struct link_arg a;
             a.ffrdp = ffrdp; a.handle = 0; a.peer = peer; a.is_server = 1; a.owns_ctx = 1;
             a.slot = -1; a.cr = &cr;
-            link_loop(&a);                          // 同上：exit 由它负责 ✓
+            link_loop(&a);  // 同上：exit 由它负责 ✓
             ffrdp = NULL;
             if (g_exit) break;
-            continue;                               // 断了 ⇒ 重建（老路径的老行为 ✓）
+            continue;  // 断了 ⇒ 重建（老路径的老行为 ✓）
         }
 
         // 服务端：取一个 accept 句柄 ⇒ 起一条 link 线程 ✓
         {   int h = accept_pop();
             if (h < 0) { usleep(5 * 1000); continue; }
-            link_reap(links, live, &nlink);           // 先收掉跑完的 ⇒ 槽位还回来 ✓
-            for (i = 0; i < TEST_MAX_LINK && live[i]; i++);   // 第一个空槽（槽位固定 ⇒ 与 slot 同一个编号 ✓）
+            link_reap(links, live, &nlink);  // 先收掉跑完的 ⇒ 槽位还回来 ✓
+            for (i = 0; i < TEST_MAX_LINK && live[i]; i++);  // 第一个空槽（槽位固定 ⇒ 与 slot 同一个编号 ✓）
             if (i < TEST_MAX_LINK) {
                 struct link_arg *a = (struct link_arg*)malloc(sizeof(*a));
                 if (a) {
@@ -1084,9 +1116,9 @@ static void* peer_thread(void *param)
         printf("[%s] --- final dump (right before ffrdp_exit) ---\n", peer->name);
         fflush(stdout);
         pthread_mutex_lock(&g_mutex); ffrdp_dump(ffrdp, -1, 0); pthread_mutex_unlock(&g_mutex);
-        ffrdp_exit(ffrdp);             // 只有"上下文还开着"的那条路才需要退 ✓
+        ffrdp_exit(ffrdp);  // 只有"上下文还开着"的那条路才需要退 ✓
     }
-    if (cr.fc) { ffc_free(cr.fc); cr.fc = NULL; }   // 协议线程已停 ⇒ 之后不会再有回调 ✓
+    if (cr.fc) { ffc_free(cr.fc); cr.fc = NULL; }  // 协议线程已停 ⇒ 之后不会再有回调 ✓
     return NULL;
 }
 
@@ -1111,6 +1143,13 @@ int main(int argc, char *argv[])
     pthread_t hserver = 0, hclient = 0;
     char *str;
 
+    // stdout 一进文件/管道就是全缓冲 ⇒ 进程被 kill、或用 pkill 收尾时，最后那**整块
+    // ffrdp_dump（判死现场）会一起丢掉。实测 p2p 那两份日志就是这样：`--- dump ---` 打出来了，
+    // 后面的计数器一行都没有，于是"发了多少 / 收了多少 / 谁丢的"全都没法判断 ✗。
+    // 这里直接改成行缓冲，不依赖调用方记不记得加 stdbuf。
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     if (argc <= 1) {
         const char *prog = argv[0] ? argv[0] : "test_ffrdp"; // 按调用名打印：重命名、软链、绝对路径都对得上
         printf("ffrdp test program - v%s\n", TEST_VERSION);
@@ -1121,6 +1160,7 @@ int main(int argc, char *argv[])
         printf("\n");
         printf("  --server[=ip:port]            run as server    (default 0.0.0.0:8000)\n");
         printf("  --client[=ip:port]            run as client    (default 127.0.0.1:8000)\n");
+        printf("    either may instead be a *onffp2p:// URL - see the ffp2p section below\n");
         printf("  --server_max_send_size=N      server max bytes per message (default 16384)\n");
         printf("  --client_max_send_size=N      client max bytes per message (default 16384)\n");
         printf("  --send_speed=N                limit this process to N KB/s (default 0 = unlimited)\n");
@@ -1134,6 +1174,31 @@ int main(int argc, char *argv[])
         printf("  limit then applies to both; type 'quit' or 'exit' to stop: only that way prints\n");
         printf("  the verify summary (Ctrl+C ends the process without it); a diagnostic dump is\n");
         printf("  printed every 10 s.\n");
+        printf("\n");
+        printf("  -- ffrdp over ffp2p (NAT traversal) --\n");
+        printf("  the two p2p schemes take a full URL instead of ip:port, so --server=/--client=\n");
+        printf("  becomes a parameter list (needs a build with libffp2p, FFRDP_WITH_FFP2P=1):\n");
+        printf("\n");
+        printf("    --server=\"ffrdpsonffp2p://local:uuid_srv,server:<signal>\"\n");
+        printf("    --client=\"ffrdpconffp2p://local:uuid_cli,remote:uuid_srv,server:<signal>\"\n");
+        printf("\n");
+        printf("  <signal> is a host[:port] of the ffp2p signaling server (\"http://\" optional,\n");
+        printf("  port 80 by default), e.g. server:ffp2p.nat100.top or server:127.0.0.1:8080.\n");
+        printf("  the server role omits remote:, the client role must give it (it is the peer's\n");
+        printf("  uuid). more keys follow comma separated: mss:1200 (recommended - a full 1500\n");
+        printf("  frame fragments over srflx), stun:host:port, bind:IP, port:N (fixed local UDP\n");
+        printf("  port), i_debug:1 (ffp2p per-round log).\n");
+        printf("\n");
+        printf("  both uuids must already be registered on the signaling server (device.add), or\n");
+        printf("  sync fails with 1004 unknown peer / 1005 quota full / 1007 peer offline.\n");
+        printf("  punching needs seconds to tens of seconds: the \"not connected yet\" grace is\n");
+        printf("  90 s in this mode, and the dump shows state connecting until it is through.\n");
+        printf("\n");
+        printf("  self test on one host (both roles at once, different uuids):\n");
+        printf("    ./test_ffrdp --server=\"ffrdpsonffp2p://local:a1,server:127.0.0.1:8080\" \\\n");
+        printf("                 --client=\"ffrdpconffp2p://local:b2,remote:a1,server:127.0.0.1:8080\"\n");
+        printf("  or run ./test_ffp2p.sh <this binary> [user@host] for the scripted smoke test\n");
+        printf("  (same host by default; with user@host the server side runs over ssh).\n");
         printf("\n");
         return 0;
     }
