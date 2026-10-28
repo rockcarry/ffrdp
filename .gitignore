@@ -10,3 +10,22 @@
 # 注意：gitignore **不支持行内注释** ✗ —— 注释必须单独一行，否则整行会被当成图案 ✓。
 /dist
 /logs
+
+# autotools 生成（与 ffp2p 一致：不入库，./autogen.sh 现生成）
+/Makefile
+/Makefile.in
+/aclocal.m4
+/autom4te.cache/
+/build-aux/
+/m4/*.m4
+/configure
+/libtool
+/config.log
+/config.status
+/.build-state
+/libffrdp.la
+.libs/
+.deps/
+.dirstamp
+*.lo
+*.la

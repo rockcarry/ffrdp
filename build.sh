@@ -1,170 +1,181 @@
 #!/bin/bash
-
-# environment needs:
-# TOOLCHAIN_NAME       - indicate toolchain name
-# BUILD_PACKAGE_OUTDIR - indicate package binary output dir, if empty $PWD/out will be used
-# BUILD                - build tier: dev (default) | ship
+# ffrdp 构建（autotools，与 ffp2p / winipc / lnxipc 的包构建习惯一致）
 #
-# 用法:
-#   bash build.sh            # = dev：仪表全开（读数/判据/check.sh 都用这一档 ✓）
-#   bash build.sh dev        # 同上
-#   bash build.sh ship       # 出货：仪表编掉 + LTO（**性能数字只认这一档** ✓）
-#   BUILD=ship bash build.sh # 同一个意思（环境变量形式，给不方便传参的脚本用 ✓）
-
+#   ./build.sh                    # = ./build.sh ship install
+#   ./build.sh help               # 帮助
+#   ./build.sh dev                # 调试档：-O2 -g + 仪表全开，只构建不安装
+#   ./build.sh dev install        # 调试档 + 安装
+#   ./build.sh ship               # 发布档：-O3 -DNDEBUG -DFFRDP_DIAG=0 + LTO
+#   ./build.sh config [dev|ship]  # 强制重新 ./configure（例如从 dev 切 ship）
+#   ./build.sh clean|distclean
+#
+# 平台由 --host 决定；source 对应项目的 envsetup.sh 后本脚本读这些变量：
+#   TOOLCHAIN_NAME        工具链名（linux-x86_64 / i686-w64-mingw32-gcc-13.2.0）
+#   BUILD_PACKAGE_OUTDIR  包产出根（winipc/lnxipc 里 = <proj>/bin-sdk）
+#   BUILD_HOST            configure --host（i686-w64-mingw32 / x86_64-pc-linux-gnu）
+#   CROSS_COMPILE         工具链前缀（只用于提示与 gcc-ar 探测）
+#   CC / CXX              configure 直接使用
+#   ARCH                  仅用于摘要打印
+#   EXTRA_CFLAGS          追加编译选项
+#   INSTALL_ROOT          安装根，给了就优先用它
+#   PKG_CONFIG_PATH       依赖库搜索路径（libffp2p 是否使能由它决定）
+#   FFP2P_CFLAGS/FFP2P_LIBS  交叉编译时直接指定 libffp2p（绕过 pkg-config）
+#   JOBS                  make -j 并发数，缺省 = nproc
+#
+# 安装根取法（优先级从上到下）：
+#   $INSTALL_ROOT
+#   $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME
+#   $PWD/out/$TOOLCHAIN_NAME（没 source envsetup 时的本地默认）
+#
+# 安装布局：<root>/include/{ffrdp.h,lowlevel.h}、<root>/lib/libffrdp.a、
+#           <root>/lib/pkgconfig/libffrdp.pc
+#
+# p2p 后端：configure 时自动检测 libffp2p.pc（或显式 FFP2P_LIBS），
+#           有就编进 ffrdpsonffp2p:// / ffrdpconffp2p://，没有就只少了这两个 scheme。
 set -e
+cd "$(dirname "$0")"
+TOP=$PWD
 
-TOPDIR=$PWD
+usage()
+{
+    sed -n '2,/^set -e$/p' "$TOP/build.sh" | sed '$d' | sed 's/^# \{0,1\}//'
+}
 
-# 档位：命令行参数优先，其次 BUILD，默认 dev（= 改造前的编译选项 ✓，check.sh / tools/*.sh 都靠它取读数 ✓）
-BUILD_MODE=${BUILD:-dev}
-case "$1" in
-dev|ship) BUILD_MODE="$1" ;;
-esac
-case "$BUILD_MODE" in
-dev|ship) ;;
+MODE=ship
+ACTION=install
+FORCE_CONFIG=0
+
+case "${1:-}" in
+help | -h | --help)
+    usage
+    exit 0
+    ;;
+clean)
+    [ -f Makefile ] && make clean
+    exit 0
+    ;;
+distclean)
+    if [ -f Makefile ]; then make distclean || true; fi
+    rm -rf Makefile libffrdp.pc config.status config.log libtool aclocal.m4 \
+           autom4te.cache build-aux configure depcomp install-sh missing \
+           ltmain.sh compile config.guess config.sub test-driver
+    rm -f m4/*.m4
+    rm -rf "$TOP/.build-state"
+    rm -f test_ffrdp test_ffrdp.exe
+    exit 0
+    ;;
+config | reconfig)
+    FORCE_CONFIG=1
+    MODE=${2:-ship}
+    ACTION=${3:-}
+    ;;
+dev | ship)
+    MODE=$1
+    ACTION=${2:-}
+    ;;
+install)
+    ACTION=install
+    ;;
+"") ;;
 *)
-    echo -e "\n\033[31munknown build tier '$BUILD_MODE' (want: dev | ship)\033[0m\n" >&2
-    exit -1
+    usage >&2
+    exit 2
     ;;
 esac
 
-if [ "$BUILD_PACKAGE_OUTDIR"x = ""x ]; then
-    BUILD_PACKAGE_OUTDIR=$PWD/out
+# ---- 工具链 / 目标平台 -------------------------------------------------
+TC=${TOOLCHAIN_NAME:-}
+if [ -n "${BUILD_HOST:-}" ]; then
+    HOST_ARG="--host=$BUILD_HOST"
+elif [ -n "${CROSS_COMPILE:-}" ]; then
+    echo "build: 设置了 CROSS_COMPILE=$CROSS_COMPILE 但没有 BUILD_HOST" >&2
+    echo "       请先 source 对应项目的 envsetup.sh（它会导出 BUILD_HOST / TOOLCHAIN_NAME）" >&2
+    exit 2
+fi
+HOST_ARG=${HOST_ARG:-}
+
+# ---- 安装根 ------------------------------------------------------------
+if [ -n "${INSTALL_ROOT:-}" ]; then
+    ROOT=$INSTALL_ROOT
+elif [ -n "${BUILD_PACKAGE_OUTDIR:-}" ] && [ -n "$TC" ]; then
+    ROOT=$BUILD_PACKAGE_OUTDIR/$TC
+else
+    ROOT=$TOP/out/${TC:-linux-x86_64}
 fi
 
-gen_libffrdp_pkgconfig_file()
+# ---- 依赖库的 pkg-config 路径（决定 libffp2p 能否被检测到）-------------
+add_pc_path()
 {
-    # Version 只有**一个来源**：ffrdp.h 里的 FFRDP_VERSION ✓。这里以前是写死的 "1.1.0" ✗ ——
-    # 库升到 v2.0.0 之后生成的 .pc 还在报 1.1.0 ✗（pkg-config 查出来的版本与库不符 ✗）。
-    # 解析失败就报错退出，**绝不静默生成一个假版本** ✓。
-    local ver
-    ver=$(sed -n 's/^[[:space:]]*#[[:space:]]*define[[:space:]][[:space:]]*FFRDP_VERSION[[:space:]][[:space:]]*"\([^"]*\)".*/\1/p' "$TOPDIR/ffrdp.h" | head -n 1)
-    ver=${ver#v}   # pkg-config 的 Version 走 RPM 式版本比较 ⇒ 去掉可选的 "v" 前缀：v2.0.0 ⇒ 2.0.0 ✓
-    if [ -z "$ver" ]; then
-        echo -e "\n\033[31mcannot parse FFRDP_VERSION from $TOPDIR/ffrdp.h (want: #define FFRDP_VERSION \"vX.Y.Z\")\033[0m\n" >&2
-        exit -1
-    fi
-
-    echo "prefix=$BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME"  > $TOPDIR/libffrdp.pc
-    echo "exec_prefix=\${prefix}"                       >> $TOPDIR/libffrdp.pc
-    echo "libdir=\${exec_prefix}/lib"                   >> $TOPDIR/libffrdp.pc
-    echo "includedir=\${prefix}/include"                >> $TOPDIR/libffrdp.pc
-    echo ""                                             >> $TOPDIR/libffrdp.pc
-    echo "Name: libffrdp"                               >> $TOPDIR/libffrdp.pc
-    echo "Description: ffrdp library"                   >> $TOPDIR/libffrdp.pc
-    echo "Version: $ver"                                >> $TOPDIR/libffrdp.pc
-    echo "Libs: -L\${libdir} -lffrdp"                   >> $TOPDIR/libffrdp.pc
-    # 编了 p2p 后端的话，静态链接的上层要把 libffp2p 一起带上（否则 ffrdp_init 里那两个
-    # 符号 undefined）。没编就什么都不写 —— 保持"零依赖"这个默认 ✓。
-    [ -n "$FFRDP_PC_REQUIRES" ] && echo "Requires.private: $FFRDP_PC_REQUIRES" >> $TOPDIR/libffrdp.pc
-    echo "Cflags: -I\${includedir}"                     >> $TOPDIR/libffrdp.pc
+    [ -d "$1" ] || return 0
+    case ":${PKG_CONFIG_PATH:-}:" in
+    *":$1:"*) ;;
+    *) export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}$1" ;;
+    esac
 }
 
-build_package()
-{
-    if [ "$TOOLCHAIN_NAME"x = ""x ]; then
-        echo -e "\n\033[31menv TOOLCHAIN_NAME not set, please check your toolchain is correctly installed !\033[0m\n"
-        exit -1
-    fi
+if [ -n "${BUILD_PACKAGE_OUTDIR:-}" ] && [ -n "$TC" ]; then
+    add_pc_path "$BUILD_PACKAGE_OUTDIR/$TC/lib/pkgconfig"
+fi
+# 没 source envsetup 时的本地兜底
+add_pc_path "$HOME/lnxipc/bin-sdk/linux-x86_64/lib/pkgconfig"
+if [ -n "$TC" ]; then
+    add_pc_path "$HOME/lnxipc/bin-sdk/$TC/lib/pkgconfig"
+    add_pc_path "$HOME/winipc/bin-sdk/$TC/lib/pkgconfig"
+fi
 
-    # ── 两档的差别只在这里 ───────────────────────────────────────────────────
-    # dev（默认）：-O2 + -g，-DFFRDP_DIAG=1 保留完整仪表（dump/①-xx/计数器），FEC 全功能（t_fec 要它 ✓）。
-    #   ⚠️ 仪表会吃 CPU（printf + 静态计数内存）⇒ **dev 的吞吐/CPU 数字不能当性能结论** ✓。
-    # ship：-O3 + LTO、-DFFRDP_DIAG=0（dump 与只给 dump 用的计数器整段编掉 ⇒ 无 printf、无静态内存）、
-    #   不开 FEC（fec:N 被忽略并提示一次 ✓）、-DNDEBUG。**要报性能就用这一档** ✓。
-    # 两档都保持 -Werror：警告当错是编译期的事，与优化级别无关 ✓。
-    local CFLAGS="-Wall -Werror -Wextra -Wunused-macros"
-    local LDFLAGS="-lpthread"
-    # 额外编译期开关：默认已是嵌入式 64 档（窗口/闸门/乱序窗/两环全 64 ⇒ 191 KB/连接），不用给任何 -D ✓。
-    # 要吞吐档就整组覆盖（漏一个就是编译期 #error，完整配方见 docs/ffrdp-v2.md §9.7 ✓）：
-    #   EXTRA_CFLAGS='-DFFRDP_RX_WINDOW_FRAMES=128 -DFFRDP_RECV_QUEUE_MAX=128 -DFFRDP_MAX_WAITSND=128
-    #                  -DFFRDP_MAX_CWND_SIZE=128 -DFFRDP_INFLIGHT_MAX=128 -DFFRDP_INFLIGHT_CEIL=128
-    #                  -DFFRDP_SND_FRAME_RING=256 -DFFRDP_RCV_FRAME_RING=128' bash build.sh ✓
-    # ⚠️ 改了窗口/受理闸/乱序窗就要同步改两个环，否则编译期 #error。
-    # 只影响这一次构建，不改默认值 ✓。
-    [ -n "${EXTRA_CFLAGS:-}" ] && CFLAGS="$CFLAGS $EXTRA_CFLAGS"
-    local AR="${CROSS_COMPILE}ar"
-    case "$BUILD_MODE" in
-    dev)
-        CFLAGS="$CFLAGS -O2 -g -DFFRDP_DIAG=1 -DFFRDP_FEC_ENABLE=1"
-        ;;
-    ship)
-        # LTO 的 .o 里是 GIMPLE 字节码：binutils 的 ar 要靠 plugin 才认，gcc-ar 是带 plugin 的包装 ✓。
-        if command -v "${CROSS_COMPILE}gcc-ar" > /dev/null 2>&1; then
-            AR="${CROSS_COMPILE}gcc-ar"
-        fi
-        CFLAGS="$CFLAGS -O3 -DNDEBUG -DFFRDP_DIAG=0 -flto"
-        LDFLAGS="$LDFLAGS -flto"
-        ;;
-    esac
-    case "$CROSS_COMPILE" in
-    *mingw*)
-        LDFLAGS="$LDFLAGS -lws2_32"
-        ;;
-    *)
-        # socket.c / utils.c / lowlevel-udp.c 的 Linux 实现被 #ifdef LINUX 挡着：不给这个宏，它们编出来
-        # 是空函数（或者干脆编不过），而这三个文件是传输层本身。mingw 那一支不需要它。
-        CFLAGS="$CFLAGS -DLINUX"
-        # test.c 的崩溃处理器用 execinfo/backtrace 打栈（偶发段错误没有栈就只能猜）：符号名要靠
-        # -rdynamic 导出。只在 Linux 这一支加，mingw 没有 execinfo.h ✓。
-        LDFLAGS="$LDFLAGS -rdynamic"
-        ;;
-    esac
-
-    # ── p2p 后端（可选）─────────────────────────────────────────────────────
-    # 有 libffp2p 就编进去（ffrdpsonffp2p:// / ffrdpconffp2p://）；没有就只是不支持那两个 scheme，
-    # UDP 路径完全不受影响。交叉编译时 pkg-config 常常只认宿主库 ⇒ 可用 FFP2P_CFLAGS/FFP2P_LIBS 直接给。
-    local FFP2P_CFLAGS="${FFP2P_CFLAGS:-}"
-    local FFP2P_LIBS="${FFP2P_LIBS:-}"
-    local WITH_FFP2P=0
-    if [ -z "$FFP2P_LIBS" ] && pkg-config --exists libffp2p 2>/dev/null; then
-        FFP2P_CFLAGS=$(pkg-config --cflags libffp2p)
-        FFP2P_LIBS=$(pkg-config --libs --static libffp2p)
-    fi
-    FFRDP_PC_REQUIRES=""
-    if [ -n "$FFP2P_LIBS" ]; then
-        WITH_FFP2P=1
-        FFRDP_PC_REQUIRES="libffp2p"
-        CFLAGS="$CFLAGS -DFFRDP_WITH_FFP2P=1 $FFP2P_CFLAGS"
-    fi
-
-    echo "build tier: $BUILD_MODE (${CROSS_COMPILE}gcc)"
-    if [ "$WITH_FFP2P" = "1" ]; then echo "p2p backend: on ($FFP2P_LIBS)"
-    else                              echo "p2p backend: off (no libffp2p; *onffp2p:// 不可用)"; fi
-    gen_libffrdp_pkgconfig_file
-    # 协议层依赖传输层：ffrdp.c 现在只认 lowlevel 的接口（send / timer / 回调），实现是 lowlevel-udp.c，
-    # 它自己又用 socket.c 与 utils.c（工作线程）。所以这几份一起进库 —— 少一份就是运行期才发现的
-    # undefined reference。
-    ${CROSS_COMPILE}gcc -c $CFLAGS ffrdp.c
-    ${CROSS_COMPILE}gcc -c $CFLAGS lowlevel-udp.c
-    ${CROSS_COMPILE}gcc -c $CFLAGS socket.c
-    ${CROSS_COMPILE}gcc -c $CFLAGS utils.c
-    $AR rcs libffrdp.a ffrdp.o lowlevel-udp.o socket.o utils.o
-    # 加密模块是**应用侧**的可选代码，刻意不进 libffrdp（库保持零依赖、且不知道密码学）：
-    #   · 后端可选：-DFFC_BACKEND=0 内置 ChaCha20（默认，零依赖）
-    #               -DFFC_BACKEND=1 OpenSSL   （切过去要自己加 -lcrypto 到 EXTRA_CFLAGS/LDFLAGS）
-    #               -DFFC_BACKEND=2 mbedTLS   （切过去要自己加 -lmbedcrypto）
-    #   · 不用加密的构建可以把它从命令行里删掉，不影响 test_ffrdp 的其它功能。
-    # $FFP2P_LIBS 必须在 libffrdp.a 之后（静态链接的符号解析顺序 ✓）；没编 p2p 时它是空串 ✓
-    ${CROSS_COMPILE}gcc $CFLAGS test.c ffcrypto.c libffrdp.a $LDFLAGS $FFP2P_LIBS -o test_ffrdp
-    mkdir -p $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/include
-    mkdir -p $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/lib/pkgconfig
-    cp $TOPDIR/ffrdp.h     $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/include/
-    cp $TOPDIR/lowlevel.h  $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/include/
-    mv $TOPDIR/libffrdp.a  $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/lib/
-    mv $TOPDIR/libffrdp.pc $BUILD_PACKAGE_OUTDIR/$TOOLCHAIN_NAME/lib/pkgconfig
-}
-
-case "$1" in
-""|dev|ship)
-    build_package
+# ---- 编译档 ------------------------------------------------------------
+# dev ：仪表全开（dump / ①-xx / check.sh 的读数都靠它），FEC 全功能
+#       ⚠️ 仪表吃 CPU ⇒ dev 的吞吐/CPU 数字不能当性能结论
+# ship：-DFFRDP_DIAG=0（dump 与"只给 dump 用"的计数器整段编掉）+ LTO
+#       要报性能就用这一档
+case "$MODE" in
+dev)
+    BASE_CFLAGS="-O2 -g -DFFRDP_DIAG=1 -DFFRDP_FEC_ENABLE=1"
     ;;
-clean|distclean)
-    rm -rf *.o *.a *.exe *.pc test_ffrdp out/
+ship)
+    BASE_CFLAGS="-O3 -DNDEBUG -DFFRDP_DIAG=0 -flto"
+    # LTO 的 .o 里是 GIMPLE 字节码：要带 plugin 的 ar/ranlib 才认
+    if command -v "${CROSS_COMPILE}gcc-ar" > /dev/null 2>&1; then
+        export AR="${CROSS_COMPILE}gcc-ar"
+        export RANLIB="${CROSS_COMPILE}gcc-ranlib"
+    fi
     ;;
 *)
-    echo -e "\n\033[31munknown argument '$1' (want: dev | ship | clean | distclean)\033[0m\n" >&2
-    exit -1
+    echo "unknown mode: $MODE" >&2
+    usage >&2
+    exit 2
     ;;
 esac
+export CFLAGS="${BASE_CFLAGS} ${EXTRA_CFLAGS:-}"
+# 两档都保持警告当错（编译期的事，与优化级别无关）
 
+echo "build: mode=$MODE host=${BUILD_HOST:-native} toolchain=${TC:-native} arch=${ARCH:-native}"
+echo "  prefix: $ROOT"
+echo "  cflags: $CFLAGS"
+echo "  pkg-config: ${PKG_CONFIG_PATH:-<default>}"
+
+# ---- configure ---------------------------------------------------------
+# prefix / 模式 / host 变了就必须重配（configure 把 prefix 与 CFLAGS 固化进 Makefile，
+# libffrdp.pc 的 prefix 也是 configure 时替换的）
+STATE_FILE=$TOP/.build-state
+WANT_STATE="$ROOT|$MODE|$HOST_ARG"
+if [ "$FORCE_CONFIG" = 1 ] || [ ! -f Makefile ] || \
+   [ -f "$STATE_FILE" -a "$(cat "$STATE_FILE")" != "$WANT_STATE" ]; then
+    [ -f ./configure ] || ./autogen.sh
+    ./configure --prefix="$ROOT" $HOST_ARG --enable-static --disable-shared
+    echo "$WANT_STATE" > "$STATE_FILE"
+fi
+
+make -j"${JOBS:-$(nproc 2>/dev/null || echo 4)}"
+
+case "$ACTION" in
+"") ;;
+install)
+    make install
+    echo "installed: $ROOT  (pkg-config: $ROOT/lib/pkgconfig/libffrdp.pc)"
+    ;;
+*)
+    echo "usage: $0 [dev|ship] [install]" >&2
+    exit 2
+    ;;
+esac
