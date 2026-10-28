@@ -427,9 +427,9 @@ CFG='-DFFRDP_RX_WINDOW_FRAMES=128 -DFFRDP_RECV_QUEUE_MAX=128
      -DFFRDP_INFLIGHT_MAX=128 -DFFRDP_INFLIGHT_CEIL=128
      -DFFRDP_SND_FRAME_RING=256 -DFFRDP_RCV_FRAME_RING=128'
 
-EXTRA_CFLAGS="$CFG" TOOLCHAIN_NAME=gcc bash build.sh ship                  # 出货构建
-EXTRA_CFLAGS="$CFG" bash tools/size.sh                                     # 内存账
-EXTRA_CFLAGS="$CFG" TESTS='t_recvdata t_fec t_fuzz t_readpath' bash tools/sim/run.sh   # 仿真
+EXTRA_CFLAGS="$CFG" TOOLCHAIN_NAME=gcc bash build.sh ship  # 出货构建
+EXTRA_CFLAGS="$CFG" bash tools/size.sh                     # 内存账
+EXTRA_CFLAGS="$CFG" TESTS='t_recvdata t_fec t_fuzz t_readpath' bash tools/sim/run.sh  # 仿真
 ```
 
 配方速查（数字都是 `tools/size.sh` 的实测口径）：
