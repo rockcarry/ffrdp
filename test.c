@@ -70,6 +70,38 @@ static char client_url[512] = "";
 // 任一 URL 带 "://" ⇒ p2p 模式：建链要等打洞（秒级到几十秒），"还没连上"的宽限期不能再用 5 s
 static int  g_p2p_mode = 0;
 
+// URL 的 scheme **写死了协议层角色**（ffrdp_init 只看 scheme 决定谁发 SYN、谁等 SYN），而
+// --server=/--client= 决定的是**应用层**角色（谁去 accept、谁在主连接上收发）。
+// 两者不一致时，同一侧会"协议层当客户端、应用层当服务端"（或反过来），现象是：
+// 链路就绪、p2p 也稳，但握手/数据永远不动，日志里连一条 [peer] status 都看不到。
+// ⇒ 启动时就拒绝，别让它跑到线上去猜。
+// 返回 0 = 一致（或没给 URL）；-1 = 不认识 scheme / 角色相反（原因已打印）。
+static int url_check_role(const char *url, int want_server)
+{
+    int srv;
+
+    if (!url || !url[0]) return 0;  // 没给 URL（ip:port 或该角色未启用）⇒ 无需校验
+    if      (strncmp(url, "ffrdpsonffp2p://", 16) == 0) srv = 1;
+    else if (strncmp(url, "ffrdpconffp2p://", 16) == 0) srv = 0;
+    else if (strncmp(url, "ffrdps://",         9) == 0) srv = 1;
+    else if (strncmp(url, "ffrdpc://",         9) == 0) srv = 0;
+    else {
+        printf("✗ %s\n  scheme 不认识：只认 ffrdps:// ffrdpc:// ffrdpsonffp2p:// ffrdpconffp2p://\n", url);
+        return -1;
+    }
+    if (srv != (want_server ? 1 : 0)) {
+        printf("✗ %s\n  scheme 是%s端，但这里是 --%s= —— 两端角色必须一致\n",
+               url, srv ? "服务" : "客户", want_server ? "server" : "client");
+        printf("  scheme 决定协议层角色（谁发 SYN、谁等 SYN），开关决定应用层角色；\n"
+               "  不一致时本侧会同时按两个角色跑，握手永远走不完（现象：链路就绪但一条 status 都没有）。\n");
+        printf("  正解：--%s=%s\n", want_server ? "server" : "client",
+               want_server ? "ffrdpsonffp2p://local:<uuid>,server:<signal>"
+                           : "ffrdpconffp2p://local:<uuid>,remote:<uuid_srv>,server:<signal>");
+        return -1;
+    }
+    return 0;
+}
+
 // ①-41 的两个应用侧旋钮（env ✓，默认 = 老行为 ✓）：
 //   TEST_APP_SENDRETRY：send 被拒后立刻重试几次（0 = 下一个循环再说，会白等一次 10ms 的 recv ✗）；
 //   TEST_APP_SENDWAIT_MS：送进 ffrdp_send 的等待额 —— 队列删掉之后，反压改由协议在 cond 上做 ✓。
@@ -1178,6 +1210,8 @@ int main(int argc, char *argv[])
         printf("  -- ffrdp over ffp2p (NAT traversal) --\n");
         printf("  the two p2p schemes take a full URL instead of ip:port, so --server=/--client=\n");
         printf("  becomes a parameter list (needs a build with libffp2p, FFRDP_WITH_FFP2P=1):\n");
+        printf("  ⚠ the scheme must match the switch: --server= wants ffrdpsonffp2p:// (or ffrdps://),\n");
+        printf("    --client= wants ffrdpconffp2p:// (or ffrdpc://) -- a mismatch is refused at startup.\n");
         printf("\n");
         printf("    --server=\"ffrdpsonffp2p://local:uuid_srv,server:<signal>\"\n");
         printf("    --client=\"ffrdpconffp2p://local:uuid_cli,remote:uuid_srv,server:<signal>\"\n");
@@ -1258,6 +1292,9 @@ int main(int argc, char *argv[])
     strtok_r(server_bind_ip, ":", &str); if (str && *str) server_bind_port = atoi(str);
     strtok_r(client_cnnt_ip, ":", &str); if (str && *str) client_cnnt_port = atoi(str);
     g_p2p_mode = (server_url[0] || client_url[0]) ? 1 : 0;   // 影响"还没连上"的宽限期（见 peer_connect_get）
+    // 参数合法性：URL 的 scheme 与 --server/--client 必须同角色（见 url_check_role 的注释）。
+    // 这里直接退出：角色错位的进程只会白跑一轮、还留下一份看着"哪儿都对"的日志。
+    if (url_check_role(server_url, 1) != 0 || url_check_role(client_url, 0) != 0) return 1;
     {   // 两个验收开关（都不设 ⇒ 与以前完全一样 ✓）
         const char *si = getenv("FFRDP_IDLE");
         const char *sc = getenv("FFRDP_CLOSE");
