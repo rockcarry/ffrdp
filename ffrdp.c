@@ -8,10 +8,6 @@
 #include "lowlevel.h"
 #include "ffrdp.h"
 
-#if FFRDP_WITH_FFP2P
-#include <ffp2p/ffp2p.h>
-#endif
-
 /* ══ FFRDP_DIAG：诊断/调试代码的总开关（默认 0）═════════════════════════════
  * 0（默认 · release / 嵌入式）：dump、①-xx、以及“只给 dump 用”的计数器全部**编译掉** ✓
  *   ⇒ 无 printf、无静态内存、无计数开销；逻辑真正要读的量不受影响 ✓。
@@ -509,6 +505,7 @@ typedef struct {
     uint32_t hs_tick;             // 上次发握手帧的时刻（重传计时）
     uint32_t hs_start;            // 本次握手开始（或上次重传）的时刻：与 handshake_ms 比就是超时
     uint32_t hs_retry;            // 已重传次数
+    uint32_t hs_round;            // 已"整轮重来"几次（客户端；上限 = ffrdp->hs_retry_max）
     uint32_t counter_hs_refused;  // 握手 SYN 没能建连接（表全满 / 内存不足）—— 与"静默失败"相反
     uint32_t handle;              // 本连接的句柄 = 代号*FFRDP_MAXCONN + 槽号（槽复用后代号变 ⇒ 陈旧句柄失效 ✓）
 
@@ -665,8 +662,9 @@ typedef struct {
     FFRDP_CALLBACK    app_callback;  // 应用回调（v2 起：ACCEPT/CONNECT/DISCONN/ENCRYPT/DECRYPT/RECVDATA）
     void             *app_cbctx;
     int               maxconn;       // 配置：最大连接数（"maxconn:N"，默认 FFRDP_MAXCONN）
-    int               handshake_ms;  // 配置：握手超时（"handshake:N"，默认 10000）
-    int               idle_ms;       // 配置：空闲判死超时（"idle:N"，默认 5000）
+    int               handshake_ms;  // 配置：握手超时（"handshake_ms:N"，默认 10000）
+    int               hs_retry_max;  // 配置：客户端握手超时后允许"整轮重来"的总轮数（"hs_retry:N"，默认 3；0/1 = 超时就判死）
+    int               idle_ms;       // 配置：空闲判死超时（"idle_ms:N"，默认 5000）
     int               hs_enable;     // 配置：是否走三次握手（"hs:1" 开 / "hs:0" 关，默认 1；hs:0 = 与 v1 线上行为一致）
     int               is_server;     // 角色（v1 的 FLAG_SERVER 搬到进程级：它是"这个进程"的属性，不是连接的 ✗）
     // 槽位复用（见 ffrdp.h 的句柄约定 ✓）：分配时取表里**第一个空槽**，并把该槽的代号 +1 ⇒
@@ -1104,6 +1102,7 @@ static FFRDPCONN *ffrdp_conn_lookup(FFRDPCONTEXT *ffrdp, int handle)
 
 // ── p2p（ffp2p 打洞）────────────────────────────────────────────────────────
 #if FFRDP_WITH_FFP2P
+#include <ffp2p/ffp2p.h>
 // 这个 socket 是跟 ffp2p 共用的：它的保活/探测包（"FFP2" 开头）要交回去，
 // 否则 punch 的 dead_ms 计时看不到任何回包 ⇒ 30s 后误判对端失联（数据面其实好好的）。
 static int ffrdp_p2p_filter(void *user, uint8_t *buf, int len, const void *from)
@@ -1134,6 +1133,7 @@ static void ffrdp_p2p_client_start(FFRDPCONTEXT *ffrdp, const char *peer_text)
     if (ffrdp->hs_enable) {
         c->hs_state = HS_SYN_SENT;
         c->hs_start = NOW_MS();
+        c->hs_round = 0;  // 每重新打通一次 p2p 都从第一轮开始算（重试额度不跨链路累积）
         ffrdp_hs_send(ffrdp, c, FFRDP_HS_SYN);
         ffrdp_arm_timer(ffrdp);
     }
@@ -1169,12 +1169,10 @@ static long ffrdp_p2p_event(void *cbctx, int type, void *buf, int len)
     }
     return 0;
 }
-#endif
 
 // 建 ffp2p 实例并启动（失败返回 -1）。没有 libffp2p 时这里就是一条明确的报错。
 static int ffrdp_p2p_start(FFRDPCONTEXT *ffrdp, const char *p2p_params)
 {
-#if FFRDP_WITH_FFP2P
     char params[640];
 
     if (!strstr(p2p_params, "server:")) { printf("ffrdp_init: p2p 必须给 server:<信令服务器>\n"); return -1; }
@@ -1198,19 +1196,24 @@ static int ffrdp_p2p_start(FFRDPCONTEXT *ffrdp, const char *p2p_params)
      * 反过来，先让 ffp2p 用 300 ms 一个的 HELLO 小包把这条路跑稳（双向连续有包）再接管，就稳。
      *
      * 这里给的是**上限**（不是时长）：libffp2p 现在按"攒够 N 个无丢包来回"退出
-     * （ffp2p 层缺省 N=12、40 ms 一个探活，见 i_stabilize_probes / i_stabilize_probe_ms；
-     * 200 ms RTT 的路径约 2.9 s 就交接），这个上限只用来兜底失败重打洞。
+     * （ffp2p 层缺省 N=32、40 ms 一个探活，见 i_stabilize_probes / i_stabilize_probe_ms；
+     * 200 ms RTT 的路径约 7.7 s 才交接），这个上限只用来兜底失败重打洞。
      * 注意成对配：N × (RTT + 探活间隔) 必须小于这里的上限，否则永远攒不够 ⇒ 一直判失败。
      * 实测（只统计打洞已成功、确实发生交接的轮次）：
      *   300 ms 探活：4 s(13 个来回) 0/2 ✗，5 s(16) 5/5，8 s(26) 6/7，10 s(33) 7/7；
      *   30 ms 探活：0.5 s(17) 1/3，0.7 s(18) 1/1 ✓，1 s(27~33) 4/4 ✓；
      *   60 ms 探活：1 s(16) 0/1 ✗，2 s(33) ✓。
      * 所以准据是来回**次数**（≥30 稳、≤17 不稳），不是秒数 —— 别再把这里当成"等多久"。
+     * ⚠ 原来这里注入的是 8000：它和 ffp2p 旧缺省 N=12 是配套的，但现场实测 N=12 只有
+     * 602 ms 就攒满 ⇒ 交权后大包单向黑洞（握手成功、服务端 accept ok，客户端却 recv_seq 恒 0）。
+     * 现在 N 提到 32（7.7 s @200 ms RTT），上限必须同步给到 15 s，否则永远攒不够。
      * 用户显式给了 i_stabilize 就完全听用户的。 */
     {   size_t n = strlen(params);
 
-        if (!strstr(params, "stabilize") && n + 24 < sizeof(params))
-            snprintf(params + n, sizeof(params) - n, ",i_stabilize:8000");
+        /* 只认 "i_stabilize:"：原来写的是 "stabilize"，用户只配 i_stabilize_probes 时
+         * 也会命中 ⇒ 上限反而不注入，攒不够就一路判失败（两个键必须成对生效）。 */
+        if (!strstr(params, "i_stabilize:") && n + 26 < sizeof(params))
+            snprintf(params + n, sizeof(params) - n, ",i_stabilize:15000");
     }
     ffrdp->p2p = ffp2p_init((void*)params, ffrdp_p2p_event, ffrdp);
     if (!ffrdp->p2p) { printf("failed to init ffp2p !\n"); return -1; }
@@ -1221,16 +1224,10 @@ static int ffrdp_p2p_start(FFRDPCONTEXT *ffrdp, const char *p2p_params)
     }
     printf("<6> ffrdp: p2p 已启动（%s）\n", params);
     return 0;
-#else
-    (void)ffrdp; (void)p2p_params;
-    printf("<2> ffrdp_init: *onffp2p:// 需要 libffp2p，本版本未编译 p2p 支持（FFRDP_WITH_FFP2P=0）\n");
-    return -1;
-#endif
 }
 
 // 退出前先把数据面交回 ffp2p（i_data_detach=0）：移交模式下 ffp2p 的 exit **不关** fd
 // （fd 归上层），而 lowlevel 也不拥有它 ⇒ 不交回就是句柄泄漏。交回后由 ffp2p 负责 close。
-#if FFRDP_WITH_FFP2P
 #define FFRDP_P2P_STOP(f) do {                                                  \
         if ((f)->p2p) {                                                         \
             ffp2p_set((f)->p2p, FFP2P_KEY_DATA_DETACH, (void*)(intptr_t)0);     \
@@ -1240,6 +1237,13 @@ static int ffrdp_p2p_start(FFRDPCONTEXT *ffrdp, const char *p2p_params)
         }                                                                       \
     } while (0)
 #else
+static int ffrdp_p2p_start(FFRDPCONTEXT *ffrdp, const char *p2p_params)
+{
+    (void)ffrdp; (void)p2p_params;
+    printf("<2> ffrdp_init: *onffp2p:// 需要 libffp2p，本版本未编译 p2p 支持（FFRDP_WITH_FFP2P=0）\n");
+    return -1;
+}
+
 #define FFRDP_P2P_STOP(f) do { (void)(f); } while (0)
 #endif
 
@@ -1253,7 +1257,7 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
     int           p2p_n = 0;
     char         *text, *addr, *key;
     int           server = 0, p2p = 0, smss = FFRDP_MAX_MSS, sfec = 0;
-    int           maxconn = FFRDP_MAXCONN, handshake_ms = 10000, idle_ms = 5000, hs_enable = 1;
+    int           maxconn = FFRDP_MAXCONN, handshake_ms = 10000, idle_ms = 5000, hs_enable = 1, hs_retry_max = 3;
 
     if (!params) { printf("ffrdp_init: params is NULL\n"); return NULL; }
     snprintf(buf, sizeof(buf), "%s", (char*)params);
@@ -1295,6 +1299,11 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
         else if (!strcmp(key, "mss"))          smss         = val;
         else if (!strcmp(key, "fec"))          sfec         = val;
         else if (!strcmp(key, "hs"))           hs_enable    = val;   // 三次握手开关（**默认开** ✓；hs:0 关掉 ⇒ v1 行为 ✓）
+        // 客户端握手超时后"整轮重来"的总轮数（含首轮）：SYN 层每 500 ms 已经重传，但总窗口只有
+        // handshake_ms。偶发的"p2p 就绪但 SYN 全被对端 punch 丢掉/对端 socket 还没稳"会让一整轮
+        // 打空 —— 这时把整条 p2p 拆了重打洞代价太大（重打洞 + 稳定期 10 s 起）。默认 3 轮
+        // （3 × handshake_ms）后再判死；0/1 = 老行为（一次超时就 HS_FAILED）。
+        else if (!strcmp(key, "hs_retry"))     hs_retry_max = val;
         else if (p2p) {
             // 其余键原样交给 ffp2p（local/remote/server/stun 以及它自己的 i_*/s_* 键）：
             // ffrdp 不该维护第二份词表，ffp2p 新增键也就能直接用。server 补 http:// —— 它只认 URL。
@@ -1327,6 +1336,7 @@ void* ffrdp_init(void *params, FFRDP_CALLBACK callback, void *cbctx)
     ffrdp->app_cbctx    = cbctx;
     ffrdp->maxconn      = maxconn;
     ffrdp->handshake_ms = handshake_ms;
+    ffrdp->hs_retry_max = hs_retry_max > 0 ? hs_retry_max : 0;
     ffrdp->idle_ms      = idle_ms;
     ffrdp->hs_enable    = hs_enable ? 1 : 0;
     // 连接表：0 号固定给内嵌主连接（句柄 0 = 代号 0 * 16 + 槽 0 ✓）⇒ 服务端可用槽是 1..maxconn-1 ✓。
@@ -3462,6 +3472,18 @@ static long ffrdp_lowlevel_cb(void *cbctx, int type, void *buf, int len)
                         // 半开连接计时封顶：没人来完成握手就把这条连接放掉（**槽位随即回收** ✓）。
                         ffrdp_emit_ex(ffrdp, FFRDP_DISCONN, ffrdp_conn_handle(ffrdp, cc), cc->peer_addr, NULL, 0, FFRDP_DISCONN_HS_TIMEOUT);
                         ffrdp_conn_free(ffrdp, cc);
+                    } else if ((int)cc->hs_round + 1 < ffrdp->hs_retry_max) {
+                        /* 客户端：这一轮打空先别判死。成因很具体 —— 对端此刻可能还没把 fd 从
+                         * punch 交到它上层（punch 会把非 FFP2 的帧全丢掉，连 rx_unknown 都不涨，
+                         * 日志上像"包没到"），或者 NAT 刚建好还在黑洞期。这时把整条 p2p 拆了
+                         * 重打洞要付"重新打洞 + 稳定期"的代价，而再等一轮往往就通了。
+                         * 只重置握手状态：链路 / fd / 对端地址一概不动。 */
+                        cc->hs_round++;
+                        cc->hs_start = now;  // 重新开一个 handshake_ms 窗口
+                        cc->hs_state = HS_SYN_SENT;
+                        ffrdp_hs_send(ffrdp, cc, FFRDP_HS_SYN);  // 立刻重发，不必等那 500 ms
+                        printf("<3> ffrdp: handshake timed out after %d ms, retry %u/%d (keep the p2p link)\n",
+                               (int)ffrdp->handshake_ms, (unsigned)cc->hs_round, ffrdp->hs_retry_max);
                     } else {
                         cc->hs_state = HS_FAILED; // 客户端：此后 send/recv 按"已断"处理
                         ffrdp_emit_ex(ffrdp, FFRDP_DISCONN, ffrdp_conn_handle(ffrdp, cc), cc->peer_addr, NULL, 0, FFRDP_DISCONN_HS_TIMEOUT);
