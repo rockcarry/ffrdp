@@ -23,7 +23,8 @@ ffrdps://0.0.0.0:8000,maxconn:16,handshake_ms:10000,idle_ms:5000,mss:1024,fec:0,
 |---|---|---|
 | `maxconn` | 连接表上限（服务端；含内嵌的主连接 ✓）| 16 |
 | `hs` | 三次握手开关：`1` 走握手 / `0` 走 v1 那条老路 | **1** |
-| `handshake_ms` | 等 SYN-ACK 的时限（握手重传间隔同此）| 10000 |
+| `handshake_ms` | 等 SYN-ACK 的时限（握手重传间隔同此）。客户端超时后由 `hs_retry` 决定重来几轮 ✓ | 10000 |
+| `hs_retry` | 客户端握手超时后允许**整轮重来**的总轮数（含首轮）：超时只重置握手状态并立刻重发 SYN，链路不拆；用满才 `HS_FAILED` ✓。`0`/`1` = 老行为（一次超时就判死）| 3 |
 | `idle_ms` | keep-alive：**半程**（`idle_ms/2`）没听到对端就发一个 QUERY 去确权 ✓；整整 `idle_ms` 没听到 ⇒ 判死（报 `DISCONN` 并收摊 ✓）。只在 `hs:1` 下生效 ✓ | 5000 |
 | `mss` | 单帧最大载荷 | 由对端学习 + 上限 |
 | `fec` | FEC 冗余 | 0 |
@@ -100,6 +101,33 @@ ffrdps://0.0.0.0:8000,maxconn:16,handshake_ms:10000,idle_ms:5000,mss:1024,fec:0,
 - 空闲探活（`idle_ms`）与 FIN 是**两件事** ✓：前者是"对端还在不在"的确认（QUERY + ack ✓），
   后者是"我要走了"的通知 ✓ —— 空闲但活着的连接**不会被误杀** ✓（`t_keepalive` 钉住 ✓）。
 - v1 收到 v2 的握手帧会**静默丢弃** ✓（正好符合"不互通、但能识别并丢弃" ✓）。
+
+### 5.1 客户端握手超时先"整轮重来"（`hs_retry:N`）✓
+
+客户端在 `handshake_ms`（默认 10 s）内没走完握手时，**先不判死**：只重置握手状态
+（`hs_start = now`、`hs_state = HS_SYN_SENT`、`hs_round++`）并**立刻重发 SYN**，链路 / fd /
+对端地址一概不动；轮次用满（默认 3 轮）才置 `HS_FAILED`，由应用层重建上下文。
+服务端对重复 SYN 幂等（`HS_SYN_RCVD` 时重发 SYN-ACK ✓），不会留下半开垃圾 ✓。
+
+- 配置：`hs_retry:N`，默认 3；`0` / `1` = 老行为（一次超时就 `HS_FAILED`）。
+  最坏判死时间 = `hs_retry × handshake_ms`（默认 30 s）。
+- 每重新打通一次 p2p 都从第一轮算起（`ffrdp_p2p_client_start` 里清零 `hs_round`）✓。
+
+**为什么需要**：`*onffp2p://` 下第一个 SYN 常常落在"对端还没把 fd 从 ffp2p 的 punch 交到
+自己传输层"的窗口里 —— 那一侧只认 `FFP2` 前缀（punch 的探测包），2 字节的 SYN 连
+`len < PUNCH_PKT_HDR(16)` 都过不了，会被**静默丢弃**（连"陌生来源"计数都不涨，日志上像
+"包没到"）。这个窗口是几百 ms 到几秒，而一轮打空就判死 ⇒ 应用层 `ffrdp_exit` + 重新打洞
++ 重新预热（10 s 起），代价远大于再等一轮。日志里能看到：
+
+```
+<3> ffrdp: handshake timed out after 10000 ms, retry 1/3 (keep the p2p link)
+```
+
+**配套**：`*onffp2p://` 时本库向 ffp2p 注入 `i_sync_idle:10000` 与 `i_stabilize:15000`
+（用户显式给了就不注入）。后者是预热**上限**，与 ffp2p 的 `i_stabilize_probes=32`
+（40 ms 一个探活，200 ms RTT 约 7.7 s）配套 —— 判据是 `strstr("i_stabilize:")`，所以只配
+`i_stabilize_probes` 时上限仍会被补上（两个键必须成对生效）。预热的意义与实测数据见
+ffp2p 仓库的 `docs/stun-punch.md` 5.1 与 `docs/data-plane-detach.md` 2.1。
 
 ## 六、接口清单与接线状态
 
